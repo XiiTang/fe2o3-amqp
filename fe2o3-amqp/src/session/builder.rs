@@ -93,7 +93,7 @@ cfg_transaction! {
             pub(crate) fn into_txn_session(
                 self,
                 control: mpsc::Sender<SessionControl>,
-                outgoing: mpsc::Sender<crate::link::LinkFrame>,
+                outgoing: crate::session::transfer_queue::Sender,
                 outgoing_channel: OutgoingChannel,
                 control_link_acceptor: ControlLinkAcceptor,
                 local_state: SessionState,
@@ -284,7 +284,7 @@ impl Builder {
             let (session_control_tx, session_control_rx) =
                 mpsc::channel::<SessionControl>(DEFAULT_SESSION_CONTROL_BUFFER_SIZE);
             let (incoming_tx, incoming_rx) = mpsc::channel(self.buffer_size);
-            let (outgoing_tx, outgoing_rx) = mpsc::channel(self.buffer_size);
+            let (outgoing_tx, outgoing_rx) = crate::session::transfer_queue::channel(self.buffer_size);
 
             // create session in connection::Engine
             let outgoing_channel = match connection.allocate_session(incoming_tx).await {
@@ -402,7 +402,7 @@ impl Builder {
             let (session_control_tx, session_control_rx) =
                 mpsc::channel::<SessionControl>(DEFAULT_SESSION_CONTROL_BUFFER_SIZE);
             let (incoming_tx, incoming_rx) = mpsc::channel(self.buffer_size);
-            let (outgoing_tx, outgoing_rx) = mpsc::channel(self.buffer_size);
+            let (outgoing_tx, outgoing_rx) = crate::session::transfer_queue::channel(self.buffer_size);
 
             // create session in connection::Engine
             let outgoing_channel = match connection.allocate_session(incoming_tx).await {
@@ -470,7 +470,7 @@ impl Builder {
             let (session_control_tx, session_control_rx) =
                 mpsc::channel::<SessionControl>(DEFAULT_SESSION_CONTROL_BUFFER_SIZE);
             let (incoming_tx, incoming_rx) = mpsc::channel(self.buffer_size);
-            let (outgoing_tx, outgoing_rx) = mpsc::channel(self.buffer_size);
+            let (outgoing_tx, outgoing_rx) = crate::session::transfer_queue::channel(self.buffer_size);
 
             // create session in connection::Engine
             let outgoing_channel = match connection.allocate_session(incoming_tx).await {

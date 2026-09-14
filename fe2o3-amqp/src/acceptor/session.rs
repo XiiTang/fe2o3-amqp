@@ -165,7 +165,7 @@ impl SessionAcceptor {
         async fn launch_listener_session_engine<R>(
             &self,
             listener_session: ListenerSession,
-            _control_link_outgoing: &mpsc::Sender<LinkFrame>,
+            _control_link_outgoing: &crate::session::transfer_queue::Sender,
             connection: &crate::connection::ConnectionHandle<R>,
             _session_control_tx: &mpsc::Sender<SessionControl>,
             session_control_rx: mpsc::Receiver<SessionControl>,
@@ -190,7 +190,7 @@ impl SessionAcceptor {
         async fn launch_listener_session_engine<R>(
             &self,
             listener_session: ListenerSession,
-            control_link_outgoing: &mpsc::Sender<LinkFrame>,
+            control_link_outgoing: &crate::session::transfer_queue::Sender,
             connection: &crate::connection::ConnectionHandle<R>,
             session_control_tx: &mpsc::Sender<SessionControl>,
             session_control_rx: mpsc::Receiver<SessionControl>,
@@ -243,7 +243,8 @@ impl SessionAcceptor {
         let local_state = SessionState::Unmapped;
         let (session_control_tx, session_control_rx) =
             mpsc::channel::<SessionControl>(DEFAULT_SESSION_CONTROL_BUFFER_SIZE);
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(self.0.buffer_size);
+        let (outgoing_tx, outgoing_rx) =
+            crate::session::transfer_queue::channel(self.0.buffer_size);
         let (link_listener_tx, link_listener_rx) = mpsc::channel(self.0.buffer_size);
 
         // If the connection engine pre-allocated the session relay (to handle
@@ -641,9 +642,10 @@ impl endpoint::Session for ListenerSession {
         input_handle: InputHandle,
         transfer: Transfer,
         payload: Payload,
+        queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Option<SessionOutgoingItem>, Self::Error> {
         self.session
-            .on_outgoing_transfer(input_handle, transfer, payload)
+            .on_outgoing_transfer(input_handle, transfer, payload, queue_slot)
     }
 
     fn on_outgoing_disposition(

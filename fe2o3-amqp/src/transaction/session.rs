@@ -389,9 +389,10 @@ where
         input_handle: InputHandle,
         transfer: Transfer,
         payload: Payload,
+        queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Option<SessionOutgoingItem>, Self::Error> {
         self.session
-            .on_outgoing_transfer(input_handle, transfer, payload)
+            .on_outgoing_transfer(input_handle, transfer, payload, queue_slot)
     }
 
     fn on_outgoing_disposition(

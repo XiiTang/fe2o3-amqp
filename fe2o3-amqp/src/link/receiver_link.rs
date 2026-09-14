@@ -30,7 +30,7 @@ where
     /// This is cancel safe because it only `.await` on sending over a `tokio::mpsc::Sender`
     async fn send_flow(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         link_credit: Option<u32>,
         drain: Option<bool>,
         echo: bool,
@@ -242,7 +242,7 @@ where
     /// This is cancel safe because it only `.await` on sending over `tokio::mpsc::Sender`
     async fn dispose(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         delivery_info: DeliveryInfo,
         settled: Option<bool>,
         state: DeliveryState,
@@ -309,7 +309,7 @@ where
     /// This is cancel safe because all internal `.await` points are cancel safe
     async fn dispose_all(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         mut delivery_infos: Vec<DeliveryInfo>,
         settled: Option<bool>,
         state: DeliveryState,
@@ -392,7 +392,7 @@ impl<T> ReceiverLink<T> {
     /// This is cancel safe because it only `.await` on sending over a `tokio::mpsc::Sender`
     async fn dispose_consecutive(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         consecutive_infos: &[DeliveryInfo],
         settled: Option<bool>,
         state: DeliveryState,
@@ -680,7 +680,7 @@ where
     /// This is cancel safe if oneshot channel is cancel safe
     async fn send_attach(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         session: &mpsc::Sender<SessionControl>,
         is_reattaching: bool,
     ) -> Result<(), Self::AttachError> {
@@ -769,7 +769,7 @@ where
     /// This should be cancel safe if oneshot channel is cancel safe
     async fn exchange_attach(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         reader: &mut mpsc::Receiver<LinkFrame>,
         session: &mpsc::Sender<SessionControl>,
         is_reattaching: bool,
@@ -795,7 +795,7 @@ where
     async fn handle_attach_error(
         &mut self,
         attach_error: ReceiverAttachError,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         reader: &mut mpsc::Receiver<LinkFrame>,
         session: &mpsc::Sender<SessionControl>,
     ) -> ReceiverAttachError {

@@ -504,7 +504,7 @@ pub(crate) struct SenderInner<L: endpoint::SenderLink> {
     pub(crate) session: mpsc::Sender<SessionControl>,
 
     // Outgoing mpsc channel to send the Link frames
-    pub(crate) outgoing: mpsc::Sender<LinkFrame>,
+    pub(crate) outgoing: crate::session::transfer_queue::Sender,
     pub(crate) incoming: mpsc::Receiver<LinkFrame>,
 }
 

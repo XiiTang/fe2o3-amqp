@@ -32,6 +32,7 @@ pub(crate) struct ConnectionEngine<Io, C> {
     control: Receiver<ConnectionControl>,
     outgoing_session_frames: Receiver<SessionFrame>,
     heartbeat: HeartBeat,
+    write_pending: bool,
 }
 
 impl<Io, C> ConnectionEngine<Io, C>
@@ -235,6 +236,7 @@ where
             control,
             outgoing_session_frames,
             heartbeat: HeartBeat::never(),
+            write_pending: false,
         };
 
         match engine.open_inner().await {
@@ -478,7 +480,11 @@ where
         tracing::trace!(channel = frame.channel, frame = ?frame.body);
         #[cfg(feature = "log")]
         log::trace!("SEND channel = {}, frame = {:?}", frame.channel, frame.body);
-        self.transport.send(frame).await?;
+        // The engine admits one frame, then flushes it concurrently with reads.
+        // `feed` cannot wait on a previous write in the normal event loop because
+        // its outbound branch is disabled until that write has flushed.
+        self.transport.feed(frame).await?;
+        self.write_pending = true;
         Ok(Running::Continue)
     }
 
@@ -491,7 +497,11 @@ where
         }
 
         let frame = Frame::empty();
-        self.transport.send(frame).await?;
+        // The engine admits one frame, then flushes it concurrently with reads.
+        // `feed` cannot wait on a previous write in the normal event loop because
+        // its outbound branch is disabled until that write has flushed.
+        self.transport.feed(frame).await?;
+        self.write_pending = true;
         Ok(Running::Continue)
     }
 
@@ -529,8 +539,15 @@ where
         let mut outcome = Ok(());
         loop {
             let result = tokio::select! {
-                _ = self.heartbeat.next() => self.on_heartbeat().await,
-                incoming = self.transport.next() => {
+                _ = self.heartbeat.next(), if !self.write_pending => self.on_heartbeat().await,
+                progress = self.transport.next_event(self.write_pending) => {
+                    let incoming = match progress {
+                        transport::DuplexEvent::Flushed => {
+                            self.write_pending = false;
+                            continue;
+                        }
+                        transport::DuplexEvent::Incoming(incoming) => incoming,
+                    };
                     let result = match incoming {
                         Some(incoming) => {
                             match incoming {
@@ -607,7 +624,7 @@ where
                         }
                     }
                 },
-                frame = self.outgoing_session_frames.recv() => {
+                frame = self.outgoing_session_frames.recv(), if !self.write_pending => {
                     match frame {
                         Some(frame) => self.on_outgoing_session_frames(frame).await,
                         None => {

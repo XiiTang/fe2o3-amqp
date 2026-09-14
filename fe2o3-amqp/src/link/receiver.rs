@@ -366,6 +366,14 @@ impl Receiver {
     pub fn into_detached(self) -> Result<DetachedReceiver, Self> {
         if matches!(
             self.inner.link.local_state,
+            super::state::LinkState::Closed
+                | super::state::LinkState::CloseSent
+                | super::state::LinkState::CloseReceived
+        ) {
+            return Err(self);
+        }
+        if matches!(
+            self.inner.link.local_state,
             super::state::LinkState::Detached
         ) || self.inner.link.session_stop_reason.get().is_some()
         {

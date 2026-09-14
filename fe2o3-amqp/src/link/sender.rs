@@ -203,6 +203,33 @@ impl Sender {
             .await
     }
 
+    /// Preserve an endpoint after its session stopped, without sending frames.
+    /// Already closed links and queued peer-closing Detach frames cannot resume.
+    pub fn into_detached(mut self) -> Result<DetachedSender, Self> {
+        use super::state::LinkState;
+        if matches!(
+            self.inner.link.local_state,
+            LinkState::Closed | LinkState::CloseSent | LinkState::CloseReceived
+        ) {
+            return Err(self);
+        }
+        if !matches!(self.inner.link.local_state, LinkState::Detached)
+            && self.inner.link.session_stop_reason.get().is_none()
+        {
+            return Err(self);
+        }
+        while let Ok(frame) = self.inner.incoming.try_recv() {
+            if let LinkFrame::Detach(detach) = frame {
+                if detach.closed {
+                    self.inner.link.local_state = LinkState::Closed;
+                    self.inner.link.output_handle.take();
+                    return Err(self);
+                }
+            }
+        }
+        Ok(DetachedSender { inner: self.inner })
+    }
+
     /// Detach the link
     ///
     /// The Sender will send a detach frame with closed field set to false,

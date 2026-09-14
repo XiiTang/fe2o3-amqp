@@ -469,6 +469,10 @@ where
         use fe2o3_amqp_types::transaction::TransactionError;
 
         match kind {
+            SessionInnerError::InvalidTransfer => {
+                let error = Error::new(AmqpError::InvalidField, None, None);
+                self.end_session(Some(error)).await
+            }
             SessionInnerError::UnattachedHandle => {
                 let error = Error::new(SessionError::UnattachedHandle, None, None);
                 self.end_session(Some(error)).await

@@ -716,6 +716,8 @@ impl std::error::Error for ReceiverResumeError {}
 /// Error with link relay
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LinkRelayError {
+    #[error("Invalid or duplicate transfer identity")]
+    InvalidTransfer,
     /// Link is not attached
     #[error("Link is not attached")]
     UnattachedHandle,
@@ -728,6 +730,9 @@ pub(crate) enum LinkRelayError {
 impl From<LinkRelayError> for definitions::Error {
     fn from(error: LinkRelayError) -> Self {
         match error {
+            LinkRelayError::InvalidTransfer => {
+                definitions::Error::new(AmqpError::InvalidField, None, None)
+            }
             LinkRelayError::UnattachedHandle => definitions::Error {
                 condition: SessionError::UnattachedHandle.into(),
                 description: None,

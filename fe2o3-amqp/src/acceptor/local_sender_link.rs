@@ -8,7 +8,6 @@ use fe2o3_amqp_types::{
     performatives::Attach,
     primitives::Symbol,
 };
-use parking_lot::RwLock;
 use tokio::sync::{mpsc, Notify};
 
 use crate::{
@@ -111,7 +110,7 @@ where
         let flow_state_producer = Producer::new(notifier.clone(), flow_state.clone());
         let flow_state_consumer = Consumer::new(notifier, flow_state);
 
-        let unsettled = Arc::new(RwLock::new(None));
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
         let link_handle = LinkRelay::Sender {
             tx: incoming_tx,
             output_handle: (),

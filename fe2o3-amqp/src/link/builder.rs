@@ -781,6 +781,17 @@ mod suspension_tests {
                     .await
                     .unwrap();
             }
+            let (_outcome, outcome) = tokio::sync::oneshot::channel();
+            let mut next_session = SessionHandle {
+                is_ended: true,
+                engine_joined: false,
+                control: session.clone(),
+                outgoing: outgoing.clone().into(),
+                engine_handle: tokio::spawn(std::future::pending()),
+                outcome,
+                session_stop_reason: Arc::new(OnceLock::new()),
+                link_listener: (),
+            };
             let sender = Sender {
                 inner: SenderInner {
                     link,
@@ -797,7 +808,31 @@ mod suspension_tests {
                 Err(mpsc::error::TryRecvError::Empty)
             ));
             // An active endpoint was rejected, so its normal Drop semantics still apply.
-            drop(retained);
+            if let Ok(endpoint) = retained {
+                let first = endpoint
+                    .resume_on_session_until(&next_session, std::future::ready(()))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    first.kind,
+                    crate::link::SenderResumeErrorKind::Interrupted
+                ));
+                let second = first
+                    .detached_sender
+                    .resume_on_session_until(&next_session, std::future::ready(()))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    second.kind,
+                    crate::link::SenderResumeErrorKind::Interrupted
+                ));
+                assert!(matches!(
+                    sent.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                drop(second);
+            }
+            next_session.stop_and_join().await.unwrap();
         }
     }
 }

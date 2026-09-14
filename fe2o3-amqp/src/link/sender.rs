@@ -1096,6 +1096,41 @@ macro_rules! try_as_sender {
 }
 
 impl DetachedSender {
+    /// Resume with an explicit interruption future. Both success and failure
+    /// return the native endpoint; interruption performs no protocol cleanup.
+    pub async fn resume_on_session_until<R>(
+        mut self,
+        session: &SessionHandle<R>,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) -> Result<Sender, SenderResumeError> {
+        if self.inner.link.session_stop_reason.get().is_some() {
+            self = match (Sender { inner: self.inner }).into_detached() {
+                Ok(endpoint) => endpoint,
+                Err(endpoint) => {
+                    return Err(SenderResumeError {
+                        detached_sender: DetachedSender {
+                            inner: endpoint.inner,
+                        },
+                        kind: SenderAttachError::IllegalState.into(),
+                    })
+                }
+            };
+        }
+        self.inner.link.session_stop_reason = session.session_stop_reason().clone();
+        self.inner.session = session.control.clone();
+        self.inner.outgoing = session.outgoing.clone();
+        let result = tokio::select! { biased;
+            _ = interrupt => Err(SenderResumeErrorKind::Interrupted),
+            result = self.inner.resume_incoming_attach(None, false) => result,
+        };
+        match result {
+            Ok(()) => Ok(Sender { inner: self.inner }),
+            Err(kind) => Err(SenderResumeError {
+                detached_sender: self,
+                kind,
+            }),
+        }
+    }
     fn new(inner: SenderInner<SenderLink<Target>>) -> Self {
         Self { inner }
     }

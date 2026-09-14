@@ -1,6 +1,5 @@
 //! Session Listener
 
-
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -22,12 +21,11 @@ use crate::{
     session::{
         self,
         engine::SessionEngine,
-        frame::{SessionFrame, SessionIncomingItem, SessionOutgoingItem},
         error::{
             connection_stop_reason_or_closed, AllocLinkError, BeginError, Error, SessionInnerError,
         },
-        SessionHandle,
-        DEFAULT_SESSION_CONTROL_BUFFER_SIZE,
+        frame::{SessionFrame, SessionIncomingItem, SessionOutgoingItem},
+        SessionHandle, DEFAULT_SESSION_CONTROL_BUFFER_SIZE,
     },
     util::Initialized,
     Payload,
@@ -37,10 +35,9 @@ use super::{builder::Builder, IncomingSession, ListenerConnectionHandle};
 
 cfg_transaction! {
     use fe2o3_amqp_types::{messaging::Accepted, transaction::TransactionError};
-    
+
     use crate::transaction::{manager::TransactionManager, session::TxnSession, AllocTxnIdError};
 }
-
 
 /// An empty marker trait that acts as a constraint for session engine
 pub trait ListenerSessionEndpoint {}
@@ -209,7 +206,7 @@ impl SessionAcceptor {
                         session: listener_session,
                         txn_manager,
                     };
-    
+
                     let engine = SessionEngine::begin_listener_session(
                         connection.control.clone(),
                         listener_session,
@@ -321,6 +318,7 @@ impl SessionAcceptor {
 
         let handle = SessionHandle {
             is_ended: false,
+            engine_joined: false,
             control: session_control_tx,
             engine_handle,
             outcome,
@@ -337,12 +335,13 @@ impl SessionAcceptor {
         &self,
         connection: &mut ListenerConnectionHandle,
     ) -> Result<ListenerSessionHandle, BeginError> {
-        let incoming_session = connection
-            .next_incoming_session()
-            .await
-            .ok_or(BeginError::ConnectionStopped(connection_stop_reason_or_closed(
-                &connection.connection_stop_reason,
-            )))?;
+        let incoming_session =
+            connection
+                .next_incoming_session()
+                .await
+                .ok_or(BeginError::ConnectionStopped(
+                    connection_stop_reason_or_closed(&connection.connection_stop_reason),
+                ))?;
         self.accept_incoming_session(incoming_session, connection)
             .await
     }
@@ -435,8 +434,9 @@ impl endpoint::Session for ListenerSession {
         link_handle: LinkRelay<()>,
         input_handle: InputHandle,
     ) -> Result<OutputHandle, Self::AllocError> {
-        let output_handle = self.session
-            .allocate_incoming_link(link_name, link_handle, input_handle.clone())?;
+        let output_handle =
+            self.session
+                .allocate_incoming_link(link_name, link_handle, input_handle.clone())?;
 
         // Replay any buffered link-level Flow frames that arrived before this
         // link handle was registered (due to pipelining).
@@ -663,8 +663,8 @@ cfg_transaction! {
             Err(AllocTxnIdError::NotImplemented)
         }
     }
-    
-    
+
+
     impl endpoint::HandleDischarge for ListenerSession {
         async fn commit_transaction(
             &mut self,
@@ -673,7 +673,7 @@ cfg_transaction! {
             // FIXME: This should be impossible
             Ok(Err(TransactionError::UnknownId))
         }
-    
+
         fn rollback_transaction(
             &mut self,
             _txn_id: fe2o3_amqp_types::transaction::TransactionId,

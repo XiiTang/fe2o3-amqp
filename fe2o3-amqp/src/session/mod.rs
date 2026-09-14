@@ -68,6 +68,7 @@ pub const DEFAULT_WINDOW: Uint = 5000;
 pub struct SessionHandle<R> {
     /// This value should only be changed in the `on_end` method
     pub(crate) is_ended: bool,
+    pub(crate) engine_joined: bool,
     pub(crate) control: mpsc::Sender<SessionControl>,
     pub(crate) engine_handle: JoinHandle<()>,
     pub(crate) outcome: oneshot::Receiver<Result<(), Error>>,
@@ -87,6 +88,9 @@ impl<R> std::fmt::Debug for SessionHandle<R> {
 
 impl<R> Drop for SessionHandle<R> {
     fn drop(&mut self) {
+        if self.is_ended {
+            return;
+        }
         if let Err(_error) = self.control.try_send(SessionControl::End(None)) {
             #[cfg(any(feature = "log", feature = "tracing"))]
             {
@@ -106,6 +110,23 @@ impl<R> Drop for SessionHandle<R> {
 }
 
 impl<R> SessionHandle<R> {
+    /// Stop the local engine and join its task, without sending protocol cleanup.
+    /// The owner must separately stop its transport/children. Repeated calls are safe.
+    pub async fn stop_and_join(&mut self) -> Result<(), tokio::task::JoinError> {
+        self.is_ended = true;
+        let _ = self.session_stop_reason.set(SessionStopReason::Stopped);
+        if self.engine_joined {
+            return Ok(());
+        }
+        self.engine_handle.abort();
+        let result = (&mut self.engine_handle).await;
+        self.engine_joined = true;
+        match result {
+            Err(error) if error.is_cancelled() => Ok(()),
+            other => other,
+        }
+    }
+
     /// The shared stop reason cell, used by links to observe why the session stopped
     pub(crate) fn session_stop_reason(&self) -> &Arc<OnceLock<SessionStopReason>> {
         &self.session_stop_reason
@@ -1257,5 +1278,55 @@ mod tests {
         session.need_flow_count = u32::MAX;
 
         assert!(session.maybe_outgoing_session_flow().is_none());
+    }
+}
+
+#[cfg(test)]
+mod local_stop_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Released(Arc<AtomicBool>);
+    impl Drop for Released {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    #[tokio::test]
+    async fn stop_joins_a_blocked_engine_without_protocol_cleanup_or_detached_work() {
+        let released = Arc::new(AtomicBool::new(false));
+        let owned = released.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (outcome_tx, outcome) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _released = Released(owned);
+            let _outcome = outcome_tx;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let (control, mut commands) = tokio::sync::mpsc::channel(1);
+        let (outgoing, _outgoing_rx) = tokio::sync::mpsc::channel(1);
+        let mut owner = SessionHandle {
+            is_ended: false,
+            engine_joined: false,
+            engine_handle: task,
+            outcome,
+            control,
+            outgoing,
+            session_stop_reason: Arc::new(OnceLock::new()),
+            link_listener: (),
+        };
+        owner.stop_and_join().await.unwrap();
+        owner.stop_and_join().await.unwrap();
+        assert!(released.load(Ordering::Acquire));
+        assert!(matches!(
+            owner.session_stop_reason.get(),
+            Some(SessionStopReason::Stopped)
+        ));
+        drop(owner);
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+        ));
     }
 }

@@ -14,9 +14,7 @@ use fe2o3_amqp_types::{
 };
 
 use crate::{
-    connection::DEFAULT_OUTGOING_BUFFER_SIZE,
-    link::SessionStopReason,
-    session::SessionHandle,
+    connection::DEFAULT_OUTGOING_BUFFER_SIZE, link::SessionStopReason, session::SessionHandle,
     util::Initialized,
 };
 
@@ -253,12 +251,10 @@ mod tests {
     use fe2o3_amqp_types::performatives::Attach;
     use tokio::sync::{mpsc, oneshot};
 
-    use super::{AcceptorAttachError, LinkAcceptor, ListenerSessionHandle, SessionHandle, SessionStopReason};
-    use crate::{
-        control::SessionControl,
-        link::LinkFrame,
-        session::error::Error,
+    use super::{
+        AcceptorAttachError, LinkAcceptor, ListenerSessionHandle, SessionHandle, SessionStopReason,
     };
+    use crate::{control::SessionControl, link::LinkFrame, session::error::Error};
 
     /// Constructs a listener session handle in the "ended" state: the link
     /// listener sender is dropped (as if the session engine exited) and the
@@ -277,6 +273,7 @@ mod tests {
         }
         SessionHandle {
             is_ended: false,
+            engine_joined: false,
             control,
             engine_handle: tokio::spawn(async {}),
             outcome,
@@ -290,18 +287,16 @@ mod tests {
     /// ends.
     #[tokio::test]
     async fn accept_reports_recorded_stop_reason() {
-        let mut handle = ended_listener_session_handle(Some(
-            SessionStopReason::ConnectionStopped(crate::connection::ConnectionStopReason::Closed),
-        ));
+        let mut handle = ended_listener_session_handle(Some(SessionStopReason::ConnectionStopped(
+            crate::connection::ConnectionStopReason::Closed,
+        )));
 
         let result = LinkAcceptor::new().accept(&mut handle).await;
 
         match result {
-            Err(AcceptorAttachError::SessionStopped(
-                SessionStopReason::ConnectionStopped(
-                    crate::connection::ConnectionStopReason::Closed,
-                ),
-            )) => {}
+            Err(AcceptorAttachError::SessionStopped(SessionStopReason::ConnectionStopped(
+                crate::connection::ConnectionStopReason::Closed,
+            ))) => {}
             other => panic!("expected SessionStopped(ConnectionClosed), got {:?}", other),
         }
     }

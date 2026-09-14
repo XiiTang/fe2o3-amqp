@@ -1,11 +1,9 @@
 use fe2o3_amqp_types::performatives::Transfer;
 
-use crate::{util::AsByteIterator, Payload};
+use crate::Payload;
 
-use super::{
-    receiver_link::{count_number_of_sections_and_offset, is_section_header},
-    ReceiverTransferError,
-};
+use super::ReceiverTransferError;
+use fe2o3_amqp_types::messaging::message::admission::{prefix_offset, prefix_position};
 
 macro_rules! or_assign {
     ($self:ident, $other:ident, $field:ident) => {
@@ -30,23 +28,30 @@ macro_rules! or_assign {
 
 #[derive(Debug)]
 pub(crate) struct IncompleteTransfer {
+    storage: super::receive_budget::Reservation,
     pub performative: Transfer,
-    pub buffer: Vec<Payload>,
+    pub buffer: Vec<u8>,
     pub section_number: Option<u32>,
     pub section_offset: u64,
 }
 
 impl IncompleteTransfer {
-    pub fn new(transfer: Transfer, partial_payload: Payload) -> Self {
-        let (number, offset) = count_number_of_sections_and_offset(&partial_payload);
-        Self {
+    pub fn new(
+        transfer: Transfer,
+        partial_payload: Payload,
+        budget: &std::sync::Arc<super::receive_budget::ReceiveBudget>,
+    ) -> Result<Self, ReceiverTransferError> {
+        let storage = budget.reserve(partial_payload.len())?;
+        let (number, offset) = prefix_position(&partial_payload)
+            .map_err(ReceiverTransferError::InvalidMessageEncoding)?;
+        Ok(Self {
+            storage,
             performative: transfer,
-            buffer: vec![partial_payload], // TODO: handle payload split across re-attachment
+            buffer: partial_payload.to_vec(),
             section_number: Some(number),
             section_offset: offset,
-        }
+        })
     }
-
     /// Like `|=` operator but works on the field level
     pub fn or_assign(&mut self, other: Transfer) -> Result<(), ReceiverTransferError> {
         or_assign! {
@@ -91,75 +96,89 @@ impl IncompleteTransfer {
         Ok(())
     }
 
-    /// Append to the buffered payload
-    pub fn append(&mut self, other: Payload) {
-        // Count section numbers
-        let (number, offset) = count_number_of_sections_and_offset(&other);
-        match (&mut self.section_number, number) {
-            (_, 0) => self.section_offset += offset,
-            (None, 1) => {
-                // The first section
-                self.section_number = Some(0);
-                self.section_offset = offset;
-            }
-            (None, _) => {
-                self.section_number = Some(number - 1);
-                self.section_offset = offset;
-            }
-            (Some(val), _) => {
-                *val += number;
-                self.section_offset = offset;
-            }
-        }
-
-        self.buffer.push(other);
+    /// Append payload after the receiver has checked its materialization bound.
+    pub fn append(&mut self, other: Payload) -> Result<(), ReceiverTransferError> {
+        self.storage.resize(
+            self.buffer
+                .len()
+                .checked_add(other.len())
+                .ok_or(ReceiverTransferError::MessageSizeExceeded)?,
+        )?;
+        self.buffer.reserve_exact(other.len());
+        self.buffer.extend_from_slice(&other);
+        let (number, offset) =
+            prefix_position(&self.buffer).map_err(ReceiverTransferError::InvalidMessageEncoding)?;
+        self.section_number = Some(number);
+        self.section_offset = offset;
+        Ok(())
     }
-
-    fn position_of_section_number_and_offset(
-        &self,
-        section_number: u32,
-        section_offset: u64,
-    ) -> Option<usize> {
-        let b0 = self.buffer.as_byte_iterator();
-        let b1 = self.buffer.as_byte_iterator().skip(1);
-        let b2 = self.buffer.as_byte_iterator().skip(2);
-        let iter = b0.zip(b1.zip(b2));
-
-        let mut cur_number = 0;
-        let mut cur_offset = 0;
-
-        for (i, (&b0, (&b1, &b2))) in iter.enumerate() {
-            cur_offset += 1;
-
-            if is_section_header(b0, b1, b2) {
-                cur_number += 1;
-                cur_offset = 0;
-            }
-
-            if cur_number == section_number && cur_offset == section_offset {
-                return Some(i);
-            }
-        }
-
-        None
-    }
-
     pub fn keep_buffer_till_section_number_and_offset(
         &mut self,
-        section_number: u32,
-        section_offset: u64,
-    ) {
-        if let Some(mut index) =
-            self.position_of_section_number_and_offset(section_number, section_offset)
-        {
-            for chunk in self.buffer.iter_mut() {
-                if chunk.len() < index {
-                    index -= chunk.len();
-                } else {
-                    // Found the chunk and split the chunk
-                    let _ = chunk.split_off(index);
-                }
-            }
+        number: u32,
+        offset: u64,
+    ) -> Result<(), ReceiverTransferError> {
+        let index = prefix_offset(&self.buffer, number, offset)
+            .map_err(ReceiverTransferError::InvalidMessageEncoding)?;
+        self.buffer.truncate(index);
+        self.buffer.shrink_to_fit();
+        self.storage.resize(index)?;
+        let (number, offset) =
+            prefix_position(&self.buffer).map_err(ReceiverTransferError::InvalidMessageEncoding)?;
+        self.section_number = Some(number);
+        self.section_offset = offset;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn transfer() -> Transfer {
+        serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x55, 0x43])
+            .unwrap()
+    }
+    #[test]
+    fn every_fragment_boundary_and_explicit_recovery_preserve_exact_encoded_sections() {
+        let message = [
+            0, 0x53, 0x75, 0xa0, 6, 0, 0x53, 0x75, 0, 255, 7, 0, 0x53, 0x75, 0xa0, 1, 9,
+        ];
+        for split in 0..=message.len() {
+            let mut part = IncompleteTransfer::new(
+                transfer(),
+                Payload::copy_from_slice(&message[..split]),
+                &super::super::receive_budget::ReceiveBudget::new(1024),
+            )
+            .unwrap();
+            part.append(Payload::copy_from_slice(&message[split..]))
+                .unwrap();
+            assert_eq!(part.buffer, message);
+            assert_eq!((part.section_number, part.section_offset), (Some(2), 0));
+            assert!(part
+                .keep_buffer_till_section_number_and_offset(0, 12)
+                .is_err());
+            assert_eq!(part.buffer, message);
+            part.keep_buffer_till_section_number_and_offset(1, 3)
+                .unwrap();
+            assert_eq!(part.buffer, &message[..14]);
+            part.append(Payload::copy_from_slice(&message[14..]))
+                .unwrap();
+            assert_eq!(part.buffer, message);
         }
+    }
+    #[test]
+    fn continuation_identity_changes_fail_and_empty_fragments_do_not_grow_storage() {
+        let mut part = IncompleteTransfer::new(
+            transfer(),
+            Payload::new(),
+            &super::super::receive_budget::ReceiveBudget::new(1024),
+        )
+        .unwrap();
+        for _ in 0..10000 {
+            part.append(Payload::new()).unwrap();
+        }
+        assert_eq!(part.buffer.capacity(), 0);
+        let mut changed = transfer();
+        changed.delivery_tag = Some(vec![1].into());
+        assert!(part.or_assign(changed).is_err());
     }
 }

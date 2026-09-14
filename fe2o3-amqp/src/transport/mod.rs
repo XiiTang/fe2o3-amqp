@@ -33,6 +33,7 @@ use self::{error::NegotiationError, protocol_header::ProtocolHeaderCodec};
 
 pub(crate) mod error;
 pub use error::Error;
+pub mod observation;
 pub mod protocol_header;
 
 pin_project! {
@@ -49,6 +50,7 @@ pin_project! {
         idle_timeout: Option<IdleTimeout>,
         // frame type
         ftype: PhantomData<Ftype>,
+        observer: Option<std::sync::Arc<dyn observation::IncomingFrameObserver>>,
     }
 }
 
@@ -56,6 +58,13 @@ impl<Io, Ftype> Transport<Io, Ftype>
 where
     Io: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Install the observer after SASL negotiation and before AMQP Open.
+    pub fn set_incoming_frame_observer(
+        &mut self,
+        observer: Option<std::sync::Arc<dyn observation::IncomingFrameObserver>>,
+    ) {
+        self.observer = observer;
+    }
     /// Consume the transport and return the underlying codec
     pub fn into_framed_codec(
         self,
@@ -98,6 +107,7 @@ where
             framed_read,
             idle_timeout,
             ftype: PhantomData,
+            observer: None,
         }
     }
 }
@@ -511,8 +521,17 @@ where
                             Err(err) => return Poll::Ready(Some(Err(err.into()))),
                         };
                         // tracing::debug!("raw bytes {:#x?}", &src[..]);
+                        let raw = this.observer.as_ref().map(|_| src.clone().freeze());
                         let mut decoder = amqp::FrameDecoder {};
-                        Poll::Ready(decoder.decode(&mut src).map_err(Into::into).transpose())
+                        let decoded = decoder.decode(&mut src).map_err(Into::into);
+                        if let (Ok(Some(frame)), Some(raw), Some(observer)) =
+                            (&decoded, raw, this.observer.as_ref())
+                        {
+                            observer.incoming(std::sync::Arc::new(
+                                observation::IncomingFrame::from_decoded(raw, frame),
+                            ));
+                        }
+                        Poll::Ready(decoded.transpose())
                     }
                     None => Poll::Ready(None),
                 }

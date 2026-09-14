@@ -646,7 +646,7 @@ mod tests {
             EncodingCodes::SmallUlong as u8,
             0x24, // descriptor code
             EncodingCodes::List8 as u8,
-            0, // size
+            1, // size includes the count byte
             0, // count
         ];
         let _: Accepted = from_slice(&buf).unwrap();
@@ -663,7 +663,7 @@ mod tests {
             0,
             0,
             0,
-            0, // size
+            4, // size includes the four-byte count
             0,
             0,
             0,
@@ -689,7 +689,7 @@ mod tests {
             EncodingCodes::SmallUlong as u8,
             0x25, // descriptor code
             EncodingCodes::List8 as u8,
-            0, // size
+            1, // size includes the count byte
             0, // count
         ];
         let rejected: Rejected = from_slice(&buf).unwrap();

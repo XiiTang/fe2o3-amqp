@@ -50,21 +50,21 @@ cfg_acceptor! {
         #[cfg(not(target_arch = "wasm32"))]
         #[cfg(feature = "acceptor")]
         GlobalIdNotImplemented,
-    
+
         /// Session must have dropped
         #[cfg(not(target_arch = "wasm32"))]
         #[cfg(feature = "acceptor")]
         InvalidSessionState,
-    
+
         /// The allocation of transaction ID is not implemented
         AllocTxnIdNotImplemented,
-    
+
         /// If the coordinator is unable to complete the discharge, the coordinator MUST convey the error to the controller
         /// as a transaction-error. If the source for the link to the coordinator supports the rejected outcome, then the
         /// message MUST be rejected with this outcome carrying the transaction-error.
         TransactionError(TransactionError),
     }
-    
+
     impl From<AllocTxnIdError> for CoordinatorError {
         fn from(value: AllocTxnIdError) -> Self {
             match value {
@@ -75,7 +75,7 @@ cfg_acceptor! {
             }
         }
     }
-    
+
     impl From<DischargeError> for CoordinatorError {
         fn from(value: DischargeError) -> Self {
             match value {
@@ -91,6 +91,10 @@ cfg_acceptor! {
 /// Errors with sending message on the control link
 #[derive(Debug, thiserror::Error)]
 pub enum ControllerSendError {
+    /// An earlier discharge may have reached the coordinator. Do not resend it.
+    #[error("The previous discharge outcome is unknown")]
+    DischargeOutcomeUnknown,
+
     /// Errors found in link state
     #[error("Local error: {:?}", .0)]
     LinkStateError(#[from] LinkStateError),
@@ -283,6 +287,8 @@ impl FromDeliveryFailure for PostResult {
     }
 
     fn from_session_stop_reason(reason: SessionStopReason) -> Self {
-        Err(PostError::LinkStateError(LinkStateError::SessionStopped(reason)))
+        Err(PostError::LinkStateError(LinkStateError::SessionStopped(
+            reason,
+        )))
     }
 }

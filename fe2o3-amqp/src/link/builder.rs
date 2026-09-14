@@ -740,3 +740,64 @@ cfg_transaction! {
         }
     }
 }
+
+#[cfg(test)]
+mod suspension_tests {
+    use super::*;
+    use crate::link::{unsettled_store::Store, LinkFrame};
+    use fe2o3_amqp_types::performatives::Detach;
+
+    #[tokio::test]
+    async fn suspend_only_stopped_nonclosed_sender_without_protocol_cleanup() {
+        for (stopped, closed, queued_close, allowed) in [
+            (false, false, false, false),
+            (true, false, false, true),
+            (true, true, false, false),
+            (true, false, true, false),
+        ] {
+            let mut builder = Sender::builder().name("retained").target("queue");
+            let (_producer, consumer) = builder.create_flow_state_containers();
+            let stop = Arc::new(OnceLock::new());
+            if stopped {
+                stop.set(SessionStopReason::Stopped).unwrap();
+            }
+            let mut link =
+                builder.create_link(Arc::new(Store::new(None)), OutputHandle(0), consumer, stop);
+            link.local_state = if closed {
+                LinkState::Closed
+            } else {
+                LinkState::Attached
+            };
+            let (session, _control) = mpsc::channel(8);
+            let (outgoing, mut sent) = mpsc::channel(8);
+            let (frames, incoming) = mpsc::channel(8);
+            if queued_close {
+                frames
+                    .send(LinkFrame::Detach(Detach {
+                        handle: 0.into(),
+                        closed: true,
+                        error: None,
+                    }))
+                    .await
+                    .unwrap();
+            }
+            let sender = Sender {
+                inner: SenderInner {
+                    link,
+                    buffer_size: 8,
+                    session,
+                    outgoing: outgoing.into(),
+                    incoming,
+                },
+            };
+            let retained = sender.into_detached();
+            assert_eq!(retained.is_ok(), allowed);
+            assert!(matches!(
+                sent.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            // An active endpoint was rejected, so its normal Drop semantics still apply.
+            drop(retained);
+        }
+    }
+}

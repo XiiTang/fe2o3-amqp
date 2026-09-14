@@ -1635,6 +1635,50 @@ impl From<ResumingReceiver> for Receiver {
 }
 
 impl DetachedReceiver {
+    /// Resume with an explicit interruption future while retaining ownership.
+    /// No Detach, settlement, or additional exchange is inferred on interruption.
+    pub async fn resume_on_session_until<R>(
+        mut self,
+        session: &SessionHandle<R>,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) -> Result<ResumingReceiver, ReceiverResumeError> {
+        if self.inner.link.session_stop_reason.get().is_some() {
+            self = match (Receiver { inner: self.inner }).into_detached() {
+                Ok(endpoint) => endpoint,
+                Err(endpoint) => {
+                    return Err(ReceiverResumeError {
+                        detached_recver: DetachedReceiver {
+                            inner: endpoint.inner,
+                        },
+                        kind: ReceiverAttachError::IllegalState.into(),
+                    })
+                }
+            };
+        }
+        self.inner.link.session_stop_reason = session.session_stop_reason().clone();
+        self.inner.session = session.control.clone();
+        self.inner.outgoing = session.outgoing.clone();
+        let result = tokio::select! { biased;
+            _ = interrupt => Err(ReceiverResumeErrorKind::Interrupted),
+            result = self.inner.resume_incoming_attach(None, false) => result,
+        };
+        match result {
+            Ok(exchange) => {
+                let receiver = Receiver { inner: self.inner };
+                Ok(match exchange {
+                    ReceiverAttachExchange::Complete => ResumingReceiver::Complete(receiver),
+                    ReceiverAttachExchange::IncompleteUnsettled => {
+                        ResumingReceiver::IncompleteUnsettled(receiver)
+                    }
+                    ReceiverAttachExchange::Resume => ResumingReceiver::Resume(receiver),
+                })
+            }
+            Err(kind) => Err(ReceiverResumeError {
+                detached_recver: self,
+                kind,
+            }),
+        }
+    }
     /// Get a reference to the link's source field
     pub fn source(&self) -> &Option<Source> {
         &self.inner.link.source
@@ -2078,7 +2122,44 @@ mod tests {
                 .unwrap()
                 .received
         );
-        drop(detached);
+        let (control, _controls) = mpsc::channel(8);
+        let (outgoing, mut next_sent) = mpsc::channel(8);
+        let (_outcome, outcome) = tokio::sync::oneshot::channel();
+        let mut next_session = SessionHandle {
+            is_ended: true,
+            engine_joined: false,
+            control,
+            outgoing: outgoing.into(),
+            engine_handle: tokio::spawn(std::future::pending()),
+            outcome,
+            session_stop_reason: Arc::new(OnceLock::new()),
+            link_listener: (),
+        };
+        let interrupted = detached
+            .resume_on_session_until(&next_session, std::future::ready(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            interrupted.kind,
+            ReceiverResumeErrorKind::Interrupted
+        ));
+        assert_eq!(
+            interrupted
+                .detached_recver
+                .inner
+                .incomplete_transfer
+                .as_ref()
+                .unwrap()
+                .buffer
+                .as_slice(),
+            &[0, 0x53, 0x75, 0xa0, 2, 0]
+        );
+        assert!(matches!(
+            next_sent.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(interrupted);
+        next_session.stop_and_join().await.unwrap();
         assert!(
             sent.try_recv().is_err(),
             "no second Detach or automatic disposition"

@@ -663,6 +663,10 @@ pub enum SenderResumeErrorKind {
     /// Resume timed out
     #[error("Resume timed out")]
     Timeout,
+
+    /// The caller interrupted the exchange; the endpoint remains owned.
+    #[error("Resume interrupted")]
+    Interrupted,
 }
 
 /// Sender encountered error with resumption
@@ -701,6 +705,10 @@ pub enum ReceiverResumeErrorKind {
     /// Resume timed out
     #[error("Resume timed out")]
     Timeout,
+
+    /// The caller interrupted the exchange; the endpoint remains owned.
+    #[error("Resume interrupted")]
+    Interrupted,
 }
 
 /// Receiver resumption error

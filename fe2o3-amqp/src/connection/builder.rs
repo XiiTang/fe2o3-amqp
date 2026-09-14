@@ -1372,6 +1372,7 @@ cfg_not_wasm32! {
 
         let connection_handle = ConnectionHandle {
             is_closed: false,
+            engine_joined: false,
             control: control_tx,
             handle,
             outcome,
@@ -1399,6 +1400,7 @@ cfg_wasm32! {
 
         let connection_handle = ConnectionHandle {
             is_closed: false,
+            engine_joined: false,
             control: control_tx,
             handle,
             outcome,
@@ -1423,6 +1425,7 @@ cfg_wasm32! {
 
         let connection_handle = ConnectionHandle {
             is_closed: false,
+            engine_joined: false,
             control: control_tx,
             handle,
             outcome,

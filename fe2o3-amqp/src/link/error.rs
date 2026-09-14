@@ -18,6 +18,8 @@ use super::{delivery::DeliveryInfo, receiver::DetachedReceiver, sender::Detached
 /// the connection's own stop reason (see [`ConnectionStopReason`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStopReason {
+    /// The owner stopped local processing without an End exchange.
+    Stopped,
     /// The session ended cleanly (locally)
     Ended,
     /// We ended the session with this error

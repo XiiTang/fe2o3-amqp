@@ -67,6 +67,8 @@ type SessionRelay = Arc<Sender<SessionIncomingItem>>;
 /// variants describe a remote-initiated close.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectionStopReason {
+    /// The owner stopped local processing without a Close exchange.
+    Stopped,
     /// The connection closed cleanly (locally)
     Closed,
     /// We closed the connection with this error
@@ -88,6 +90,7 @@ pub enum ConnectionStopReason {
 pub struct ConnectionHandle<R> {
     /// Only change this value in `on_close` method
     pub(crate) is_closed: bool,
+    pub(crate) engine_joined: bool,
     pub(crate) control: Sender<ConnectionControl>,
     pub(crate) handle: JoinHandle<()>,
     pub(crate) outcome: oneshot::Receiver<Result<(), Error>>,
@@ -107,6 +110,9 @@ impl<R> std::fmt::Debug for ConnectionHandle<R> {
 
 impl<R> Drop for ConnectionHandle<R> {
     fn drop(&mut self) {
+        if self.is_closed {
+            return;
+        }
         if let Err(_error) = self.control.try_send(ConnectionControl::Close(None)) {
             #[cfg(any(feature = "log", feature = "tracing"))]
             {
@@ -126,6 +132,25 @@ impl<R> Drop for ConnectionHandle<R> {
 }
 
 impl<R> ConnectionHandle<R> {
+    /// Stop the local engine and join its task, without sending protocol cleanup.
+    /// The owner must separately stop its transport/children. Repeated calls are safe.
+    pub async fn stop_and_join(&mut self) -> Result<(), tokio::task::JoinError> {
+        self.is_closed = true;
+        let _ = self
+            .connection_stop_reason
+            .set(ConnectionStopReason::Stopped);
+        if self.engine_joined {
+            return Ok(());
+        }
+        self.handle.abort();
+        let result = (&mut self.handle).await;
+        self.engine_joined = true;
+        match result {
+            Err(error) if error.is_cancelled() => Ok(()),
+            other => other,
+        }
+    }
+
     /// Checks if the underlying event loop has stopped
     pub fn is_closed(&self) -> bool {
         match self.is_closed {
@@ -910,6 +935,56 @@ mod tests {
             Err(AllocSessionError::ConnectionStopped(
                 ConnectionStopReason::Closed
             ))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod local_stop_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Released(Arc<AtomicBool>);
+    impl Drop for Released {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    #[tokio::test]
+    async fn stop_joins_a_blocked_engine_without_protocol_cleanup_or_detached_work() {
+        let released = Arc::new(AtomicBool::new(false));
+        let owned = released.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (outcome_tx, outcome) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _released = Released(owned);
+            let _outcome = outcome_tx;
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        let (control, mut commands) = tokio::sync::mpsc::channel(1);
+        let (outgoing, _outgoing_rx) = tokio::sync::mpsc::channel(1);
+        let mut owner = ConnectionHandle {
+            is_closed: false,
+            engine_joined: false,
+            handle: task,
+            outcome,
+            control,
+            outgoing,
+            connection_stop_reason: Arc::new(OnceLock::new()),
+            session_listener: (),
+        };
+        owner.stop_and_join().await.unwrap();
+        owner.stop_and_join().await.unwrap();
+        assert!(released.load(Ordering::Acquire));
+        assert!(matches!(
+            owner.connection_stop_reason.get(),
+            Some(ConnectionStopReason::Stopped)
+        ));
+        drop(owner);
+        assert!(matches!(
+            commands.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
         ));
     }
 }

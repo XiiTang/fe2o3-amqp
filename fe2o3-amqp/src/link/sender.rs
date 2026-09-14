@@ -255,9 +255,11 @@ impl Sender {
         // Detach the link
         let detach_result = self.inner.detach_with_error(None).await;
 
-        let is_reattaching = !self.inner.session.same_channel(&new_session.control);
+        // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
 
         // Re-attach the link
+        self.inner.link.session_stop_reason = new_session.session_stop_reason().clone();
         self.inner.session = new_session.control.clone();
         self.inner.outgoing = new_session.outgoing.clone();
         let attach_result = self
@@ -1127,7 +1129,8 @@ impl DetachedSender {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_sender!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(SenderResumeError {
                         detached_sender: self,
                         kind: SenderResumeErrorKind::Timeout,
@@ -1160,7 +1163,8 @@ impl DetachedSender {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_sender!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(SenderResumeError {
                         detached_sender: self,
                         kind: SenderResumeErrorKind::Timeout,
@@ -1184,7 +1188,9 @@ impl DetachedSender {
         mut self,
         session: &SessionHandle<R>,
     ) -> Result<Sender, SenderResumeError> {
-        let is_reattaching = !self.inner.session.same_channel(&session.control);
+        // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
+        self.inner.link.session_stop_reason = session.session_stop_reason().clone();
         self.inner.session = session.control.clone();
         self.inner.outgoing = session.outgoing.clone();
         self.resume_inner(is_reattaching).await
@@ -1196,7 +1202,9 @@ impl DetachedSender {
         remote_attach: Attach,
         session: &SessionHandle<R>,
     ) -> Result<Sender, SenderResumeError> {
-        let is_reattaching = !self.inner.session.same_channel(&session.control);
+        // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
+        self.inner.link.session_stop_reason = session.session_stop_reason().clone();
         self.inner.session = session.control.clone();
         self.inner.outgoing = session.outgoing.clone();
 
@@ -1216,8 +1224,10 @@ impl DetachedSender {
             session: &SessionHandle<R>,
             duration: Duration,
         ) -> Result<Sender, SenderResumeError> {
-            let is_reattaching = !self.inner.session.same_channel(&session.control);
-            self.inner.session = session.control.clone();
+            // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
+            self.inner.link.session_stop_reason = session.session_stop_reason().clone();
+        self.inner.session = session.control.clone();
             self.inner.outgoing = session.outgoing.clone();
             self.resume_with_timeout_inner(duration, is_reattaching).await
         }
@@ -1229,8 +1239,10 @@ impl DetachedSender {
             session: &SessionHandle<R>,
             duration: Duration,
         ) -> Result<Sender, SenderResumeError> {
-            let is_reattaching = !self.inner.session.same_channel(&session.control);
-            self.inner.session = session.control.clone();
+            // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
+            self.inner.link.session_stop_reason = session.session_stop_reason().clone();
+        self.inner.session = session.control.clone();
             self.inner.outgoing = session.outgoing.clone();
             self.resume_incoming_attach_with_timeout_inner(remote_attach, duration, is_reattaching)
                 .await

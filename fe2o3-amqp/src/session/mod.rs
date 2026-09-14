@@ -42,6 +42,7 @@ cfg_transaction! {
 
 pub(crate) mod engine;
 pub(crate) mod frame;
+pub(crate) mod receive_window;
 
 pub mod error;
 use error::{
@@ -243,6 +244,29 @@ impl<R> SessionHandle<R> {
     }
 }
 
+/// Size the link inbox for every transfer promised by the session, plus the
+/// attach/detach control frames. Tokio allocates queue blocks only as used.
+pub(crate) async fn link_incoming_capacity(
+    control: &mpsc::Sender<SessionControl>,
+    minimum: usize,
+    reason: &OnceLock<SessionStopReason>,
+) -> Result<usize, AllocLinkError> {
+    let (tx, rx) = oneshot::channel();
+    let stopped = || {
+        AllocLinkError::SessionStopped(reason.get().cloned().unwrap_or(SessionStopReason::Ended))
+    };
+    control
+        .send(SessionControl::GetIncomingWindow(tx))
+        .await
+        .map_err(|_| stopped())?;
+    let window = rx.await.map_err(|_| stopped())?;
+    (window as usize)
+        .checked_add(2)
+        .map(|n| n.max(minimum))
+        .filter(|n| *n <= tokio::sync::Semaphore::MAX_PERMITS)
+        .ok_or(AllocLinkError::NativeBufferTooLarge)
+}
+
 /// # Cancel safety
 ///
 /// It internally `.await` on a send on `tokio::mpsc::Sender` and on a `oneshot::Receiver`.
@@ -350,11 +374,9 @@ pub struct Session {
     pub(crate) incoming_channel: Option<IncomingChannel>,
     // initialize with 0 first and change after receiving the remote Begin
     pub(crate) next_incoming_id: TransferNumber,
-    // Number of transfer frames received since the last session flow was sent.
-    // Used to re-advertise the session window (advancing next-incoming-id) when half
-    // of the incoming-window has been consumed, mirroring go-amqp's approach. This
-    // keeps the peer's send window sliding even when no link-level flow is generated.
+    // Consumed transfer slots since the last session-only window update.
     pub(crate) need_flow_count: u32,
+    pub(crate) receive_window: Arc<receive_window::ReceiveWindow>,
     pub(crate) remote_incoming_window: SequenceNo,
     // Outgoing transfers that are blocked by the remote-incoming-window
     pub(crate) remote_incoming_window_exhausted_buffer: VecDeque<(InputHandle, Transfer, Payload)>,
@@ -478,7 +500,7 @@ impl Session {
         let flow = Flow {
             // Session flow states
             next_incoming_id: Some(self.next_incoming_id),
-            incoming_window: self.incoming_window,
+            incoming_window: self.receive_window.available(),
             next_outgoing_id: self.next_outgoing_id,
             outgoing_window: self.outgoing_window,
             // No link flow states: this is a session-only flow
@@ -797,14 +819,17 @@ impl endpoint::Session for Session {
         // remote-outgoing-window, and MAY (depending on policy) decrement its incoming-window.
         self.next_incoming_id = self.next_incoming_id.wrapping_add(1);
         self.remote_outgoing_window = self.remote_outgoing_window.saturating_sub(1);
-        self.need_flow_count = self.need_flow_count.saturating_add(1);
-
-        // TODO: allow user to define whether the incoming window should be decremented
+        let slot = self
+            .receive_window
+            .reserve()
+            .ok_or(SessionInnerError::WindowViolation)?;
 
         let input_handle = InputHandle::from(transfer.handle.clone());
         match self.link_by_input_handle.get_mut(&input_handle) {
             Some(link_relay) => {
-                let id_and_tag = link_relay.on_incoming_transfer(transfer, payload).await?;
+                let id_and_tag = link_relay
+                    .on_incoming_transfer(transfer, payload, Some(slot))
+                    .await?;
 
                 // FIXME: If the unsettled map needs this
                 if let Some((delivery_id, delivery_tag)) = id_and_tag {
@@ -826,11 +851,23 @@ impl endpoint::Session for Session {
         let first = disposition.first;
         let last = disposition.last.unwrap_or(first);
 
+        // The peer chooses a serial-number interval, not a loop bound. Work is
+        // proportional to our actual unsettled identities, including wraparound.
+        let width = last.wrapping_sub(first);
+        let mut matching_ids: Vec<_> = self
+            .delivery_tag_by_id
+            .keys()
+            .filter_map(|(role, id)| {
+                (role == &disposition.role && id.wrapping_sub(first) <= width).then_some(*id)
+            })
+            .collect();
+        matching_ids.sort_unstable_by_key(|id| id.wrapping_sub(first));
+
         // A disposition frame may refer to deliveries on multiple links, each may be running
         // in different mode. This counts the largest sections that can be echoed back together
         if disposition.settled {
             // If it is alrea
-            for delivery_id in first..=last {
+            for delivery_id in matching_ids {
                 let key = (disposition.role.clone(), delivery_id);
                 if let Some((handle, delivery_tag)) = self.delivery_tag_by_id.remove(&key) {
                     if let Some(link_handle) = self.link_by_input_handle.get_mut(&handle) {
@@ -847,7 +884,7 @@ impl endpoint::Session for Session {
             Ok(None)
         } else {
             let mut delivery_ids = Vec::new();
-            for delivery_id in first..=last {
+            for delivery_id in matching_ids {
                 let key = (disposition.role.clone(), delivery_id);
                 if let Some((handle, delivery_tag)) = self.delivery_tag_by_id.get(&key) {
                     if let Some(link_handle) = self.link_by_input_handle.get_mut(handle) {
@@ -867,6 +904,8 @@ impl endpoint::Session for Session {
                 }
             }
 
+            // Chunking expects numeric order and must not span uint wraparound.
+            delivery_ids.sort_unstable();
             let chunk_inds = consecutive_chunk_indices(&delivery_ids[..]);
 
             let mut dispositions = Vec::with_capacity(chunk_inds.len());
@@ -958,7 +997,7 @@ impl endpoint::Session for Session {
         let begin = Begin {
             remote_channel: self.incoming_channel.map(Into::into),
             next_outgoing_id: self.next_outgoing_id,
-            incoming_window: self.incoming_window,
+            incoming_window: self.receive_window.available(),
             outgoing_window: self.outgoing_window,
             handle_max: self.handle_max.clone(),
             offered_capabilities: self.offered_capabilities.clone().map(Into::into),
@@ -1034,7 +1073,7 @@ impl endpoint::Session for Session {
         let flow = Flow {
             // Session flow states
             next_incoming_id: Some(self.next_incoming_id),
-            incoming_window: self.incoming_window,
+            incoming_window: self.receive_window.available(),
             next_outgoing_id: self.next_outgoing_id,
             outgoing_window: self.outgoing_window,
             // Link flow states
@@ -1052,18 +1091,23 @@ impl endpoint::Session for Session {
         Ok(frame)
     }
 
-    /// Returns a session-only flow to send when half of the incoming-window has been consumed
-    /// by received transfer frames, mirroring go-amqp's proactive window top-up. The advertised
-    /// window size is constant; the peer's remaining allowance is recomputed from the advanced
-    /// `next-incoming-id`, so a peer that relies on continuous sending never stalls when no
-    /// link-level flow is generated.
+    /// Slots remain occupied while a frame waits in a link inbox. Consumption
+    /// wakes the engine so it can replenish the peer's window even without a
+    /// new inbound frame or application command.
+    fn receive_window(&self) -> &Arc<receive_window::ReceiveWindow> {
+        &self.receive_window
+    }
+
     fn maybe_outgoing_session_flow(&mut self) -> Option<SessionOutgoingItem> {
+        self.need_flow_count = self
+            .need_flow_count
+            .saturating_add(self.receive_window.take_released());
         // Only send while the session is fully mapped; no flows are emitted during teardown.
         if !matches!(self.local_state, SessionState::Mapped) {
             return None;
         }
 
-        if self.need_flow_count >= self.incoming_window / 2 {
+        if self.need_flow_count >= (self.incoming_window / 2).max(1) {
             self.need_flow_count = 0;
             Some(SessionOutgoingItem::SingleFrame(
                 self.on_outgoing_session_flow(),
@@ -1211,6 +1255,151 @@ mod tests {
                 SessionState::Mapped,
                 Arc::new(OnceLock::new()),
             )
+    }
+
+    #[test]
+    fn peer_disposition_ranges_visit_only_live_ids_and_cover_serial_wrap() {
+        use crate::endpoint::InputHandle;
+        use fe2o3_amqp_types::{definitions::Role, performatives::Disposition};
+        let mut session = mapped_session();
+        for id in [0, 1, 4, u32::MAX - 1, u32::MAX] {
+            session
+                .delivery_tag_by_id
+                .insert((Role::Sender, id), (InputHandle(0), vec![1].into()));
+        }
+        session
+            .delivery_tag_by_id
+            .insert((Role::Receiver, 0), (InputHandle(0), vec![2].into()));
+        let mut frame = Disposition {
+            role: Role::Sender,
+            first: u32::MAX - 1,
+            last: Some(1),
+            settled: true,
+            state: None,
+            batchable: false,
+        };
+        session.on_incoming_disposition(frame.clone()).unwrap();
+        assert_eq!(session.delivery_tag_by_id.len(), 2);
+        assert!(session.delivery_tag_by_id.contains_key(&(Role::Sender, 4)));
+        assert!(session
+            .delivery_tag_by_id
+            .contains_key(&(Role::Receiver, 0)));
+        // This used to enumerate all 2^32 possible IDs on the session driver.
+        frame.first = 0;
+        frame.last = Some(u32::MAX);
+        session.on_incoming_disposition(frame).unwrap();
+        assert_eq!(session.delivery_tag_by_id.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unread_transfers_hold_session_window_but_do_not_block_settlement() {
+        use crate::{
+            endpoint::{InputHandle, OutputHandle},
+            link::{
+                state::{LinkFlowState, LinkFlowStateInner},
+                unsettled_store::Store,
+                LinkFrame, LinkRelay,
+            },
+            Payload,
+        };
+        use fe2o3_amqp_types::{
+            definitions::{ReceiverSettleMode, Role},
+            performatives::{Disposition, Transfer},
+        };
+        let mut session = Builder::new().incoming_window(4).into_session(
+            OutgoingChannel(0),
+            SessionState::Mapped,
+            Arc::new(OnceLock::new()),
+        );
+        let (tx, mut inbox) = tokio::sync::mpsc::channel(6);
+        let unsettled = Arc::new(Store::new(None));
+        let flow = Arc::new(LinkFlowState::receiver(LinkFlowStateInner {
+            initial_delivery_count: 0,
+            delivery_count: 0,
+            link_credit: 8,
+            available: 0,
+            drain: false,
+            properties: None,
+        }));
+        let relay =
+            LinkRelay::new_receiver(tx, flow, unsettled.clone(), ReceiverSettleMode::Second)
+                .with_output_handle(OutputHandle(0));
+        session.link_by_input_handle.insert(InputHandle(0), relay);
+        let template: Transfer =
+            serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x55, 0x43])
+                .unwrap();
+        for id in 0..4 {
+            let mut transfer = template.clone();
+            transfer.delivery_id = Some(id);
+            transfer.delivery_tag = Some(vec![id as u8].into());
+            session
+                .on_incoming_transfer(transfer, Payload::new())
+                .await
+                .unwrap();
+            assert!(session.maybe_outgoing_session_flow().is_none());
+        }
+        assert_eq!(session.receive_window.available(), 0);
+        session
+            .on_incoming_disposition(Disposition {
+                role: Role::Sender,
+                first: 0,
+                last: Some(3),
+                settled: true,
+                state: None,
+                batchable: false,
+            })
+            .unwrap();
+        assert!(unsettled.read().as_ref().unwrap().is_empty());
+        assert_eq!(
+            session.receive_window.available(),
+            0,
+            "settlement is not frame consumption"
+        );
+        let first = inbox.recv().await.unwrap();
+        assert!(matches!(first, LinkFrame::Transfer { .. }));
+        assert_eq!(
+            session.receive_window.available(),
+            0,
+            "dequeue alone must retain the slot during processing"
+        );
+        drop(first);
+        assert_eq!(session.receive_window.available(), 1);
+        assert!(session.maybe_outgoing_session_flow().is_none());
+        drop(inbox.recv().await.unwrap());
+        let Some(SessionOutgoingItem::SingleFrame(SessionFrame {
+            body: SessionFrameBody::Flow(flow),
+            ..
+        })) = session.maybe_outgoing_session_flow()
+        else {
+            panic!("consumption must reopen window")
+        };
+        assert_eq!(flow.incoming_window, 2);
+        assert_eq!(flow.next_incoming_id, Some(4));
+        drop(inbox);
+        assert_eq!(
+            session.receive_window.available(),
+            4,
+            "closing a child releases its queued slots"
+        );
+    }
+
+    #[tokio::test]
+    async fn excess_transfer_is_rejected_without_creating_an_unsettled_identity() {
+        use crate::Payload;
+        let mut session = Builder::new().incoming_window(0).into_session(
+            OutgoingChannel(0),
+            SessionState::Mapped,
+            Arc::new(OnceLock::new()),
+        );
+        let transfer =
+            serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x55, 0x43])
+                .unwrap();
+        assert!(matches!(
+            session.on_incoming_transfer(transfer, Payload::new()).await,
+            Err(super::SessionInnerError::WindowViolation)
+        ));
+        assert!(session.delivery_tag_by_id.is_empty());
+        assert_eq!(session.receive_window.available(), 0);
     }
 
     #[test]

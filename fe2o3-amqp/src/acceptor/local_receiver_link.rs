@@ -141,7 +141,13 @@ where
         };
 
         // Create channels for Session-Link communication
-        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(shared.buffer_size);
+        let capacity = crate::session::link_incoming_capacity(
+            &control,
+            shared.buffer_size,
+            &session_stop_reason,
+        )
+        .await?;
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(capacity);
 
         // Create shared flow state
         let flow_state_inner = LinkFlowStateInner {

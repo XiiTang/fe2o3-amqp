@@ -783,6 +783,7 @@ impl LinkRelay<OutputHandle> {
         &mut self,
         transfer: Transfer,
         payload: Payload,
+        window_slot: Option<crate::session::receive_window::Slot>,
     ) -> Result<Option<(DeliveryNumber, DeliveryTag)>, LinkRelayError> {
         match self {
             LinkRelay::Sender { .. } => Err(LinkRelayError::TransferFrameToSender),
@@ -846,6 +847,7 @@ impl LinkRelay<OutputHandle> {
                     input_handle: InputHandle::from(transfer.handle.clone()),
                     performative: transfer,
                     payload,
+                    window_slot,
                 })
                 .await
                 .map_err(|_| LinkRelayError::UnattachedHandle)?;
@@ -950,7 +952,7 @@ mod incoming_identity_tests {
             let tag = first.delivery_tag.clone().unwrap();
             assert_eq!(
                 relay
-                    .on_incoming_transfer(first.clone(), Payload::new())
+                    .on_incoming_transfer(first.clone(), Payload::new(), None)
                     .await
                     .unwrap(),
                 Some((0, tag.clone()))
@@ -964,7 +966,7 @@ mod incoming_identity_tests {
             next.message_format = None;
             assert_eq!(
                 relay
-                    .on_incoming_transfer(next.clone(), Payload::new())
+                    .on_incoming_transfer(next.clone(), Payload::new(), None)
                     .await
                     .unwrap(),
                 None
@@ -972,7 +974,7 @@ mod incoming_identity_tests {
             next.more = false;
             assert_eq!(
                 relay
-                    .on_incoming_transfer(next, Payload::new())
+                    .on_incoming_transfer(next, Payload::new(), None)
                     .await
                     .unwrap(),
                 None
@@ -983,7 +985,7 @@ mod incoming_identity_tests {
             first.more = false;
             assert_eq!(
                 relay
-                    .on_incoming_transfer(first, Payload::new())
+                    .on_incoming_transfer(first, Payload::new(), None)
                     .await
                     .unwrap(),
                 Some((1, vec![0x56].into()))

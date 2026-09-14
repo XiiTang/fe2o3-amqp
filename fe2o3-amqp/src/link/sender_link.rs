@@ -422,6 +422,7 @@ async fn send_transfer(
     session_stop_reason: &OnceLock<SessionStopReason>,
 ) -> Result<(), LinkStateError> {
     let frame = LinkFrame::Transfer {
+        window_slot: None,
         input_handle,
         performative: transfer,
         payload,
@@ -784,7 +785,8 @@ where
         session: &mpsc::Sender<SessionControl>,
     ) -> SenderAttachError {
         match attach_error {
-            SenderAttachError::SessionStopped(_)
+            SenderAttachError::NativeBufferTooLarge
+            | SenderAttachError::SessionStopped(_)
             | SenderAttachError::SessionNotMapped
             | SenderAttachError::IllegalState
             | SenderAttachError::NonAttachFrameReceived

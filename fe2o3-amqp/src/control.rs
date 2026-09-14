@@ -65,6 +65,7 @@ pub(crate) enum SessionControl {
     Disposition(Disposition),
     CloseConnectionWithError((ConnectionError, Option<String>)),
     GetMaxFrameSize(oneshot::Sender<usize>),
+    GetIncomingWindow(oneshot::Sender<u32>),
 
     // Transaction related controls
     #[cfg(feature = "transaction")]
@@ -104,6 +105,7 @@ impl std::fmt::Display for SessionControl {
             SessionControl::Disposition(_) => write!(f, "Disposition"),
             SessionControl::CloseConnectionWithError(_) => write!(f, "CloseConnectionWithError"),
             SessionControl::GetMaxFrameSize(_) => write!(f, "GetMaxFrameSize"),
+            SessionControl::GetIncomingWindow(_) => write!(f, "GetIncomingWindow"),
 
             #[cfg(feature = "transaction")]
             SessionControl::AllocateTransactionId { .. } => write!(f, "AllocateTransactionId"),

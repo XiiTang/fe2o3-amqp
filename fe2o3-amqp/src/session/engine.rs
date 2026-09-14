@@ -210,10 +210,8 @@ where
                     })?;
                 }
 
-                // Re-advertise the session window (session-only flow) once half of the
-                // incoming-window has been consumed by received transfers, mirroring
-                // go-amqp's proactive top-up. This keeps the peer's send window sliding
-                // even when no link-level flow is generated.
+                // A receiver may already have consumed a queued frame. Only
+                // consumed slots permit the session window to grow again.
                 if let Some(outgoing_item) = self.session.maybe_outgoing_session_flow() {
                     send_outgoing_item(
                         &self.outgoing,
@@ -360,6 +358,9 @@ where
                     ))
                 })?;
             }
+            SessionControl::GetIncomingWindow(resp) => {
+                let _ = resp.send(self.session.receive_window().maximum());
+            }
             SessionControl::GetMaxFrameSize(resp) => {
                 self.conn_control
                     .send(ConnectionControl::GetMaxFrameSize(resp))
@@ -423,6 +424,7 @@ where
                 .map(SessionOutgoingItem::SingleFrame)
                 .map(Some)?,
             LinkFrame::Transfer {
+                window_slot: _,
                 input_handle,
                 performative,
                 payload,
@@ -469,6 +471,10 @@ where
         use fe2o3_amqp_types::transaction::TransactionError;
 
         match kind {
+            SessionInnerError::WindowViolation => {
+                let error = Error::new(SessionError::WindowViolation, None, None);
+                self.end_session(Some(error)).await
+            }
             SessionInnerError::InvalidTransfer => {
                 let error = Error::new(AmqpError::InvalidField, None, None);
                 self.end_session(Some(error)).await
@@ -605,8 +611,14 @@ where
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "Session::event_loop", skip(self), fields(outgoing_channel = %self.session.outgoing_channel().0)))]
     async fn event_loop(mut self, tx: oneshot::Sender<Result<(), Error>>) {
         let mut outcome = Ok(());
+        let receive_window = self.session.receive_window().clone();
         loop {
             let result = tokio::select! {
+                _ = receive_window.changed.notified() => {
+                    if let Some(item) = self.session.maybe_outgoing_session_flow() {
+                        send_outgoing_item(&self.outgoing, item, self.session.connection_stop_reason()).await.map(|_| Running::Continue)
+                    } else { Ok(Running::Continue) }
+                },
                 incoming = self.incoming.recv() => {
                     match incoming {
                         Some(incoming) => self.on_incoming(incoming).await,

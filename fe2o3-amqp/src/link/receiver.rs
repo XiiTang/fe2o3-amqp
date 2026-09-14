@@ -363,7 +363,7 @@ impl Receiver {
     /// Preserve the actual endpoint after Detach or a stopped parent session.
     /// A still-active endpoint is returned unchanged as an error; this method
     /// does not perform I/O or manufacture an attached link's suspension.
-    pub fn into_detached(self) -> Result<DetachedReceiver, Self> {
+    pub fn into_detached(mut self) -> Result<DetachedReceiver, Self> {
         if matches!(
             self.inner.link.local_state,
             super::state::LinkState::Closed
@@ -377,6 +377,9 @@ impl Receiver {
             super::state::LinkState::Detached
         ) || self.inner.link.session_stop_reason.get().is_some()
         {
+            self.inner.link.local_state = super::state::LinkState::Detached;
+            self.inner.link.output_handle.take();
+            self.inner.link.input_handle.take();
             Ok(DetachedReceiver { inner: self.inner })
         } else {
             Err(self)

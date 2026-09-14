@@ -227,6 +227,11 @@ impl Sender {
                 }
             }
         }
+        // A stopped session has no live link handles. The endpoint and its
+        // unsettled map survive, but attachment belongs to the next session.
+        self.inner.link.local_state = LinkState::Detached;
+        self.inner.link.output_handle.take();
+        self.inner.link.input_handle.take();
         Ok(DetachedSender { inner: self.inner })
     }
 

@@ -81,6 +81,8 @@ impl From<SessionStateError> for BeginError {
 /// Error with session operations
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SessionInnerError {
+    #[error("Invalid or duplicate transfer identity")]
+    InvalidTransfer,
     /// A frame (other than attach) was received referencing a handle which is not currently in use of an attached link.
     #[error("A frame (other than attach) was received referencing a handle which is not currently in use of an attached link.")]
     UnattachedHandle,
@@ -133,6 +135,7 @@ impl From<SessionStateError> for SessionInnerError {
 impl From<LinkRelayError> for SessionInnerError {
     fn from(error: LinkRelayError) -> Self {
         match error {
+            LinkRelayError::InvalidTransfer => Self::InvalidTransfer,
             LinkRelayError::UnattachedHandle => Self::UnattachedHandle,
             LinkRelayError::TransferFrameToSender => Self::TransferFrameToSender,
         }
@@ -143,6 +146,9 @@ impl From<LinkRelayError> for SessionInnerError {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The peer sent invalid or duplicate transfer identity fields.
+    #[error("Invalid or duplicate transfer identity")]
+    InvalidTransfer,
     /// A frame (other than attach) was received referencing a handle which is not currently in use of an attached link.
     #[error("A frame (other than attach) was received referencing a handle which is not currently in use of an attached link.")]
     UnattachedHandle,
@@ -184,6 +190,7 @@ pub enum Error {
 impl From<SessionInnerError> for Error {
     fn from(error: SessionInnerError) -> Self {
         match error {
+            SessionInnerError::InvalidTransfer => Self::InvalidTransfer,
             SessionInnerError::UnattachedHandle => Self::UnattachedHandle,
             SessionInnerError::RemoteAttachingLinkNameNotFound => {
                 Self::RemoteAttachingLinkNameNotFound
@@ -205,6 +212,7 @@ impl From<SessionInnerError> for Error {
 impl From<LinkRelayError> for Error {
     fn from(error: LinkRelayError) -> Self {
         match error {
+            LinkRelayError::InvalidTransfer => Self::InvalidTransfer,
             LinkRelayError::UnattachedHandle => Self::UnattachedHandle,
             LinkRelayError::TransferFrameToSender => {
                 unreachable!("A sender should not receive a transfer frame")

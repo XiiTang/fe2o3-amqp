@@ -108,10 +108,11 @@ where
 
         {
             let mut guard = self.unsettled.write();
-            // The same key may be writter multiple times
-            let _ = guard
-                .get_or_insert(OrderedMap::new())
-                .insert(delivery_tag, Some(state));
+            if let Some(current) = guard.as_mut().and_then(|map| map.get_mut(&delivery_tag)) {
+                if !current.as_ref().is_some_and(DeliveryState::is_terminal) {
+                    *current = Some(state);
+                }
+            }
         }
     }
 
@@ -137,7 +138,13 @@ where
 
         // This only takes care of whether the message is considered
         // sett
-        let settled_by_sender = transfer.settled.unwrap_or(false);
+        let settled_by_sender = transfer.settled.unwrap_or(false)
+            || !transfer.delivery_tag.as_ref().is_some_and(|tag| {
+                self.unsettled
+                    .read()
+                    .as_ref()
+                    .is_some_and(|map| map.contains_key(tag))
+            });
         let delivery_id = transfer
             .delivery_id
             .ok_or(Self::TransferError::DeliveryIdIsNone)?;
@@ -192,10 +199,11 @@ where
             // set the delivery state
             {
                 let mut lock = self.unsettled.write();
-                // There may be records of incomplete delivery
-                let _ = lock
-                    .get_or_insert(OrderedMap::new())
-                    .insert(delivery_tag.clone(), Some(state));
+                if let Some(current) = lock.as_mut().and_then(|map| map.get_mut(&delivery_tag)) {
+                    if !current.as_ref().is_some_and(DeliveryState::is_terminal) {
+                        *current = Some(state);
+                    }
+                }
             }
             (result, mode)
         };

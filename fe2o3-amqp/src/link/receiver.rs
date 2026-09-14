@@ -130,6 +130,14 @@ impl Receiver {
         self.inner.link.name()
     }
 
+    /// Observe the engine's unsettled map without a second disposition ledger.
+    pub fn settlement_view(&self) -> ReceiverSettlementView {
+        ReceiverSettlementView {
+            changed: self.inner.link.unsettled.subscribe(),
+            unsettled: self.inner.link.unsettled.clone(),
+        }
+    }
+
     /// Set the shared native budget before receiving any message fragments.
     /// Existing retained fragments cannot be silently moved to another budget.
     pub fn set_receive_budget(
@@ -796,6 +804,26 @@ impl From<Modified> for TerminalDeliveryState {
     }
 }
 
+/// A read-only view of the receiver engine's unsettled delivery state.
+#[derive(Debug)]
+pub struct ReceiverSettlementView {
+    unsettled: ArcReceiverUnsettledMap,
+    changed: tokio::sync::watch::Receiver<u64>,
+}
+impl ReceiverSettlementView {
+    /// Whether this exact tag remains unsettled in the engine.
+    pub fn contains(&self, tag: &DeliveryTag) -> bool {
+        self.unsettled
+            .read()
+            .as_ref()
+            .is_some_and(|map| map.contains_key(tag))
+    }
+    /// Wait for any map change. Updates coalesce and never form a frame queue.
+    pub async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
+        self.changed.changed().await
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ReceiverInner<L: endpoint::ReceiverLink> {
     pub(crate) link: L,
@@ -882,6 +910,7 @@ where
             // This only controls whether a multi-transfer delivery id
             // will be added to sessions map
             more: false,
+            current_tag: None,
         }
     }
 
@@ -1846,7 +1875,8 @@ mod tests {
     #[tokio::test]
     async fn accept_sends_disposition_frame() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![0x01]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -1869,7 +1899,8 @@ mod tests {
     #[tokio::test]
     async fn release_sends_released_disposition() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![0x02]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -1891,7 +1922,8 @@ mod tests {
     #[tokio::test]
     async fn accept_removes_from_unsettled_map() {
         let (tx, _rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![0x0A], vec![0x0B]]);
 
         let disposer = make_disposer(tx, unsettled.clone(), CreditMode::Manual);
@@ -1908,7 +1940,8 @@ mod tests {
     #[tokio::test]
     async fn processed_counter_increments() {
         let (tx, _rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![1], vec![2], vec![3]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -1934,7 +1967,8 @@ mod tests {
         // Auto(10) → triggers refresh after 5 dispositions
         let max_credit = 10u32;
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(32);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         let tags: Vec<Vec<u8>> = (1..=5).map(|i| vec![i]).collect();
         seed_unsettled(&unsettled, &tags);
 
@@ -1970,7 +2004,8 @@ mod tests {
     #[tokio::test]
     async fn no_disposition_for_unknown_delivery_tag() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![0x01]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -1988,7 +2023,8 @@ mod tests {
     #[tokio::test]
     async fn clone_shares_state() {
         let (tx, _rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![1], vec![2]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -2010,7 +2046,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_accepts_are_safe() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(1024);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         let tags: Vec<Vec<u8>> = (0..100u8).map(|i| vec![i]).collect();
         seed_unsettled(&unsettled, &tags);
 

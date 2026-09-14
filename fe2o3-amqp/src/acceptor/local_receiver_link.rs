@@ -10,7 +10,6 @@ use fe2o3_amqp_types::{
     performatives::Attach,
     primitives::Symbol,
 };
-use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -158,7 +157,7 @@ where
         let flow_state_consumer = flow_state;
 
         // Comparing unsettled should be taken care of in `on_incoming_attach`
-        let unsettled = Arc::new(RwLock::new(None));
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
         let link_handle = LinkRelay::Receiver {
             tx: incoming_tx,
             output_handle: (),
@@ -166,6 +165,7 @@ where
             unsettled: unsettled.clone(),
             receiver_settle_mode: rcv_settle_mode.clone(),
             more: false,
+            current_tag: None,
         };
 
         // Allocate link in session

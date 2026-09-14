@@ -68,23 +68,8 @@ where
             // FIXME: Simply remove from the unsettled map?
             let _ = map.swap_remove(delivery_tag);
         } else {
-            // If a terminal state is already achieved, cannot send any further
-            let value = map.get_mut(delivery_tag);
-            match value {
-                Some(val) => {
-                    match val.as_ref().map(|v| v.is_terminal()) {
-                        Some(true) => {
-                            // Note that if the transfer performative (or an earlier disposition performative referring to the
-                            //     delivery) indicates that the delivery has attained a terminal state, then no future transfer or
-                            //     disposition sent by the sender can alter that terminal state.
-                            return Ok(());
-                        }
-                        _ => *val = Some(state),
-                    }
-                }
-                None => {
-                    map.insert(delivery_tag.clone(), Some(state));
-                }
+            if let Some(value) = map.get_mut(delivery_tag) {
+                value.remote_state(Some(state));
             }
         }
         Ok(())
@@ -109,9 +94,7 @@ where
         {
             let mut guard = self.unsettled.write();
             if let Some(current) = guard.as_mut().and_then(|map| map.get_mut(&delivery_tag)) {
-                if !current.as_ref().is_some_and(DeliveryState::is_terminal) {
-                    *current = Some(state);
-                }
+                current.received(state, false);
             }
         }
     }
@@ -200,9 +183,7 @@ where
             {
                 let mut lock = self.unsettled.write();
                 if let Some(current) = lock.as_mut().and_then(|map| map.get_mut(&delivery_tag)) {
-                    if !current.as_ref().is_some_and(DeliveryState::is_terminal) {
-                        *current = Some(state);
-                    }
+                    current.received(state, result.is_ok());
                 }
             }
             (result, mode)
@@ -279,8 +260,12 @@ where
             let mut lock = self.unsettled.write();
             // If the key is present in the map, the old value will be returned, which
             // we don't really need
-            lock.get_or_insert(OrderedMap::new())
-                .insert(delivery_info.delivery_tag.clone(), Some(state.clone()))
+            lock.as_mut()
+                .and_then(|map| map.get_mut(&delivery_info.delivery_tag))
+                .map(|entry| {
+                    entry.local_state(state.clone());
+                    entry.clone()
+                })
         };
 
         // Only dispose if message is found in unsettled map
@@ -370,22 +355,35 @@ impl<T> ReceiverLink<T> {
     fn handle_unsettled_in_attach(
         &mut self,
         remote_unsettled: Option<OrderedMap<DeliveryTag, Option<DeliveryState>>>,
+        remote_incomplete: bool,
     ) -> ReceiverAttachExchange {
-        let remote_is_empty = match remote_unsettled {
-            Some(map) => map.is_empty(),
-            None => true,
-        };
-
-        // ActiveMQ-Artemis seems like ignores non-empty unsettled from receiver-link
-        if remote_is_empty {
-            return ReceiverAttachExchange::Complete;
+        let remote_is_empty = remote_unsettled.as_ref().is_none_or(|map| map.is_empty());
+        {
+            let mut guard = self.unsettled.write();
+            if let Some(local) = guard.as_mut() {
+                local.as_inner_mut().retain(|tag, entry| {
+                    if let Some(remote) = remote_unsettled.as_ref().and_then(|map| map.get(tag)) {
+                        entry.remote_state(remote.clone());
+                        true
+                    } else {
+                        remote_incomplete
+                    }
+                });
+            }
         }
-
-        match self.local_state {
-            LinkState::IncompleteAttachReceived
-            | LinkState::IncompleteAttachSent
-            | LinkState::IncompleteAttachExchanged => ReceiverAttachExchange::IncompleteUnsettled,
-            _ => ReceiverAttachExchange::Resume,
+        if remote_incomplete
+            || matches!(
+                self.local_state,
+                LinkState::IncompleteAttachReceived
+                    | LinkState::IncompleteAttachSent
+                    | LinkState::IncompleteAttachExchanged
+            )
+        {
+            ReceiverAttachExchange::IncompleteUnsettled
+        } else if remote_is_empty {
+            ReceiverAttachExchange::Complete
+        } else {
+            ReceiverAttachExchange::Resume
         }
     }
 
@@ -424,8 +422,12 @@ impl<T> ReceiverLink<T> {
         } else {
             let mut lock = self.unsettled.write();
             for info in consecutive_infos {
-                lock.get_or_insert(OrderedMap::new())
-                    .insert(info.delivery_tag.clone(), Some(state.clone()));
+                if let Some(entry) = lock
+                    .as_mut()
+                    .and_then(|map| map.get_mut(&info.delivery_tag))
+                {
+                    entry.local_state(state.clone());
+                }
             }
         }
 
@@ -672,7 +674,10 @@ where
         }
 
         // Ok(Self::AttachExchange::Complete)
-        Ok(self.handle_unsettled_in_attach(remote_attach.unsettled))
+        Ok(self.handle_unsettled_in_attach(
+            remote_attach.unsettled,
+            remote_attach.incomplete_unsettled,
+        ))
     }
 
     /// # Cancel safety
@@ -898,6 +903,73 @@ mod tests {
     use crate::link::receiver_link::count_number_of_sections_and_offset;
 
     use super::is_consecutive;
+
+    #[test]
+    fn recovery_reconciles_only_complete_peer_maps_and_preserves_local_progress() {
+        use super::*;
+        for incomplete in [false, true] {
+            let known: DeliveryTag = vec![1].into();
+            let absent: DeliveryTag = vec![2].into();
+            let unknown: DeliveryTag = vec![3].into();
+            let mut local = OrderedMap::new();
+            for tag in [&known, &absent] {
+                let mut entry = receiver_delivery::ReceiverDelivery::new(None);
+                entry.received(
+                    fe2o3_amqp_types::messaging::Received {
+                        section_number: 1,
+                        section_offset: 0,
+                    }
+                    .into(),
+                    true,
+                );
+                local.insert(tag.clone(), entry);
+            }
+            let map = Arc::new(unsettled_store::Store::new(Some(local)));
+            let flow = Arc::new(LinkFlowState::receiver(state::LinkFlowStateInner {
+                initial_delivery_count: 0,
+                delivery_count: 0,
+                link_credit: 1,
+                available: 0,
+                drain: false,
+                properties: None,
+            }));
+            let mut link = Receiver::builder()
+                .name("resume")
+                .source("source")
+                .target("target")
+                .create_link(
+                    map.clone(),
+                    OutputHandle(0),
+                    flow,
+                    Arc::new(OnceLock::new()),
+                );
+            link.local_state = LinkState::Attached;
+            let mut peer = OrderedMap::new();
+            peer.insert(
+                known.clone(),
+                Some(fe2o3_amqp_types::messaging::Accepted {}.into()),
+            );
+            peer.insert(unknown.clone(), None);
+            let result = link.handle_unsettled_in_attach(Some(peer), incomplete);
+            assert_eq!(
+                matches!(result, ReceiverAttachExchange::IncompleteUnsettled),
+                incomplete
+            );
+            let guard = map.read();
+            let local = guard.as_ref().unwrap();
+            assert_eq!(local.contains_key(&absent), incomplete);
+            assert!(!local.contains_key(&unknown));
+            assert!(local.get(&known).unwrap().received);
+            assert!(matches!(
+                local.get(&known).unwrap().local,
+                Some(DeliveryState::Received(_))
+            ));
+            assert!(matches!(
+                local.get(&known).unwrap().remote,
+                Some(DeliveryState::Accepted(_))
+            ));
+        }
+    }
 
     #[test]
     fn test_section_numbers() {

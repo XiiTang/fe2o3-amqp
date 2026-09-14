@@ -409,9 +409,11 @@ impl Receiver {
             .await
             .map_err(DetachThenResumeReceiverError::from);
 
-        let is_reattaching = !self.inner.session.same_channel(&new_session.control);
+        // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
 
         // re-attach the link
+        self.inner.link.session_stop_reason = new_session.session_stop_reason().clone();
         self.inner.session = new_session.control.clone();
         self.inner.outgoing = new_session.outgoing.clone();
         let exchange_result = self
@@ -676,8 +678,12 @@ impl ReceiverDisposer {
                 .and_then(|map| map.swap_remove(&delivery_info.delivery_tag))
         } else {
             let mut lock = self.unsettled.write();
-            lock.get_or_insert(Default::default())
-                .insert(delivery_info.delivery_tag.clone(), Some(state.clone()))
+            lock.as_mut()
+                .and_then(|map| map.get_mut(&delivery_info.delivery_tag))
+                .map(|entry| {
+                    entry.local_state(state.clone());
+                    entry.clone()
+                })
         };
 
         if unsettled_state.is_some() {
@@ -1199,27 +1205,25 @@ where
                 .cloned();
             kind = Some(match known {
                 None => Kind::Ignore,
-                Some(_)
-                    if self
-                        .incomplete_transfer
-                        .as_ref()
-                        .is_some_and(|p| p.performative.delivery_tag.as_ref() == Some(tag)) =>
-                {
-                    Kind::Payload
-                }
-                Some(_) => Kind::StateOnly,
+                Some(entry) if entry.received => Kind::StateOnly,
+                Some(_) => Kind::Payload,
             });
             if kind == Some(Kind::Payload) {
                 let (number, offset) = match &transfer.state {
                     Some(DeliveryState::Received(r)) => (r.section_number, r.section_offset),
                     _ => (0, 0),
                 };
-                let partial = self
-                    .incomplete_transfer
-                    .as_mut()
-                    .expect("matching retained delivery");
-                partial.keep_buffer_till_section_number_and_offset(number, offset)?;
-                partial.performative.delivery_id = transfer.delivery_id;
+                if let Some(partial) = self.incomplete_transfer.as_mut() {
+                    if partial.performative.delivery_tag.as_ref() != Some(tag) {
+                        return Err(RecvError::InconsistentFieldInMultiFrameDelivery);
+                    }
+                    partial.keep_buffer_till_section_number_and_offset(number, offset)?;
+                    partial.performative.delivery_id = transfer.delivery_id;
+                } else if number != 0 || offset != 0 {
+                    return Err(RecvError::InvalidMessageEncoding(
+                        serde_amqp::Error::InvalidValue,
+                    ));
+                }
             }
             self.incoming_recovery
                 .start(&transfer, kind.expect("resume classification"));
@@ -1632,7 +1636,8 @@ impl DetachedReceiver {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_recver!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(ReceiverResumeError {
                         detached_recver: self,
                         kind: ReceiverResumeErrorKind::Timeout,
@@ -1664,8 +1669,10 @@ impl DetachedReceiver {
         mut self,
         session: &SessionHandle<R>,
     ) -> Result<ResumingReceiver, ReceiverResumeError> {
-        let is_reattaching = !self.inner.session.same_channel(&session.control);
+        // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
 
+        self.inner.link.session_stop_reason = session.session_stop_reason().clone();
         self.inner.session = session.control.clone();
         self.inner.outgoing = session.outgoing.clone();
 
@@ -1706,8 +1713,10 @@ impl DetachedReceiver {
         remote_attach: Attach,
         session: &SessionHandle<R>,
     ) -> Result<ResumingReceiver, ReceiverResumeError> {
-        let is_reattaching = !self.inner.session.same_channel(&session.control);
+        // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
 
+        self.inner.link.session_stop_reason = session.session_stop_reason().clone();
         self.inner.session = session.control.clone();
         self.inner.outgoing = session.outgoing.clone();
 
@@ -1738,8 +1747,10 @@ impl DetachedReceiver {
             session: &SessionHandle<R>,
             duration: Duration,
         ) -> Result<ResumingReceiver, ReceiverResumeError> {
-            let is_reattaching = !self.inner.session.same_channel(&session.control);
-            self.inner.session = session.control.clone();
+            // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
+            self.inner.link.session_stop_reason = session.session_stop_reason().clone();
+        self.inner.session = session.control.clone();
             self.inner.outgoing = session.outgoing.clone();
             self.resume_with_timeout_inner(duration, is_reattaching).await
         }
@@ -1772,7 +1783,8 @@ impl DetachedReceiver {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_recver!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(ReceiverResumeError {
                         detached_recver: self,
                         kind: ReceiverResumeErrorKind::Timeout,
@@ -1791,9 +1803,11 @@ impl DetachedReceiver {
             session: &SessionHandle<R>,
             duration: Duration,
         ) -> Result<ResumingReceiver, ReceiverResumeError> {
-            let is_reattaching = !self.inner.session.same_channel(&session.control);
+            // Resume preserves the endpoint, including when its session changes.
+        let is_reattaching = false;
 
-            self.inner.session = session.control.clone();
+            self.inner.link.session_stop_reason = session.session_stop_reason().clone();
+        self.inner.session = session.control.clone();
             self.inner.outgoing = session.outgoing.clone();
 
             let fut = self.inner.resume_incoming_attach(Some(remote_attach), is_reattaching);
@@ -1815,7 +1829,8 @@ impl DetachedReceiver {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_recver!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(ReceiverResumeError {
                         detached_recver: self,
                         kind: ReceiverResumeErrorKind::Timeout,
@@ -1874,7 +1889,10 @@ mod tests {
         let mut lock = map.write();
         let m = lock.get_or_insert_with(Default::default);
         for tag in tags {
-            m.insert(DeliveryTag::from(tag.clone()), None);
+            m.insert(
+                DeliveryTag::from(tag.clone()),
+                crate::link::receiver_delivery::ReceiverDelivery::new(None),
+            );
         }
     }
 
@@ -2005,6 +2023,20 @@ mod tests {
 
         // processed should have been reset to 0 after the refresh
         assert_eq!(disposer.processed.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn second_mode_unknown_receipt_does_not_create_phantom_unsettled_state() {
+        let (tx, mut rx) = mpsc::channel::<LinkFrame>(8);
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
+        let mut disposer = make_disposer(tx, unsettled.clone(), CreditMode::Manual);
+        disposer.rcv_settle_mode = ReceiverSettleMode::Second;
+        disposer
+            .accept(make_delivery_info(9, vec![9]))
+            .await
+            .unwrap();
+        assert!(unsettled.read().is_none());
+        assert!(rx.try_recv().is_err());
     }
 
     #[tokio::test]

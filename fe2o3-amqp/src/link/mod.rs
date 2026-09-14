@@ -49,6 +49,7 @@ mod incoming_recovery;
 mod incomplete_transfer;
 pub mod receive_budget;
 pub mod receiver;
+mod receiver_delivery;
 mod receiver_link;
 pub(crate) mod resumption;
 pub mod sender;
@@ -77,11 +78,11 @@ pub(crate) type SenderLink<T> = Link<role::SenderMarker, T, SenderFlowState, Uns
 
 /// Type alias for receiver link that ONLY represents the inner state of receiver
 pub(crate) type ReceiverLink<T> =
-    Link<role::ReceiverMarker, T, ReceiverFlowState, Option<DeliveryState>>;
+    Link<role::ReceiverMarker, T, ReceiverFlowState, receiver_delivery::ReceiverDelivery>;
 
 pub(crate) type ArcUnsettledMap<S> = Arc<unsettled_store::Store<S>>;
 pub(crate) type ArcSenderUnsettledMap = ArcUnsettledMap<UnsettledMessage>;
-pub(crate) type ArcReceiverUnsettledMap = ArcUnsettledMap<Option<DeliveryState>>;
+pub(crate) type ArcReceiverUnsettledMap = ArcUnsettledMap<receiver_delivery::ReceiverDelivery>;
 
 pub mod role {
     //! Type state definition of link role
@@ -747,8 +748,7 @@ impl LinkRelay<OutputHandle> {
                             // the sender and receiving a disposition indicating settlement of the
                             // delivery from the sender.
 
-                            // is_terminal
-                            true
+                            is_terminal
                         }
                     }
                 };
@@ -763,9 +763,7 @@ impl LinkRelay<OutputHandle> {
                 } else {
                     let mut guard = unsettled.write();
                     if let Some(msg_state) = guard.as_mut().and_then(|m| m.get_mut(&delivery_tag)) {
-                        if !msg_state.as_ref().is_some_and(DeliveryState::is_terminal) {
-                            *msg_state = state;
-                        }
+                        msg_state.remote_state(state);
                     }
                 }
 
@@ -834,7 +832,10 @@ impl LinkRelay<OutputHandle> {
                             if map.contains_key(tag) {
                                 return Err(LinkRelayError::InvalidTransfer);
                             }
-                            map.insert(tag.clone(), transfer.state.clone());
+                            map.insert(
+                                tag.clone(),
+                                receiver_delivery::ReceiverDelivery::new(transfer.state.clone()),
+                            );
                         }
                         guard.as_ref().is_some_and(|map| map.contains_key(tag))
                     }
@@ -934,6 +935,65 @@ mod incoming_identity_tests {
             .unwrap()
     }
     #[tokio::test]
+    async fn second_settlement_waits_for_a_terminal_peer_outcome() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (reply, mut outcome) = oneshot::channel();
+        let tag: DeliveryTag = vec![1].into();
+        let mut messages = UnsettledMap::new();
+        messages.insert(
+            tag.clone(),
+            UnsettledMessage::new(Payload::new(), None, 0, reply),
+        );
+        let unsettled = Arc::new(unsettled_store::Store::new(Some(messages)));
+        let flow = Arc::new(LinkFlowState::sender(state::LinkFlowStateInner {
+            initial_delivery_count: 0,
+            delivery_count: 0,
+            link_credit: 1,
+            available: 0,
+            drain: false,
+            properties: None,
+        }));
+        let mut relay = LinkRelay::new_sender(
+            tx,
+            Producer::new(Arc::new(tokio::sync::Notify::new()), flow),
+            unsettled.clone(),
+        )
+        .with_output_handle(OutputHandle(0));
+        if let LinkRelay::Sender {
+            receiver_settle_mode,
+            ..
+        } = &mut relay
+        {
+            *receiver_settle_mode = ReceiverSettleMode::Second;
+        }
+        let received = fe2o3_amqp_types::messaging::Received {
+            section_number: 1,
+            section_offset: 0,
+        };
+        assert!(!relay.on_incoming_disposition(
+            Role::Receiver,
+            false,
+            Some(received.into()),
+            tag.clone()
+        ));
+        assert!(matches!(
+            outcome.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(unsettled.read().as_ref().unwrap().contains_key(&tag));
+        assert!(relay.on_incoming_disposition(
+            Role::Receiver,
+            false,
+            Some(fe2o3_amqp_types::messaging::Accepted {}.into()),
+            tag
+        ));
+        assert!(matches!(
+            outcome.await.unwrap(),
+            Some(DeliveryState::Accepted(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn settlement_before_application_decode_and_fragment_continuations_use_one_identity() {
         for mode in [ReceiverSettleMode::First, ReceiverSettleMode::Second] {
             let (tx, mut input) = mpsc::channel(8);
@@ -1006,7 +1066,7 @@ mod incoming_identity_tests {
             if !settled {
                 map.write()
                     .get_or_insert_with(UnsettledMap::new)
-                    .insert(tag.clone(), None);
+                    .insert(tag.clone(), receiver_delivery::ReceiverDelivery::new(None));
             }
             let flow = Arc::new(LinkFlowState::receiver(state::LinkFlowStateInner {
                 initial_delivery_count: 0,

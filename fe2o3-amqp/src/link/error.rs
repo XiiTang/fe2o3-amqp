@@ -164,8 +164,8 @@ pub enum SendError {
     #[error("A non-terminal delivery state is received when an outcome is expected")]
     NonTerminalDeliveryState,
 
-    /// Transactional state found on non-transactional delivery
-    #[error("Transactional state found on non-transactional delivery")]
+    /// Settlement omitted an outcome or supplied a state incompatible with this send.
+    #[error("Delivery did not provide a valid outcome for this send")]
     IllegalDeliveryState,
 
     /// Error serializing message

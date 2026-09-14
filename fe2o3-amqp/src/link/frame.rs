@@ -22,6 +22,7 @@ pub(crate) enum LinkFrame {
         performative: Transfer,
         payload: Payload,
         window_slot: Option<crate::session::receive_window::Slot>,
+        queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     Disposition(Disposition),
     Detach(Detach),

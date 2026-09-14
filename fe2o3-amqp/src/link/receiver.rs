@@ -625,7 +625,7 @@ impl Receiver {
 /// Cloning a `ReceiverDisposer` is cheap: all internal state is reference-counted.
 #[derive(Clone, Debug)]
 pub struct ReceiverDisposer {
-    outgoing: mpsc::Sender<LinkFrame>,
+    outgoing: crate::session::transfer_queue::Sender,
     unsettled: ArcReceiverUnsettledMap,
     rcv_settle_mode: ReceiverSettleMode,
     flow_state: ReceiverFlowState,
@@ -836,7 +836,7 @@ pub(crate) struct ReceiverInner<L: endpoint::ReceiverLink> {
     pub(crate) session: mpsc::Sender<SessionControl>,
 
     // Outgoing mpsc channel to send the Link Frames
-    pub(crate) outgoing: mpsc::Sender<LinkFrame>,
+    pub(crate) outgoing: crate::session::transfer_queue::Sender,
     pub(crate) incoming: mpsc::Receiver<LinkFrame>,
 
     // Wrap in a box to avoid clippy warning large_enum_variant on link acceptor's output
@@ -1051,6 +1051,7 @@ where
                 performative,
                 payload,
                 window_slot,
+                queue_slot: _,
             } => {
                 let result = self.on_incoming_transfer(performative, payload).await;
                 drop(window_slot);
@@ -1849,7 +1850,7 @@ mod tests {
         credit_mode: CreditMode,
     ) -> ReceiverDisposer {
         ReceiverDisposer {
-            outgoing: tx,
+            outgoing: tx.into(),
             unsettled,
             rcv_settle_mode: ReceiverSettleMode::First,
             flow_state: make_flow_state(200),

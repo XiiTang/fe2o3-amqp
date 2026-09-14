@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-
 use fe2o3_amqp_types::{
     definitions::Role,
     messaging::{Accepted, DeliveryState, Outcome},
@@ -10,12 +9,10 @@ use fe2o3_amqp_types::{
     primitives::OrderedMap,
     transaction::{TransactionId, TransactionalState},
 };
-use tokio::sync::mpsc;
 
-use crate::{link::LinkFrame, Payload};
+use crate::Payload;
 
 use super::{coordinator::ControlLinkAcceptor, frame::TxnWorkFrame};
-
 
 pub(crate) trait HandleControlLink {
     type Error: Send;
@@ -26,14 +23,14 @@ pub(crate) trait HandleControlLink {
 /// Transaction manager
 #[derive(Debug)]
 pub(crate) struct TransactionManager {
-    pub control_link_outgoing: mpsc::Sender<LinkFrame>,
+    pub control_link_outgoing: crate::session::transfer_queue::Sender,
     pub txns: OrderedMap<TransactionId, ResourceTransaction>,
     pub control_link_acceptor: Arc<ControlLinkAcceptor>,
 }
 
 impl TransactionManager {
     pub(crate) fn new(
-        control_link_outgoing: mpsc::Sender<LinkFrame>,
+        control_link_outgoing: crate::session::transfer_queue::Sender,
         control_link_acceptor: ControlLinkAcceptor,
     ) -> Self {
         Self {

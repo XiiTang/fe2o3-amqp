@@ -453,7 +453,11 @@ where
             _ => return Err(ConnectionInnerError::IllegalState),
         }
 
-        let SessionFrame { channel, body } = frame;
+        let SessionFrame {
+            channel,
+            body,
+            queue_slot: _queue_slot,
+        } = frame;
         let channel = OutgoingChannel(channel);
         let frame = match body {
             SessionFrameBody::Begin(begin) => self.connection.on_outgoing_begin(channel, begin)?,

@@ -254,7 +254,7 @@ mod tests {
     use super::{
         AcceptorAttachError, LinkAcceptor, ListenerSessionHandle, SessionHandle, SessionStopReason,
     };
-    use crate::{control::SessionControl, link::LinkFrame, session::error::Error};
+    use crate::{control::SessionControl, session::error::Error};
 
     /// Constructs a listener session handle in the "ended" state: the link
     /// listener sender is dropped (as if the session engine exited) and the
@@ -264,7 +264,7 @@ mod tests {
     ) -> ListenerSessionHandle {
         let (_, link_listener) = mpsc::channel::<Attach>(16);
         let (control, _) = mpsc::channel::<SessionControl>(16);
-        let (outgoing, _) = mpsc::channel::<LinkFrame>(16);
+        let (outgoing, _) = crate::session::transfer_queue::channel(16);
         let (outcome_tx, outcome) = oneshot::channel::<Result<(), Error>>();
         drop(outcome_tx);
         let stop_reason_cell = Arc::new(OnceLock::new());

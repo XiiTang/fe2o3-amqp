@@ -106,7 +106,7 @@ where
                 ));
             }
         };
-        let SessionFrame { channel, body } = frame;
+        let SessionFrame { channel, body, .. } = frame;
         let channel = IncomingChannel(channel);
         let remote_begin = match body {
             SessionFrameBody::Begin(begin) => begin,
@@ -169,7 +169,7 @@ where
         &mut self,
         incoming: SessionIncomingItem,
     ) -> Result<Running, SessionInnerError> {
-        let SessionFrame { channel, body } = incoming;
+        let SessionFrame { channel, body, .. } = incoming;
         let channel = IncomingChannel(channel);
         match body {
             SessionFrameBody::Begin(begin) => {
@@ -425,12 +425,16 @@ where
                 .map(Some)?,
             LinkFrame::Transfer {
                 window_slot: _,
+                queue_slot,
                 input_handle,
                 performative,
                 payload,
-            } => self
-                .session
-                .on_outgoing_transfer(input_handle, performative, payload)?,
+            } => self.session.on_outgoing_transfer(
+                input_handle,
+                performative,
+                payload,
+                queue_slot,
+            )?,
             LinkFrame::Disposition(disposition) => self
                 .session
                 .on_outgoing_disposition(disposition)

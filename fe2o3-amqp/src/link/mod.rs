@@ -334,7 +334,7 @@ where
     /// This is cancel safe if oneshot channel is cancel safe
     pub(crate) async fn send_attach_inner(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         session: &mpsc::Sender<SessionControl>,
         is_reattaching: bool,
     ) -> Result<(), SendAttachErrorKind> {
@@ -496,7 +496,7 @@ where
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn send_detach(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         closed: bool,
         error: Option<definitions::Error>,
     ) -> Result<(), Self::DetachError> {
@@ -848,6 +848,7 @@ impl LinkRelay<OutputHandle> {
                     performative: transfer,
                     payload,
                     window_slot,
+                    queue_slot: None,
                 })
                 .await
                 .map_err(|_| LinkRelayError::UnattachedHandle)?;

@@ -21,7 +21,7 @@ where
     /// This is cancel safe because all internal `.await` are cancel safe
     pub(crate) async fn send_transfer_without_modifying_unsettled_map(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         mut transfer: Transfer,
         mut payload: Payload,
     ) -> Result<bool, LinkStateError> {
@@ -100,7 +100,7 @@ where
 
     pub(crate) async fn get_delivery_tag_or_detached<Fut>(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         detached: Fut,
     ) -> Result<[u8; 4], LinkStateError>
     where
@@ -217,7 +217,7 @@ where
 
     async fn send_payload<Fut>(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         detached: Fut,
         payload: Payload,
         message_format: MessageFormat,
@@ -249,7 +249,7 @@ where
     /// This is cancel safe because all internal `.await` are cancel safe
     async fn send_payload_with_transfer(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         message_format: MessageFormat,
         transfer: Transfer,
         payload: Payload,
@@ -288,7 +288,7 @@ where
 
     async fn dispose(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         delivery_id: DeliveryNumber,
         delivery_tag: DeliveryTag,
         settled: bool,
@@ -324,7 +324,7 @@ where
 
     async fn batch_dispose(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         mut ids_and_tags: Vec<(DeliveryNumber, DeliveryTag)>,
         settled: bool,
         state: DeliveryState,
@@ -415,7 +415,7 @@ where
 /// This is cancel safe because it only involves `.await` on sending over `tokio::mpsc::Sender`
 #[inline]
 async fn send_transfer(
-    writer: &mpsc::Sender<LinkFrame>,
+    writer: &crate::session::transfer_queue::Sender,
     input_handle: InputHandle,
     transfer: Transfer,
     payload: Payload,
@@ -423,6 +423,7 @@ async fn send_transfer(
 ) -> Result<(), LinkStateError> {
     let frame = LinkFrame::Transfer {
         window_slot: None,
+        queue_slot: None,
         input_handle,
         performative: transfer,
         payload,
@@ -438,7 +439,7 @@ async fn send_transfer(
 
 #[inline]
 async fn send_disposition(
-    writer: &mpsc::Sender<LinkFrame>,
+    writer: &crate::session::transfer_queue::Sender,
     first: DeliveryNumber,
     last: Option<DeliveryNumber>,
     settled: bool,
@@ -666,7 +667,7 @@ where
 
     async fn send_attach(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         session: &mpsc::Sender<SessionControl>,
         is_reattaching: bool,
     ) -> Result<(), Self::AttachError> {
@@ -752,7 +753,7 @@ where
 
     async fn exchange_attach(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         reader: &mut mpsc::Receiver<LinkFrame>,
         session: &mpsc::Sender<SessionControl>,
         is_reattaching: bool,
@@ -780,7 +781,7 @@ where
     async fn handle_attach_error(
         &mut self,
         attach_error: SenderAttachError,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         reader: &mut mpsc::Receiver<LinkFrame>,
         session: &mpsc::Sender<SessionControl>,
     ) -> SenderAttachError {
@@ -840,7 +841,7 @@ where
 async fn try_detach_with_error<T>(
     link: &mut SenderLink<T>,
     attach_error: SenderAttachError,
-    writer: &mpsc::Sender<LinkFrame>,
+    writer: &crate::session::transfer_queue::Sender,
     reader: &mut mpsc::Receiver<LinkFrame>,
 ) -> SenderAttachError
 where

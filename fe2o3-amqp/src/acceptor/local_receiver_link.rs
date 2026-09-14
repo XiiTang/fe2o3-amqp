@@ -19,8 +19,7 @@ use crate::{
         receiver::{CreditMode, ReceiverInner},
         state::{LinkFlowState, LinkFlowStateInner, LinkState},
         target_archetype::TargetArchetypeExt,
-        LinkFrame, LinkIncomingItem, LinkRelay, ReceiverAttachError, ReceiverLink,
-        SessionStopReason,
+        LinkIncomingItem, LinkRelay, ReceiverAttachError, ReceiverLink, SessionStopReason,
     },
     session::SessionHandle,
     Receiver,
@@ -110,7 +109,7 @@ where
         shared: &SharedLinkAcceptorFields,
         remote_attach: Attach,
         control: mpsc::Sender<SessionControl>,
-        outgoing: mpsc::Sender<LinkFrame>,
+        outgoing: crate::session::transfer_queue::Sender,
         session_stop_reason: Arc<OnceLock<SessionStopReason>>,
     ) -> Result<ReceiverInner<ReceiverLink<T>>, ReceiverAttachError>
     where

@@ -134,6 +134,7 @@ pub(crate) trait Session {
         input_handle: InputHandle,
         transfer: Transfer,
         payload: Payload,
+        queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Option<SessionOutgoingItem>, Self::Error>;
 
     fn on_outgoing_disposition(

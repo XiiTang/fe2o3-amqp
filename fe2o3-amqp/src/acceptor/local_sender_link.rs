@@ -95,7 +95,13 @@ where
             shared.fallback_rcv_settle_mode.clone()
         };
 
-        let (incoming_tx, mut incoming_rx) = mpsc::channel(shared.buffer_size);
+        let capacity = crate::session::link_incoming_capacity(
+            &session.control,
+            shared.buffer_size,
+            session.session_stop_reason(),
+        )
+        .await?;
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(capacity);
 
         let flow_state_inner = LinkFlowStateInner {
             initial_delivery_count: self.initial_delivery_count,

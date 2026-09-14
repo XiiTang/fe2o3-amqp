@@ -7,7 +7,6 @@ use fe2o3_amqp_types::{
     messaging::{Source, Target, TargetArchetype},
     primitives::{Symbol, Ulong},
 };
-use parking_lot::RwLock;
 use tokio::sync::{mpsc, Notify};
 
 use crate::{
@@ -532,7 +531,13 @@ where
         session: &mut SessionHandle<R>,
     ) -> Result<SenderInner<SenderLink<T>>, SenderAttachError> {
         let buffer_size = self.buffer_size;
-        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(self.buffer_size);
+        let capacity = session::link_incoming_capacity(
+            &session.control,
+            self.buffer_size,
+            session.session_stop_reason(),
+        )
+        .await?;
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(capacity);
         let outgoing = session.outgoing.clone();
         let (producer, consumer) = self.create_flow_state_containers();
         let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
@@ -646,7 +651,13 @@ where
         // TODO: how to avoid clone?
         let buffer_size = self.buffer_size;
         let credit_mode = self.credit_mode.clone();
-        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(self.buffer_size);
+        let capacity = session::link_incoming_capacity(
+            &session.control,
+            self.buffer_size,
+            session.session_stop_reason(),
+        )
+        .await?;
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(capacity);
         let outgoing = session.outgoing.clone();
         let (relay_flow_state, flow_state) = self.create_flow_state_containers();
         let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));

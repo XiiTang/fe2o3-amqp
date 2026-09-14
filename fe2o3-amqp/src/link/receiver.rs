@@ -1050,7 +1050,12 @@ where
                 input_handle: _,
                 performative,
                 payload,
-            } => self.on_incoming_transfer(performative, payload).await, // cancel safe
+                window_slot,
+            } => {
+                let result = self.on_incoming_transfer(performative, payload).await;
+                drop(window_slot);
+                result
+            } // cancel safe
             LinkFrame::Attach(_) => Err(LinkStateError::IllegalState.into()),
             LinkFrame::Flow(_) | LinkFrame::Disposition(_) => {
                 // Flow and Disposition are handled by LinkRelay which runs

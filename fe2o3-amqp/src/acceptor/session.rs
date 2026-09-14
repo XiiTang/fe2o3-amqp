@@ -628,6 +628,10 @@ impl endpoint::Session for ListenerSession {
         self.session.on_outgoing_flow(flow)
     }
 
+    fn receive_window(&self) -> &Arc<crate::session::receive_window::ReceiveWindow> {
+        self.session.receive_window()
+    }
+
     fn maybe_outgoing_session_flow(&mut self) -> Option<SessionOutgoingItem> {
         self.session.maybe_outgoing_session_flow()
     }

@@ -1,6 +1,5 @@
 //! Implements session that can handle transaction
 
-
 use std::sync::{Arc, OnceLock};
 
 use fe2o3_amqp_types::{
@@ -139,7 +138,6 @@ where
     }
 }
 
-
 impl<S> endpoint::HandleDischarge for TxnSession<S>
 where
     S: endpoint::Session<Error = session::error::SessionInnerError> + Send + Sync,
@@ -212,7 +210,6 @@ where
         }
     }
 }
-
 
 impl<S> endpoint::Session for TxnSession<S>
 where
@@ -377,6 +374,10 @@ where
 
     fn on_outgoing_flow(&mut self, flow: LinkFlow) -> Result<SessionFrame, Self::Error> {
         self.session.on_outgoing_flow(flow)
+    }
+
+    fn receive_window(&self) -> &Arc<crate::session::receive_window::ReceiveWindow> {
+        self.session.receive_window()
     }
 
     fn maybe_outgoing_session_flow(&mut self) -> Option<SessionOutgoingItem> {

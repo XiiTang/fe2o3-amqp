@@ -67,6 +67,9 @@ pub enum DetachError {
 /// Errors associated with attaching a link as sender
 #[derive(Debug, thiserror::Error)]
 pub enum SenderAttachError {
+    /// The declared session window cannot fit the native queue address space.
+    #[error("Session window exceeds native queue capacity")]
+    NativeBufferTooLarge,
     /// The session (or its connection) stopped before the attach completed
     #[error("The session stopped before the link was attached: {:?}", .0)]
     SessionStopped(SessionStopReason),
@@ -204,6 +207,9 @@ impl std::error::Error for DesiredFilterNotSupported {}
 /// Errors associated with attaching a link as receiver
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiverAttachError {
+    /// The declared session window cannot fit the native queue address space.
+    #[error("Session window exceeds native queue capacity")]
+    NativeBufferTooLarge,
     /// The session (or its connection) stopped before the attach completed
     #[error("The session stopped before the link was attached: {:?}", .0)]
     SessionStopped(SessionStopReason),
@@ -276,6 +282,7 @@ impl From<AllocLinkError> for ReceiverAttachError {
     fn from(value: AllocLinkError) -> Self {
         match value {
             AllocLinkError::SessionNotMapped => Self::SessionNotMapped,
+            AllocLinkError::NativeBufferTooLarge => Self::NativeBufferTooLarge,
             AllocLinkError::SessionStopped(reason) => Self::SessionStopped(reason),
             AllocLinkError::DuplicatedLinkName => Self::DuplicatedLinkName,
         }
@@ -314,6 +321,7 @@ impl From<AllocLinkError> for SenderAttachError {
     fn from(value: AllocLinkError) -> Self {
         match value {
             AllocLinkError::SessionNotMapped => Self::SessionNotMapped,
+            AllocLinkError::NativeBufferTooLarge => Self::NativeBufferTooLarge,
             AllocLinkError::SessionStopped(reason) => Self::SessionStopped(reason),
             AllocLinkError::DuplicatedLinkName => Self::DuplicatedLinkName,
         }

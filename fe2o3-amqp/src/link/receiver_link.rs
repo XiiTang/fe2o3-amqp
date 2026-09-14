@@ -111,7 +111,7 @@ where
         P: IntoReader<'a> + AsByteIterator + Send + 'a,
     {
         match self.local_state {
-            LinkState::Attached | LinkState::IncompleteAttachExchanged => {}
+            LinkState::Attached | LinkState::IncompleteAttachExchanged | LinkState::DetachSent => {}
             _ => return Err(ReceiverTransferError::IllegalState),
         }
 
@@ -184,6 +184,12 @@ where
                 let mut lock = self.unsettled.write();
                 if let Some(current) = lock.as_mut().and_then(|map| map.get_mut(&delivery_tag)) {
                     current.received(state, result.is_ok());
+                    current.info = Some(DeliveryInfo {
+                        delivery_id,
+                        delivery_tag: delivery_tag.clone(),
+                        rcv_settle_mode: mode.clone(),
+                        _sealed: Sealed {},
+                    });
                 }
             }
             (result, mode)

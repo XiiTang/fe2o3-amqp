@@ -6,6 +6,7 @@ pub(crate) struct ReceiverDelivery {
     pub local: Option<DeliveryState>,
     pub remote: Option<DeliveryState>,
     pub received: bool,
+    pub info: Option<super::delivery::DeliveryInfo>,
 }
 impl ReceiverDelivery {
     pub fn new(remote: Option<DeliveryState>) -> Self {
@@ -13,6 +14,7 @@ impl ReceiverDelivery {
             local: None,
             remote,
             received: false,
+            info: None,
         }
     }
     pub fn remote_state(&mut self, state: Option<DeliveryState>) {

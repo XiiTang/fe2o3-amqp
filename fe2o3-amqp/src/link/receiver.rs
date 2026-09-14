@@ -353,6 +353,28 @@ impl Receiver {
         self.inner.send_properties().await
     }
 
+    /// Begin an explicit non-closing Detach while retaining the receive owner.
+    /// Continue calling recv() to deliver in-flight messages and preserve partial
+    /// transfers until it reports RemoteDetached, then call into_detached().
+    pub async fn request_detach(&mut self) -> Result<(), DetachError> {
+        self.inner.send_detach(false, None).await
+    }
+
+    /// Preserve the actual endpoint after Detach or a stopped parent session.
+    /// A still-active endpoint is returned unchanged as an error; this method
+    /// does not perform I/O or manufacture an attached link's suspension.
+    pub fn into_detached(self) -> Result<DetachedReceiver, Self> {
+        if matches!(
+            self.inner.link.local_state,
+            super::state::LinkState::Detached
+        ) || self.inner.link.session_stop_reason.get().is_some()
+        {
+            Ok(DetachedReceiver { inner: self.inner })
+        } else {
+            Err(self)
+        }
+    }
+
     /// Detach the link.
     ///
     /// This will send a `Detach` performative with the `closed` field set to false. If the remote
@@ -824,6 +846,18 @@ impl ReceiverSettlementView {
             .as_ref()
             .is_some_and(|map| map.contains_key(tag))
     }
+    /// The current session delivery identity, only after a complete message or
+    /// its state-only resumed Transfer has been received. Attach alone cannot
+    /// supply a delivery-id; an identity from the prior session is never returned.
+    pub fn delivery_info(&self, tag: &DeliveryTag) -> Option<DeliveryInfo> {
+        self.unsettled
+            .read()
+            .as_ref()?
+            .get(tag)
+            .filter(|entry| entry.received)?
+            .info
+            .clone()
+    }
     /// Wait for any map change. Updates coalesce and never form a frame queue.
     pub async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
         self.changed.changed().await
@@ -853,6 +887,10 @@ pub(crate) struct ReceiverInner<L: endpoint::ReceiverLink> {
 
 impl<L: endpoint::ReceiverLink> Drop for ReceiverInner<L> {
     fn drop(&mut self) {
+        if matches!(self.link.local_state(), super::state::LinkState::DetachSent) {
+            // The declared Detach was already sent. Drop cannot close it again.
+            return;
+        }
         if let Some(handle) = self.link.output_handle_mut().take() {
             let detach = Detach {
                 handle: handle.into(),
@@ -1043,7 +1081,9 @@ where
         match frame {
             LinkFrame::Detach(detach) => {
                 let closed = detach.closed;
-                self.link.send_detach(&self.outgoing, closed, None).await?; // cancel safe
+                if !matches!(self.link.local_state(), super::state::LinkState::DetachSent) {
+                    self.link.send_detach(&self.outgoing, closed, None).await?;
+                }
                 self.link
                     .on_incoming_detach(detach)
                     .map_err(Into::into)
@@ -1232,6 +1272,24 @@ where
             return Ok(None);
         }
         if kind == Some(Kind::StateOnly) {
+            if continuation.is_none() {
+                if let Some(entry) = self.link.unsettled().write().as_mut().and_then(|map| {
+                    transfer
+                        .delivery_tag
+                        .as_ref()
+                        .and_then(|tag| map.get_mut(tag))
+                }) {
+                    entry.info = Some(DeliveryInfo {
+                        delivery_id: transfer.delivery_id.ok_or(RecvError::DeliveryIdIsNone)?,
+                        delivery_tag: transfer
+                            .delivery_tag
+                            .clone()
+                            .ok_or(RecvError::DeliveryTagIsNone)?,
+                        rcv_settle_mode: transfer.rcv_settle_mode.clone(),
+                        _sealed: crate::util::Sealed {},
+                    });
+                }
+            }
             if transfer.aborted || transfer.settled == Some(true) {
                 if let Some(map) = self.link.unsettled().write().as_mut() {
                     if let Some(tag) = &transfer.delivery_tag {
@@ -1421,6 +1479,11 @@ impl ReceiverInner<ReceiverLink<Target>> {
         mut initial_remote_attach: Option<Attach>,
         is_reattaching: bool,
     ) -> Result<ReceiverAttachExchange, ReceiverResumeErrorKind> {
+        if let Some(map) = self.link.unsettled.write().as_mut() {
+            for entry in map.values_mut() {
+                entry.info = None;
+            }
+        }
         self.reallocate_output_handle().await?;
 
         let exchange = match initial_remote_attach.take() {
@@ -1894,6 +1957,215 @@ mod tests {
                 crate::link::receiver_delivery::ReceiverDelivery::new(None),
             );
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_detach_delivers_inflight_message_and_retains_partial_without_extra_detach() {
+        use super::super::{state::LinkState, unsettled_store::Store};
+        use fe2o3_amqp_types::messaging::Body;
+        let map = Arc::new(Store::new(None));
+        seed_unsettled(&map, &[vec![0x42], vec![0x43]]);
+        let mut link = Receiver::builder()
+            .name("detach")
+            .source("source")
+            .target("target")
+            .create_link(
+                map.clone(),
+                OutputHandle(0),
+                make_flow_state(2),
+                Arc::new(OnceLock::new()),
+            );
+        link.local_state = LinkState::Attached;
+        let (control, _controls) = mpsc::channel(8);
+        let (outgoing, mut sent) = mpsc::channel(8);
+        let (incoming, frames) = mpsc::channel(8);
+        let mut receiver = Receiver {
+            inner: ReceiverInner {
+                link,
+                buffer_size: 8,
+                credit_mode: CreditMode::Manual,
+                processed: Arc::new(AtomicU32::new(0)),
+                auto_accept: false,
+                session: control,
+                outgoing: outgoing.into(),
+                incoming: frames,
+                incomplete_transfer: None,
+                incoming_recovery: Default::default(),
+                receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
+            },
+        };
+        receiver.request_detach().await.unwrap();
+        assert!(matches!(
+            sent.recv().await.unwrap(),
+            LinkFrame::Detach(Detach { closed: false, .. })
+        ));
+        let mut transfer: Transfer =
+            serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x42, 0x43])
+                .unwrap();
+        let full = vec![0, 0x53, 0x75, 0xa0, 2, 0, 255];
+        incoming
+            .send(LinkFrame::Transfer {
+                input_handle: crate::endpoint::InputHandle(0),
+                performative: transfer.clone(),
+                payload: full.into(),
+                window_slot: None,
+                queue_slot: None,
+            })
+            .await
+            .unwrap();
+        transfer.delivery_id = Some(1);
+        transfer.delivery_tag = Some(vec![0x43].into());
+        transfer.more = true;
+        incoming
+            .send(LinkFrame::Transfer {
+                input_handle: crate::endpoint::InputHandle(0),
+                performative: transfer,
+                payload: vec![0, 0x53, 0x75, 0xa0, 2, 0].into(),
+                window_slot: None,
+                queue_slot: None,
+            })
+            .await
+            .unwrap();
+        incoming
+            .send(LinkFrame::Detach(Detach {
+                handle: 0.into(),
+                closed: false,
+                error: None,
+            }))
+            .await
+            .unwrap();
+        let delivery = receiver.recv::<Body<serde_amqp::Value>>().await.unwrap();
+        assert_eq!(delivery.delivery_tag().as_ref(), &[0x42]);
+        assert!(matches!(
+            receiver.recv::<Body<serde_amqp::Value>>().await,
+            Err(RecvError::LinkStateError(LinkStateError::RemoteDetached))
+        ));
+        let detached = receiver.into_detached().unwrap();
+        assert_eq!(
+            detached
+                .inner
+                .incomplete_transfer
+                .as_ref()
+                .unwrap()
+                .buffer
+                .as_slice(),
+            &[0, 0x53, 0x75, 0xa0, 2, 0]
+        );
+        assert!(
+            map.read()
+                .as_ref()
+                .unwrap()
+                .get(&DeliveryTag::from(vec![0x42]))
+                .unwrap()
+                .received
+        );
+        assert!(
+            !map.read()
+                .as_ref()
+                .unwrap()
+                .get(&DeliveryTag::from(vec![0x43]))
+                .unwrap()
+                .received
+        );
+        drop(detached);
+        assert!(
+            sent.try_recv().is_err(),
+            "no second Detach or automatic disposition"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_only_resume_rebinds_delivery_identity_without_redelivery() {
+        use super::super::{
+            receiver_delivery::ReceiverDelivery, state::LinkState, unsettled_store::Store,
+        };
+        use fe2o3_amqp_types::{
+            messaging::{Body, Received},
+            primitives::OrderedMap,
+        };
+        let tag: DeliveryTag = vec![0x42].into();
+        let mut retained = ReceiverDelivery::new(None);
+        retained.received(
+            Received {
+                section_number: 1,
+                section_offset: 0,
+            }
+            .into(),
+            true,
+        );
+        // No identity is carried across Attach. Only the resumed Transfer can
+        // assign this delivery a new session delivery-id.
+        let map = Arc::new(Store::new(Some(
+            [(tag.clone(), retained)]
+                .into_iter()
+                .collect::<OrderedMap<_, _>>(),
+        )));
+        let mut link = Receiver::builder()
+            .name("resume")
+            .source("source")
+            .target("target")
+            .create_link(
+                map.clone(),
+                OutputHandle(0),
+                make_flow_state(0),
+                Arc::new(OnceLock::new()),
+            );
+        link.local_state = LinkState::Attached;
+        let (control, _controls) = mpsc::channel(8);
+        let (outgoing, _outgoing) = mpsc::channel(8);
+        let (_incoming, incoming) = mpsc::channel(8);
+        let mut receiver = Receiver {
+            inner: ReceiverInner {
+                link,
+                buffer_size: 8,
+                credit_mode: CreditMode::Manual,
+                processed: Arc::new(AtomicU32::new(0)),
+                auto_accept: false,
+                session: control,
+                outgoing: outgoing.into(),
+                incoming,
+                incomplete_transfer: None,
+                incoming_recovery: Default::default(),
+                receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
+            },
+        };
+        let view = receiver.settlement_view();
+        assert!(view.contains(&tag));
+        assert!(view.delivery_info(&tag).is_none());
+        let mut transfer: Transfer =
+            serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x42, 0x43])
+                .unwrap();
+        transfer.delivery_id = Some(99);
+        transfer.resume = true;
+        let result = receiver
+            .inner
+            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "a completed message must not be emitted again"
+        );
+        assert_eq!(view.delivery_info(&tag).unwrap().delivery_id(), 99);
+        // Unknown tags and terminally settled transfers never become disposable.
+        transfer.delivery_tag = Some(vec![0x43].into());
+        assert!(receiver
+            .inner
+            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(view.delivery_info(&vec![0x43].into()).is_none());
+        transfer.delivery_tag = Some(tag.clone());
+        transfer.settled = Some(true);
+        assert!(receiver
+            .inner
+            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer, Vec::new().into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!view.contains(&tag));
+        assert!(view.delivery_info(&tag).is_none());
     }
 
     #[tokio::test]

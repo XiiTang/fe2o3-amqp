@@ -512,6 +512,10 @@ pub(crate) struct SenderInner<L: endpoint::SenderLink> {
 
 impl<L: endpoint::SenderLink> Drop for SenderInner<L> {
     fn drop(&mut self) {
+        if matches!(self.link.local_state(), super::state::LinkState::DetachSent) {
+            // The declared Detach was already sent. Drop cannot close it again.
+            return;
+        }
         if let Some(handle) = self.link.output_handle_mut().take() {
             let detach = Detach {
                 handle: handle.into(),

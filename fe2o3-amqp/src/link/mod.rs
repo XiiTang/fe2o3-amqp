@@ -534,7 +534,11 @@ where
                         None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
                     });
 
-                self.output_handle.take();
+                // Retain the identity while a non-closing Detach is in flight:
+                // preceding Transfer frames still belong to this endpoint.
+                if !matches!(self.local_state, LinkState::DetachSent) {
+                    self.output_handle.take();
+                }
                 result
             }
             None => Err(DetachError::IllegalState),

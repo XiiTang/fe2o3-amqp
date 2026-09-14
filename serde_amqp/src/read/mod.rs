@@ -48,8 +48,13 @@ pub trait Read<'de>: private::Sealed {
 
     /// Consuming `n` number of bytes
     fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>, io::Error> {
-        let mut buf = vec![0u8; n];
-        self.read_exact(&mut buf)?;
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while buf.len() < n {
+            let count = (n - buf.len()).min(chunk.len());
+            self.read_exact(&mut chunk[..count])?;
+            buf.extend_from_slice(&chunk[..count]);
+        }
         Ok(buf)
     }
 

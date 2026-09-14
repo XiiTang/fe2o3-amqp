@@ -942,10 +942,18 @@ fn write_array<'a, W: Write + 'a>(
     buf: &'a [u8],
     ext_is_array_elem: &IsArrayElement,
 ) -> Result<(), Error> {
+    // Serde carries no element type for an empty generic sequence. Emit a
+    // legal canonical uint constructor; there are no element values to convert.
+    // Raw LazyValue input preserves a caller-selected empty-array constructor.
+    let buf = if num == 0 && buf.is_empty() {
+        &[EncodingCodes::Uint0 as u8][..]
+    } else {
+        buf
+    };
     let len = buf.len();
 
     match len {
-        0..=U8_MAX_MINUS_1 => {
+        0..=U8_MAX_MINUS_1 if num <= u8::MAX as usize => {
             if let IsArrayElement::False | IsArrayElement::FirstElement = ext_is_array_elem {
                 let code = [EncodingCodes::Array8 as u8];
                 writer.write_all(&code)?;
@@ -955,7 +963,7 @@ fn write_array<'a, W: Write + 'a>(
             let len_num = [len as u8, num as u8];
             writer.write_all(&len_num)?;
         }
-        U8_MAX..=U32_MAX_MINUS_4 => {
+        0..=U32_MAX_MINUS_4 if num <= u32::MAX as usize => {
             if let IsArrayElement::False | IsArrayElement::FirstElement = ext_is_array_elem {
                 let code = [EncodingCodes::Array32 as u8];
                 writer.write_all(&code)?;
@@ -1975,10 +1983,9 @@ mod test {
         let val: Array<i32> = Array::from(vec![]);
         let expected = vec![
             EncodingCodes::Array8 as u8,
-            0x01, // length
+            0x02, // length
             0x00, // count
-                  // There is no element, and thus there is no element constructor
-                  // The same behavior is observed in amqpnetlite
+            0x43, // canonical uint constructor for a generic empty array
         ];
         assert_eq_on_serialized_vs_expected(val, &expected);
     }

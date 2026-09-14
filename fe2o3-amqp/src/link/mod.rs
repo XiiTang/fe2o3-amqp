@@ -8,7 +8,7 @@ use fe2o3_amqp_types::{
         self, DeliveryNumber, DeliveryTag, MessageFormat, ReceiverSettleMode, Role,
         SenderSettleMode, SequenceNo, SessionError,
     },
-    messaging::{DeliveryState, Received, Source, Target, TargetArchetype},
+    messaging::{DeliveryState, Received, Source, TargetArchetype},
     performatives::{Attach, Detach, Disposition, Transfer},
     primitives::{OrderedMap, Symbol},
 };
@@ -46,7 +46,9 @@ pub(crate) use frame::*;
 pub mod builder;
 pub mod delivery;
 mod error;
+mod incoming_recovery;
 mod incomplete_transfer;
+pub mod receive_budget;
 pub mod receiver;
 mod receiver_link;
 pub(crate) mod resumption;

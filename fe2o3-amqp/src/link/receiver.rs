@@ -130,6 +130,19 @@ impl Receiver {
         self.inner.link.name()
     }
 
+    /// Set the shared native budget before receiving any message fragments.
+    /// Existing retained fragments cannot be silently moved to another budget.
+    pub fn set_receive_budget(
+        &mut self,
+        budget: Arc<super::receive_budget::ReceiveBudget>,
+    ) -> Result<(), RecvError> {
+        if self.inner.incomplete_transfer.is_some() {
+            return Err(LinkStateError::IllegalState.into());
+        }
+        self.inner.receive_budget = budget;
+        Ok(())
+    }
+
     /// Returns the `max_message_size` of the link. A value of zero indicates that the link has no
     /// maximum message size, and thus a zero value is turned into a `None`
     pub fn max_message_size(&self) -> Option<u64> {
@@ -800,6 +813,8 @@ pub(crate) struct ReceiverInner<L: endpoint::ReceiverLink> {
 
     // Wrap in a box to avoid clippy warning large_enum_variant on link acceptor's output
     pub(crate) incomplete_transfer: Option<Box<IncompleteTransfer>>,
+    pub(crate) incoming_recovery: super::incoming_recovery::IncomingRecovery,
+    pub(crate) receive_budget: Arc<super::receive_budget::ReceiveBudget>,
 }
 
 impl<L: endpoint::ReceiverLink> Drop for ReceiverInner<L> {
@@ -882,6 +897,7 @@ where
         &mut self,
         is_reattaching: bool,
     ) -> Result<ReceiverAttachExchange, <Self::Link as LinkAttach>::AttachError> {
+        self.incoming_recovery.reset();
         self.link
             .exchange_attach(
                 &self.outgoing,
@@ -1031,18 +1047,6 @@ where
         settled: Option<bool>,
         state: DeliveryState,
     ) -> Result<(), RecvError> {
-        match &mut self.incomplete_transfer {
-            Some(incomplete) if *delivery_tag == incomplete.performative.delivery_tag => {
-                if let DeliveryState::Received(received) = &state {
-                    incomplete.keep_buffer_till_section_number_and_offset(
-                        received.section_number,
-                        received.section_offset,
-                    );
-                }
-            }
-            Some(_) | None => {}
-        }
-
         self.link
             .on_transfer_state(delivery_tag, settled, state)
             .map_err(Into::into)
@@ -1057,7 +1061,7 @@ where
         match &mut self.incomplete_transfer {
             Some(incomplete) => {
                 incomplete.or_assign(transfer)?;
-                incomplete.append(payload);
+                incomplete.append(payload)?;
 
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
@@ -1069,7 +1073,7 @@ where
                 }
             }
             None => {
-                let incomplete = IncompleteTransfer::new(transfer, payload);
+                let incomplete = IncompleteTransfer::new(transfer, payload, &self.receive_budget)?;
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
                     self.link.on_incomplete_transfer(
@@ -1088,55 +1092,6 @@ where
     /// # Cancel safety
     ///
     /// This is cancel safe because all internal `.await` point(s) are cancel safe
-    async fn on_resuming_transfer<T>(
-        &mut self,
-        transfer: Transfer,
-        payload: Payload,
-    ) -> Result<Option<Delivery<T>>, RecvError>
-    where
-        for<'de> T: FromBody<'de> + Send,
-    {
-        // need to check whether the incoming transfer matches
-        match (
-            &transfer.delivery_tag,
-            self.incomplete_transfer
-                .as_ref()
-                .map(|i| &i.performative.delivery_tag),
-        ) {
-            (Some(remote), Some(Some(local))) => {
-                // The transfer does not belong to the buffer incomplete transfer
-                if remote != local {
-                    let (section_number, section_offset) =
-                        count_number_of_sections_and_offset(&payload);
-                    let delivery = self.link.on_complete_transfer(
-                        transfer,
-                        &payload,
-                        section_number,
-                        section_offset,
-                    )?;
-
-                    // Auto accept the message and leave settled to be determined based on rcv_settle_mode
-                    if self.auto_accept {
-                        self.dispose(&delivery, None, Accepted {}.into()).await?;
-                        // cancel safe
-                    }
-
-                    Ok(Some(delivery))
-                } else {
-                    // The new Transfer belongs to the buffered incomplete transfer
-                    self.on_complete_transfer(transfer, payload).await // cancel safe
-                }
-            }
-            _ => {
-                // The new Transfer belongs to the buffered incomplete transfer that there isn't an incomplete_transfer
-                self.on_complete_transfer(transfer, payload).await // cancel safe
-            }
-        }
-    }
-
-    /// # Cancel safety
-    ///
-    /// This is cancel safe because all internal `.await` point(s) are cancel safe
     async fn on_complete_transfer<T>(
         &mut self,
         transfer: Transfer,
@@ -1148,7 +1103,7 @@ where
         let delivery = match self.incomplete_transfer.take() {
             Some(mut incomplete) => {
                 incomplete.or_assign(transfer)?;
-                incomplete.append(payload); // This also computes the section number and offset incrementally
+                incomplete.append(payload)?; // This also computes the section number and offset incrementally
 
                 self.link.on_complete_transfer(
                     incomplete.performative,
@@ -1159,7 +1114,7 @@ where
             }
             None => {
                 let (section_number, section_offset) =
-                    count_number_of_sections_and_offset(&payload);
+                    count_number_of_sections_and_offset(&payload)?;
                 self.link.on_complete_transfer(
                     transfer,
                     &payload,
@@ -1183,20 +1138,127 @@ where
     #[inline]
     async fn on_incoming_transfer<T>(
         &mut self,
-        transfer: Transfer,
+        mut transfer: Transfer,
         payload: Payload,
     ) -> Result<Option<Delivery<T>>, RecvError>
     where
         for<'de> T: FromBody<'de> + Send,
     {
-        // Aborted messages SHOULD be discarded by the recipient (any payload
-        // within the frame carrying the performative MUST be ignored). An aborted
-        // message is implicitly settled
-        if transfer.aborted {
-            let _ = self.incomplete_transfer.take();
+        use super::incoming_recovery::Kind;
+        let continuation = self.incoming_recovery.continuation(&mut transfer)?;
+        let mut kind = continuation;
+        if continuation.is_none() && transfer.resume {
+            let tag = transfer
+                .delivery_tag
+                .as_ref()
+                .ok_or(RecvError::DeliveryTagIsNone)?;
+            if transfer.delivery_id.is_none() {
+                return Err(RecvError::DeliveryIdIsNone);
+            }
+            let known = self
+                .link
+                .unsettled()
+                .read()
+                .as_ref()
+                .and_then(|m| m.get(tag))
+                .cloned();
+            kind = Some(match known {
+                None => Kind::Ignore,
+                Some(_)
+                    if self
+                        .incomplete_transfer
+                        .as_ref()
+                        .is_some_and(|p| p.performative.delivery_tag.as_ref() == Some(tag)) =>
+                {
+                    Kind::Payload
+                }
+                Some(_) => Kind::StateOnly,
+            });
+            if kind == Some(Kind::Payload) {
+                let (number, offset) = match &transfer.state {
+                    Some(DeliveryState::Received(r)) => (r.section_number, r.section_offset),
+                    _ => (0, 0),
+                };
+                let partial = self
+                    .incomplete_transfer
+                    .as_mut()
+                    .expect("matching retained delivery");
+                partial.keep_buffer_till_section_number_and_offset(number, offset)?;
+                partial.performative.delivery_id = transfer.delivery_id;
+            }
+            self.incoming_recovery
+                .start(&transfer, kind.expect("resume classification"));
+        }
+        if kind == Some(Kind::Ignore) {
             return Ok(None);
         }
-
+        if kind == Some(Kind::StateOnly) {
+            if transfer.aborted || transfer.settled == Some(true) {
+                if let Some(map) = self.link.unsettled().write().as_mut() {
+                    if let Some(tag) = &transfer.delivery_tag {
+                        map.swap_remove(tag);
+                    }
+                }
+            } else if let Some(state) = transfer.state {
+                self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state)?;
+            }
+            return Ok(None);
+        }
+        if transfer.aborted {
+            self.incomplete_transfer = None;
+            return Ok(None);
+        }
+        if matches!(transfer.state, Some(DeliveryState::Received(_)))
+            && !transfer.resume
+            && continuation.is_none()
+        {
+            return Err(RecvError::InvalidMessageEncoding(
+                serde_amqp::Error::InvalidValue,
+            ));
+        }
+        if self.incomplete_transfer.is_none() {
+            if transfer.delivery_id.is_none() {
+                return Err(RecvError::DeliveryIdIsNone);
+            }
+            if transfer.delivery_tag.is_none() {
+                return Err(RecvError::DeliveryTagIsNone);
+            }
+            if transfer.message_format.is_none() {
+                return Err(RecvError::InvalidMessageEncoding(
+                    serde_amqp::Error::InvalidValue,
+                ));
+            }
+        } else if transfer.delivery_tag.is_none() {
+            transfer.delivery_tag = self
+                .incomplete_transfer
+                .as_ref()
+                .and_then(|p| p.performative.delivery_tag.clone());
+        }
+        let retained = self
+            .incomplete_transfer
+            .as_ref()
+            .map_or(0, |p| p.buffer.len());
+        let size = retained
+            .checked_add(payload.len())
+            .ok_or(RecvError::MessageSizeExceeded)?;
+        let maximum = self
+            .link
+            .max_message_size()
+            .filter(|n| *n != 0)
+            .unwrap_or(16 * 1024 * 1024)
+            .min(16 * 1024 * 1024);
+        if size as u64 > maximum {
+            return Err(RecvError::MessageSizeExceeded);
+        }
+        if transfer
+            .delivery_tag
+            .as_ref()
+            .is_some_and(|tag| tag.len() > 32)
+        {
+            return Err(RecvError::InvalidMessageEncoding(
+                serde_amqp::Error::InvalidValue,
+            ));
+        }
         if let Some(state) = transfer.state.clone() {
             // Setting the state
             // on the transfer can be thought of as being equivalent to sending a disposition immediately before
@@ -1212,8 +1274,6 @@ where
             self.on_incomplete_transfer(transfer, payload)?;
             // Partial delivery doesn't yield a complete message
             Ok(None)
-        } else if transfer.resume {
-            self.on_resuming_transfer(transfer, payload).await // cancel safe
         } else {
             // Final transfer of the delivery
             self.on_complete_transfer(transfer, payload).await // cancel safe

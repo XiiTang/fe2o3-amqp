@@ -185,7 +185,6 @@ mod tests {
     use crate::{
         de::Deserializer,
         descriptor::{Descriptor, PeekDescriptor},
-        from_slice,
         primitives::Symbol,
         read::SliceReader,
     };
@@ -197,7 +196,9 @@ mod tests {
         // let descriptor = Descriptor::Name(Symbol::from("amqp"));
         let descriptor = Descriptor::Code(113);
         let buf = to_vec(&descriptor).unwrap();
-        let deserialized: Descriptor = from_slice(&buf).unwrap();
+        // A descriptor alone is an encoding component, not a complete described value.
+        let deserialized =
+            Descriptor::deserialize(&mut Deserializer::new(SliceReader::new(&buf))).unwrap();
         assert_eq!(deserialized, descriptor)
     }
 

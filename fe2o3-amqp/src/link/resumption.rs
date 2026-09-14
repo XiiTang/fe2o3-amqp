@@ -6,7 +6,7 @@ use tokio::sync::oneshot;
 
 use crate::Payload;
 
-use super::{delivery::UnsettledMessage, receiver_link::is_section_header};
+use super::delivery::UnsettledMessage;
 
 pub(crate) enum ResumingDelivery {
     Abort {
@@ -205,29 +205,14 @@ fn split_off_at_section_and_offset(
     section: usize,
     offset: usize,
 ) -> Option<Payload> {
-    let b0 = payload.iter();
-    let b1 = payload.iter().skip(1);
-    let b2 = payload.iter().skip(2);
-    let zip = b0.zip(b1.zip(b2));
-
-    let mut section_counter = None;
-    let mut last_section_index = 0;
-
-    for (i, (&b0, (&b1, &b2))) in zip.enumerate() {
-        if is_section_header(b0, b1, b2) {
-            match &mut section_counter {
-                Some(value) => *value += 1,
-                None => section_counter = Some(0),
-            }
-            last_section_index = i;
-        }
-
-        if section_counter == Some(section) && i - last_section_index == offset {
-            return Some(payload.slice(i..));
-        }
-    }
-
-    None
+    let number = u32::try_from(section).ok()?;
+    let index = fe2o3_amqp_types::messaging::message::admission::prefix_offset(
+        payload,
+        number,
+        offset as u64,
+    )
+    .ok()?;
+    Some(payload.slice(index..))
 }
 
 #[cfg(test)]

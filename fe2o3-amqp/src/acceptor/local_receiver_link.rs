@@ -231,13 +231,8 @@ where
                 // Complete attach anyway
                 link.send_attach(&outgoing, &control, false).await?;
                 return Err(link
-                    .handle_attach_error(
-                        attach_error,
-                        &outgoing,
-                        &mut incoming_rx,
-                        &control,
-                    )
-                    .await)
+                    .handle_attach_error(attach_error, &outgoing, &mut incoming_rx, &control)
+                    .await);
             }
             _ => link.send_attach(&outgoing, &control, false).await?,
         }
@@ -252,6 +247,8 @@ where
             outgoing,
             incoming: incoming_rx,
             incomplete_transfer: None,
+            incoming_recovery: Default::default(),
+            receive_budget: crate::link::receive_budget::ReceiveBudget::new(32 * 1024 * 1024),
         };
 
         if let CreditMode::Auto(credit) = inner.credit_mode {

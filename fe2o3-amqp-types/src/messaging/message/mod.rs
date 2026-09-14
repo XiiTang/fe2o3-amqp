@@ -1,5 +1,7 @@
 //! Implementation of Message as defined in AMQP 1.0 protocol Part 3.2
 
+pub mod admission;
+
 use std::marker::PhantomData;
 
 use serde::{

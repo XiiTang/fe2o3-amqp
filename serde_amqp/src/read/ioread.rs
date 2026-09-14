@@ -33,14 +33,14 @@ impl<R: io::Read> IoReader<R> {
 
     /// Fill the internal buffer with the given length
     pub fn fill_buffer(&mut self, len: usize) -> Result<(), io::Error> {
-        let l = self.buf.len();
-        if l < len {
-            self.buf.resize(len, 0);
-            self.reader.read_exact(&mut self.buf[l..])?;
-            Ok(())
-        } else {
-            Ok(())
+        // Peer-selected lengths cannot cause allocation before bytes arrive.
+        let mut chunk = [0u8; 8192];
+        while self.buf.len() < len {
+            let count = (len - self.buf.len()).min(chunk.len());
+            self.reader.read_exact(&mut chunk[..count])?;
+            self.buf.extend_from_slice(&chunk[..count]);
         }
+        Ok(())
     }
 }
 

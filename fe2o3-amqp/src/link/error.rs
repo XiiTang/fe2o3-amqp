@@ -180,28 +180,6 @@ impl From<DetachError> for SendError {
     }
 }
 
-cfg_transaction! {
-    /// Error with the sender trying consume link credit
-    ///
-    /// This is only used in
-    #[derive(Debug, thiserror::Error)]
-    pub(crate) enum SenderTryConsumeError {
-        /// The sender is unable to acquire lock to inner state
-        #[error("Try lock error")]
-        TryLockError,
-
-        /// There is not enough link credit
-        #[error("Insufficient link credit")]
-        InsufficientCredit,
-    }
-
-    impl From<tokio::sync::TryLockError> for SenderTryConsumeError {
-        fn from(_: tokio::sync::TryLockError) -> Self {
-            Self::TryLockError
-        }
-    }
-}
-
 /// The desired filter(s) on the receiver is not supported by the remote peer
 #[derive(Debug)]
 pub struct DesiredFilterNotSupported {
@@ -460,6 +438,12 @@ pub(crate) enum ReceiverTransferError {
     #[error("Illegal local state")]
     IllegalState,
 
+    /// Incoming message data exceeded the native or negotiated materialization bound.
+    #[error("Incoming message exceeds its materialization bound")]
+    MessageSizeExceeded,
+    /// The encoded sections or explicit recovery point are invalid.
+    #[error("Invalid message encoding or retained recovery position: {0}")]
+    InvalidMessageEncoding(serde_amqp::Error),
     /// The peer sent more message transfers than currently allowed on the link.
     #[error("The peer sent more message transfers than currently allowed on the link")]
     TransferLimitExceeded,
@@ -511,6 +495,12 @@ pub enum RecvError {
     #[error("Local error: {:?}", .0)]
     LinkStateError(LinkStateError),
 
+    /// Incoming message data exceeded the native or negotiated materialization bound.
+    #[error("Incoming message exceeds its materialization bound")]
+    MessageSizeExceeded,
+    /// The encoded sections or explicit recovery point are invalid.
+    #[error("Invalid message encoding or retained recovery position: {0}")]
+    InvalidMessageEncoding(serde_amqp::Error),
     /// The peer sent more message transfers than currently allowed on the link.
     #[error("The peer sent more message transfers than currently allowed on the link")]
     TransferLimitExceeded,
@@ -544,6 +534,10 @@ pub enum RecvError {
 impl From<ReceiverTransferError> for RecvError {
     fn from(value: ReceiverTransferError) -> Self {
         match value {
+            ReceiverTransferError::MessageSizeExceeded => RecvError::MessageSizeExceeded,
+            ReceiverTransferError::InvalidMessageEncoding(error) => {
+                RecvError::InvalidMessageEncoding(error)
+            }
             ReceiverTransferError::TransferLimitExceeded => RecvError::TransferLimitExceeded,
             ReceiverTransferError::DeliveryIdIsNone => RecvError::DeliveryIdIsNone,
             ReceiverTransferError::DeliveryTagIsNone => RecvError::DeliveryTagIsNone,

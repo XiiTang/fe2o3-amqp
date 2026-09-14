@@ -246,6 +246,7 @@
 //!    of elements `Vec` is treated as an AMQP `List` in the core spec
 
 // Public mods
+pub mod admission;
 pub mod de;
 pub mod described;
 pub mod descriptor;

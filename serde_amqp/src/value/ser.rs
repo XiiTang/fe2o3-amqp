@@ -1001,7 +1001,7 @@ mod tests {
 
         let buf = to_value(&data).unwrap();
         // The produced value must round-trip through its serialized form
-        let bytes = to_vec(&buf).unwrap();
+        let bytes = crate::to_vec(&buf).unwrap();
         let round_tripped: Value = crate::from_slice(&bytes).unwrap();
         assert_eq!(buf, round_tripped);
     }

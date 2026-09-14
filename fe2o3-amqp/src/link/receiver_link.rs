@@ -4,7 +4,6 @@ use fe2o3_amqp_types::{
     definitions::{Fields, Handle},
     messaging::{message::DecodeIntoMessage, FromBody},
 };
-use serde_amqp::format_code::EncodingCodes;
 
 use crate::{
     endpoint::LinkExt,
@@ -12,19 +11,6 @@ use crate::{
 };
 
 use super::{delivery::DeliveryInfo, *};
-
-pub(crate) const DESCRIBED_TYPE: u8 = EncodingCodes::DescribedType as u8;
-pub(crate) const SMALL_ULONG_TYPE: u8 = EncodingCodes::SmallUlong as u8;
-pub(crate) const ULONG_TYPE: u8 = EncodingCodes::Ulong as u8;
-pub(crate) const HEADER_CODE: u8 = 0x70;
-pub(crate) const DELIV_ANNOT_CODE: u8 = 0x71;
-pub(crate) const MSG_ANNOT_CODE: u8 = 0x72;
-pub(crate) const PROP_CODE: u8 = 0x73;
-pub(crate) const APP_PROP_CODE: u8 = 0x74;
-pub(crate) const DATA_CODE: u8 = 0x75;
-pub(crate) const AMQP_SEQ_CODE: u8 = 0x76;
-pub(crate) const AMQP_VAL_CODE: u8 = 0x77;
-pub(crate) const FOOTER_CODE: u8 = 0x78;
 
 impl<Tar> endpoint::ReceiverLink for ReceiverLink<Tar>
 where
@@ -160,10 +146,14 @@ where
             .ok_or(Self::TransferError::DeliveryTagIsNone)?;
         let message_format = transfer.message_format;
 
+        let encoded: Vec<u8> = payload.as_byte_iterator().copied().collect();
+        let admission = fe2o3_amqp_types::messaging::message::admission::validate(&encoded);
         let (result, mode) = if settled_by_sender {
             // If the message is pre-settled, there is no need to
             // add to the unsettled map and no need to reply to the Sender
-            let result = T::decode_message_from_reader(payload.into_reader());
+            let result = admission.and_then(|_| {
+                T::decode_message_from_reader(serde_amqp::read::SliceReader::new(&encoded))
+            });
             (result, None)
         } else {
             // If the message is being sent settled by the sender, the value of this
@@ -182,7 +172,9 @@ where
                 None => None,
             };
 
-            let result = T::decode_message_from_reader(payload.into_reader());
+            let result = admission.and_then(|_| {
+                T::decode_message_from_reader(serde_amqp::read::SliceReader::new(&encoded))
+            });
 
             let state = DeliveryState::Received(Received {
                 section_number, // What is section number?
@@ -358,82 +350,12 @@ fn consecutive_chunk_indices(delivery_infos: &[DeliveryInfo]) -> Vec<usize> {
         .collect()
 }
 
-/// Count number of sections in encoded message
-pub(crate) fn count_number_of_sections_and_offset<'a, B>(bytes: B) -> (u32, u64)
-where
-    B: AsByteIterator + 'a,
-{
-    let b0 = bytes.as_byte_iterator();
-    let len = b0.len();
-    let b1 = bytes.as_byte_iterator().skip(1);
-    let b2 = bytes.as_byte_iterator().skip(2);
-    let iter = b0.zip(b1.zip(b2));
-
-    let mut last_pos = 0;
-    let mut section_numbers = 0;
-
-    for (i, (&b0, (&b1, &b2))) in iter.enumerate() {
-        if is_section_header(b0, b1, b2) {
-            section_numbers += 1;
-            last_pos = i;
-        }
-    }
-
-    let offset = len - last_pos;
-    (section_numbers, offset as u64)
-}
-
-pub(crate) fn is_section_header(b0: u8, b1: u8, b2: u8) -> bool {
-    matches!(
-        (b0, b1, b2),
-        (DESCRIBED_TYPE, SMALL_ULONG_TYPE, HEADER_CODE)
-        | (DESCRIBED_TYPE, SMALL_ULONG_TYPE, DELIV_ANNOT_CODE)
-        | (DESCRIBED_TYPE, SMALL_ULONG_TYPE, MSG_ANNOT_CODE)
-        | (DESCRIBED_TYPE, SMALL_ULONG_TYPE, PROP_CODE)
-        | (DESCRIBED_TYPE, SMALL_ULONG_TYPE, APP_PROP_CODE)
-        | (DESCRIBED_TYPE, SMALL_ULONG_TYPE, DATA_CODE)
-        | (DESCRIBED_TYPE, SMALL_ULONG_TYPE, AMQP_SEQ_CODE)
-        | (DESCRIBED_TYPE, SMALL_ULONG_TYPE, AMQP_VAL_CODE)
-        | (DESCRIBED_TYPE, SMALL_ULONG_TYPE, FOOTER_CODE)
-        // Some implementation may use Ulong for all u64 numbers
-        | (DESCRIBED_TYPE, ULONG_TYPE, HEADER_CODE)
-        | (DESCRIBED_TYPE, ULONG_TYPE, DELIV_ANNOT_CODE)
-        | (DESCRIBED_TYPE, ULONG_TYPE, MSG_ANNOT_CODE)
-        | (DESCRIBED_TYPE, ULONG_TYPE, PROP_CODE)
-        | (DESCRIBED_TYPE, ULONG_TYPE, APP_PROP_CODE)
-        | (DESCRIBED_TYPE, ULONG_TYPE, DATA_CODE)
-        | (DESCRIBED_TYPE, ULONG_TYPE, AMQP_SEQ_CODE)
-        | (DESCRIBED_TYPE, ULONG_TYPE, AMQP_VAL_CODE)
-        | (DESCRIBED_TYPE, ULONG_TYPE, FOOTER_CODE)
-    )
-}
-
-impl ReceiverLink<Target> {
-    cfg_transaction! {
-        /// Set and send flow state
-        pub(crate) fn blocking_send_flow(
-            &mut self,
-            writer: &mpsc::Sender<LinkFrame>,
-            link_credit: Option<u32>,
-            drain: Option<bool>,
-            echo: bool,
-            include_properties: bool,
-        ) -> Result<(), FlowError> {
-            let handle = self
-                .output_handle
-                .clone()
-                .ok_or(FlowError::IllegalState)?
-                .into();
-
-            let flow = self.get_link_flow(handle, link_credit, drain, echo, include_properties);
-            writer
-                .blocking_send(LinkFrame::Flow(flow))
-                .map_err(|_| match self.session_stop_reason.get() {
-                    Some(reason) => FlowError::SessionStopped(reason.clone()),
-                    None => FlowError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                })
-        }
-    }
+/// Derive recovery progress from complete encoded section boundaries.
+pub(crate) fn count_number_of_sections_and_offset(
+    bytes: &[u8],
+) -> Result<(u32, u64), ReceiverTransferError> {
+    fe2o3_amqp_types::messaging::message::admission::prefix_position(bytes)
+        .map_err(ReceiverTransferError::InvalidMessageEncoding)
 }
 
 impl<T> ReceiverLink<T> {
@@ -990,7 +912,7 @@ mod tests {
         // let mut serializer = serde_amqp::ser::Serializer::new(&mut buf);
         // message.serialize(&mut serializer).unwrap();
         let buf = to_vec(&Serializable(message)).unwrap();
-        let (_nums, _offset) = count_number_of_sections_and_offset(&*buf);
+        let (_nums, _offset) = count_number_of_sections_and_offset(&buf).unwrap();
     }
 
     #[test]

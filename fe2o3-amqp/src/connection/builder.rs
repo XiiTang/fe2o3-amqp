@@ -141,6 +141,9 @@ pub struct Builder<'a, Mode, Tls> {
     /// If username and password are supplied with the url, this field will be overriden with a
     /// PLAIN SASL profile that is interpreted from the url.
     pub sasl_profile: Option<SaslProfile>,
+    /// Optional bounded raw observation, installed only after SASL.
+    pub incoming_frame_observer:
+        Option<std::sync::Arc<dyn crate::transport::observation::IncomingFrameObserver>>,
 
     /// TLS establishment
     ///
@@ -283,6 +286,7 @@ impl<Mode> Builder<'_, Mode, ()> {
 
             buffer_size: DEFAULT_OUTGOING_BUFFER_SIZE,
             sasl_profile: None,
+            incoming_frame_observer: None,
             alt_tls_estab: false,
 
             marker: PhantomData,
@@ -316,6 +320,7 @@ impl<'a, Tls> Builder<'a, mode::ConnectorNoId, Tls> {
 
             buffer_size: self.buffer_size,
             sasl_profile: self.sasl_profile,
+            incoming_frame_observer: self.incoming_frame_observer,
             alt_tls_estab: self.alt_tls_estab,
 
             marker: PhantomData,
@@ -380,6 +385,7 @@ impl<'a, Mode, Tls> Builder<'a, Mode, Tls> {
 
                 buffer_size: self.buffer_size,
                 sasl_profile: self.sasl_profile,
+            incoming_frame_observer: self.incoming_frame_observer,
                 alt_tls_estab: self.alt_tls_estab,
 
                 marker: PhantomData,
@@ -444,6 +450,7 @@ impl<'a, Mode, Tls> Builder<'a, Mode, Tls> {
 
                     buffer_size: self.buffer_size,
                     sasl_profile: self.sasl_profile,
+            incoming_frame_observer: self.incoming_frame_observer,
                     alt_tls_estab: self.alt_tls_estab,
 
                     marker: PhantomData,
@@ -481,6 +488,15 @@ impl<'a, Mode, Tls> Builder<'a, Mode, Tls> {
     /// URL domain
     pub fn domain(mut self, domain: impl Into<Option<&'a str>>) -> Self {
         self.domain = domain.into();
+        self
+    }
+
+    /// Observe exact incoming AMQP frames without exposing SASL or TLS material.
+    pub fn incoming_frame_observer(
+        mut self,
+        observer: std::sync::Arc<dyn crate::transport::observation::IncomingFrameObserver>,
+    ) -> Self {
+        self.incoming_frame_observer = Some(observer);
         self
     }
 
@@ -743,7 +759,7 @@ impl<Tls> Builder<'_, mode::ConnectorWithId, Tls> {
             .idle_time_out
             .map(|millis| Duration::from_millis(millis as u64));
         let buffer_size = self.buffer_size;
-        let transport = Transport::negotiate_amqp_header(
+        let mut transport = Transport::negotiate_amqp_header(
             framed_write,
             framed_read,
             &mut local_state,
@@ -751,6 +767,11 @@ impl<Tls> Builder<'_, mode::ConnectorWithId, Tls> {
         )
         .await?;
 
+        if let Some(observer) = &self.incoming_frame_observer {
+            // negotiate_amqp_header accepted exactly this eight-byte peer header.
+            observer.protocol_header(*b"AMQP\0\x01\0\0");
+        }
+        transport.set_incoming_frame_observer(self.incoming_frame_observer.clone());
         let local_open = Open::from(self);
 
         // Create channels
@@ -1352,6 +1373,7 @@ cfg_not_wasm32! {
 
         let connection_handle = ConnectionHandle {
             is_closed: false,
+            engine_joined: false,
             control: control_tx,
             handle,
             outcome,
@@ -1381,6 +1403,7 @@ cfg_wasm32! {
 
         let connection_handle = ConnectionHandle {
             is_closed: false,
+            engine_joined: false,
             control: control_tx,
             handle,
             outcome,
@@ -1407,6 +1430,7 @@ cfg_wasm32! {
 
         let connection_handle = ConnectionHandle {
             is_closed: false,
+            engine_joined: false,
             control: control_tx,
             handle,
             outcome,

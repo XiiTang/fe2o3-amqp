@@ -23,7 +23,7 @@
 //! ```rust
 //! use fe2o3_amqp::acceptor::SessionAcceptor;
 //! use fe2o3_amqp::transaction::coordinator::ControlLinkAcceptor;
-//! 
+//!
 //! let session_acceptor = SessionAcceptor::builder()
 //!     .control_link_acceptor(ControlLinkAcceptor::default())
 //!     .build();
@@ -35,43 +35,30 @@ use std::future::Future;
 use crate::{
     endpoint::ReceiverLink,
     link::{
-        delivery::{DeliveryFut, DeliveryInfo, UnsettledMessage},
-        sender::SenderInner,
-        DispositionError, FlowError, LinkFrame,
+        delivery::{DeliveryFut, DeliveryInfo},
+        DispositionError, FlowError,
     },
-    util::TryConsume,
     Receiver, Sendable, Sender,
 };
 
-use bytes::{BufMut, BytesMut};
 use fe2o3_amqp_types::{
-    definitions::{self, AmqpError, DeliveryTag, Fields, SequenceNo},
-    messaging::{
-        message::__private::Serializable, Accepted, DeliveryState, Message, Modified, Outcome,
-        Rejected, Released, SerializableBody, MESSAGE_FORMAT,
-    },
-    performatives::Transfer,
-    primitives::{OrderedMap, Symbol},
-    transaction::{Declared, Discharge, TransactionId, TransactionalState},
+    definitions::{self, Fields, SequenceNo},
+    messaging::{Accepted, DeliveryState, Modified, Outcome, Rejected, Released, SerializableBody},
+    primitives::Symbol,
+    transaction::{Declared, TransactionId, TransactionalState},
 };
 
 pub(crate) const TXN_ID_KEY: &str = "txn-id";
-
-/// Default number of lock-acquisition / outcome-wait trials for the best-effort rollback
-/// performed when a transaction is dropped.
-pub const DEFAULT_ROLLBACK_ON_DROP_TRIALS: u32 = 20;
 
 mod controller;
 pub use controller::*;
 
 mod error;
 pub use error::*;
-use serde::Serialize;
-use serde_amqp::{ser::Serializer, Value};
+use serde_amqp::Value;
 
 mod acquisition;
 pub use acquisition::*;
-use tokio::sync::{mpsc::error::TryRecvError, oneshot};
 
 use controller::ControlLink;
 
@@ -112,7 +99,7 @@ pub trait TransactionDischarge: Sized {
     ///
     /// If the coordinator is unable to complete the discharge, the coordinator MUST convey the
     /// error to the controller as a transaction-error
-    fn rollback(mut self) -> impl Future<Output = Result<(), Self::Error>> + Send 
+    fn rollback(mut self) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         Self: Send,
     {
@@ -125,7 +112,7 @@ pub trait TransactionDischarge: Sized {
     ///
     /// If the coordinator is unable to complete the discharge, the coordinator MUST convey the
     /// error to the controller as a transaction-error
-    fn commit(mut self) -> impl Future<Output = Result<(), Self::Error>> + Send 
+    fn commit(mut self) -> impl Future<Output = Result<(), Self::Error>> + Send
     where
         Self: Send,
     {
@@ -238,10 +225,10 @@ pub trait TransactionRetirement: TransactionBase {
 /// and discharging.
 pub trait TransactionExt:
     TransactionBase
-        + TransactionDischarge
-        + TransactionPosting
-        + TransactionAcquisition
-        + TransactionRetirement
+    + TransactionDischarge
+    + TransactionPosting
+    + TransactionAcquisition
+    + TransactionRetirement
 {
 }
 
@@ -272,7 +259,11 @@ pub trait TransactionPosting: TransactionBase {
     where
         Self: Sync,
     {
-        async move { post_ref_inner(self.txn_id(), sender, sendable, false).await?.await }
+        async move {
+            post_ref_inner(self.txn_id(), sender, sendable, false)
+                .await?
+                .await
+        }
     }
 
     /// Post a transactional work without waiting for the acknowledgement.
@@ -341,7 +332,10 @@ where
         .send_with_state::<T, PostError>(sendable, Some(state), batchable)
         .await?;
 
-    Ok(DeliveryFut::new(settlement, sender.inner.link.session_stop_reason.clone()))
+    Ok(DeliveryFut::new(
+        settlement,
+        sender.inner.link.session_stop_reason.clone(),
+    ))
 }
 
 /// Send a ref of transactional posting with the given `batchable` flag.
@@ -370,7 +364,10 @@ where
         .send_ref_with_state::<T, PostError>(sendable, Some(state), batchable)
         .await?;
 
-    Ok(DeliveryFut::new(settlement, sender.inner.link.session_stop_reason.clone()))
+    Ok(DeliveryFut::new(
+        settlement,
+        sender.inner.link.session_stop_reason.clone(),
+    ))
 }
 
 /// Transactional acquisition (AMQP 1.0 §4.4.3)
@@ -521,9 +518,8 @@ pub struct Transaction<'t> {
     controller: &'t Controller,
     declared: Declared,
     is_discharged: bool,
-    rollback_on_drop_trials: u32,
+    discharge_started: bool,
 }
-
 
 impl<'t> TransactionDischarge for Transaction<'t> {
     type Error = ControllerSendError;
@@ -534,6 +530,10 @@ impl<'t> TransactionDischarge for Transaction<'t> {
 
     async fn discharge(&mut self, fail: bool) -> Result<(), Self::Error> {
         if !self.is_discharged {
+            if self.discharge_started {
+                return Err(ControllerSendError::DischargeOutcomeUnknown);
+            }
+            self.discharge_started = true;
             let mut inner = self.controller.inner.lock().await;
             discharge_on_link(&mut inner, self.declared.txn_id.clone(), fail).await?;
             self.is_discharged = true;
@@ -541,7 +541,6 @@ impl<'t> TransactionDischarge for Transaction<'t> {
         Ok(())
     }
 }
-
 
 impl TransactionBase for Transaction<'_> {
     fn txn_id(&self) -> &TransactionId {
@@ -567,20 +566,13 @@ impl<'t> Transaction<'t> {
             controller,
             declared,
             is_discharged: false,
-            rollback_on_drop_trials: DEFAULT_ROLLBACK_ON_DROP_TRIALS,
+            discharge_started: false,
         })
     }
 
-    /// Number of lock-acquisition / outcome-wait trials for the best-effort rollback
-    /// performed when the transaction is dropped (see [`DEFAULT_ROLLBACK_ON_DROP_TRIALS`]).
-    pub fn rollback_on_drop_trials(&self) -> u32 {
-        self.rollback_on_drop_trials
-    }
-
-    /// Sets the number of trials for the best-effort rollback performed when the transaction
-    /// is dropped. Set to 0 to skip the rollback attempt.
-    pub fn set_rollback_on_drop_trials(&mut self, trials: u32) {
-        self.rollback_on_drop_trials = trials;
+    /// True after an interrupted or failed discharge; another discharge is never inferred.
+    pub fn discharge_outcome_unknown(&self) -> bool {
+        self.discharge_started && !self.is_discharged
     }
 }
 
@@ -589,204 +581,3 @@ impl TransactionPosting for Transaction<'_> {}
 impl TransactionAcquisition for Transaction<'_> {}
 
 impl TransactionExt for Transaction<'_> {}
-
-impl<'t> Drop for Transaction<'t> {
-    #[cfg_attr(feature = "tracing", tracing::instrument)]
-    fn drop(&mut self) {
-        if !self.is_discharged {
-            let mut counter = 0u32;
-            let mut guard = loop {
-                if counter > self.rollback_on_drop_trials {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!(
-                        trials = self.rollback_on_drop_trials,
-                        "rollback_on_drop: giving up acquiring the control link lock"
-                    );
-                    #[cfg(feature = "log")]
-                    log::error!(
-                        "rollback_on_drop: giving up acquiring the control link lock after {} trials",
-                        self.rollback_on_drop_trials
-                    );
-                    return;
-                }
-                counter += 1;
-
-                match self.controller.inner.try_lock() {
-                    Ok(inner) => break inner,
-                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(
-                        (10 * counter + 1) as u64,
-                    )),
-                }
-            };
-            rollback_on_drop(
-                &mut guard,
-                &self.declared.txn_id,
-                self.rollback_on_drop_trials,
-            );
-        }
-    }
-}
-
-/// Roll back an undischarged transaction when it is dropped.
-///
-/// This is a best-effort synchronous operation: the discharge transfer is serialized and
-/// sent over the control link without `.await` (which is not possible in `Drop`), retrying
-/// the outcome wait for a limited number of trials.
-///
-/// The caller must hold exclusive access to the control link.
-pub(crate) fn rollback_on_drop(
-    inner: &mut SenderInner<ControlLink>,
-    txn_id: &TransactionId,
-    trials: u32,
-) {
-    let discharge = Discharge {
-        txn_id: txn_id.clone(),
-        fail: Some(true),
-    };
-    // As with the declare message, it is an error if the sender sends the transfer pre-settled.
-    let message = Message::builder().value(discharge).build();
-    let mut payload = BytesMut::new();
-    let mut serializer = Serializer::from((&mut payload).writer());
-    if let Err(_error) = Serializable(message).serialize(&mut serializer) {
-        #[cfg(feature = "tracing")]
-        tracing::error!(error = ?_error);
-        #[cfg(feature = "log")]
-        log::error!("error = {:?}", _error);
-        return;
-    }
-    let payload = payload.freeze();
-    let payload_copy = payload.clone();
-
-    match inner.link.flow_state.try_consume(1) {
-        Ok(_) => {
-            let input_handle = match inner.link.input_handle.clone().ok_or(AmqpError::IllegalState)
-            {
-                Ok(handle) => handle,
-                Err(_error) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!(error = ?_error);
-                    #[cfg(feature = "log")]
-                    log::error!("error = {:?}", _error);
-                    return;
-                }
-            };
-            let handle = match inner.link.output_handle.clone() {
-                Some(handle) => handle.into(),
-                None => return,
-            };
-            let tag = match inner.link.flow_state.state().lock.try_read() {
-                Some(inner) => inner.delivery_count.to_be_bytes(),
-                None => return,
-            };
-            let delivery_tag = DeliveryTag::from(tag);
-
-            let transfer = Transfer {
-                handle,
-                delivery_id: None,
-                delivery_tag: Some(delivery_tag.clone()),
-                message_format: Some(MESSAGE_FORMAT),
-                settled: Some(false),
-                more: false, // This message should be small enough
-                rcv_settle_mode: None,
-                state: None,
-                resume: false,
-                aborted: false,
-                batchable: false,
-            };
-
-            // try receive in case of detach
-            match inner.incoming.try_recv() {
-                Ok(_) => {
-                    // The only frames that are relayed is detach
-                    return;
-                }
-                Err(error) => match error {
-                    TryRecvError::Empty => {}
-                    TryRecvError::Disconnected => return,
-                },
-            }
-
-            // Send out Rollback
-            let frame = LinkFrame::Transfer {
-                input_handle,
-                performative: transfer,
-                payload,
-            };
-            if let Err(_error) = inner.outgoing.try_send(frame) {
-                // The channel to the session is already closed
-                #[cfg(feature = "tracing")]
-                tracing::error!(txn_id = ?txn_id, "rollback_on_drop: failed to send the discharge transfer, the control link channel is closed");
-                #[cfg(feature = "log")]
-                log::error!("rollback_on_drop: failed to send the discharge transfer, the control link channel is closed");
-                return;
-            }
-
-            // TODO: Wait for accept or not?
-            // The transfer is sent unsettled and will be
-            // inserted into
-            let (tx, mut rx) = oneshot::channel();
-            let unsettled = UnsettledMessage::new(payload_copy, None, MESSAGE_FORMAT, tx);
-            {
-                let mut guard = match inner.link.unsettled.try_write() {
-                    Some(guard) => guard,
-                    None => return,
-                };
-                guard
-                    .get_or_insert(OrderedMap::new())
-                    .insert(delivery_tag, unsettled);
-            }
-            let mut counter = 0u32;
-            loop {
-                // TODO:: limits?
-                if counter > trials {
-                    #[cfg(feature = "tracing")]
-                    tracing::error!(txn_id = ?txn_id, trials, "rollback_on_drop: giving up waiting for the discharge outcome");
-                    #[cfg(feature = "log")]
-                    log::error!("rollback_on_drop: giving up waiting for the discharge outcome after {trials} trials");
-                    return;
-                }
-                counter += 1;
-
-                match rx.try_recv() {
-                    Ok(Ok(Some(state))) => match state {
-                        DeliveryState::Accepted(_) => break,
-                        _ => {
-                            #[cfg(feature = "tracing")]
-                            tracing::error!(error = ?state);
-                            #[cfg(feature = "log")]
-                            log::error!("error = {:?}", state);
-                            break;
-                        }
-                    },
-                    Ok(Ok(None)) => {
-                        std::thread::sleep(std::time::Duration::from_millis(
-                            (10 * counter + 1) as u64,
-                        ));
-                    }
-                    // A link-state error was delivered through the channel
-                    // (e.g. the remote closed the control link): the discharge
-                    // outcome will not arrive, so give up waiting.
-                    Ok(Err(_error)) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(error = ?_error);
-                        #[cfg(feature = "log")]
-                        log::error!("error = {:?}", _error);
-                        return;
-                    }
-                    Err(_error) => {
-                        #[cfg(feature = "tracing")]
-                        tracing::error!(error = ?_error);
-                        #[cfg(feature = "log")]
-                        log::error!("error = {:?}", _error);
-                    }
-                };
-            }
-        }
-        Err(_error) => {
-            #[cfg(feature = "tracing")]
-            tracing::error!(error = ?_error);
-            #[cfg(feature = "log")]
-            log::error!("error = {:?}", _error);
-        }
-    }
-}

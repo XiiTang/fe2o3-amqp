@@ -10,7 +10,6 @@ use fe2o3_amqp_types::{
     performatives::Attach,
     primitives::Symbol,
 };
-use parking_lot::RwLock;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -20,8 +19,7 @@ use crate::{
         receiver::{CreditMode, ReceiverInner},
         state::{LinkFlowState, LinkFlowStateInner, LinkState},
         target_archetype::TargetArchetypeExt,
-        LinkFrame, LinkIncomingItem, LinkRelay, ReceiverAttachError, ReceiverLink,
-        SessionStopReason,
+        LinkIncomingItem, LinkRelay, ReceiverAttachError, ReceiverLink, SessionStopReason,
     },
     session::SessionHandle,
     Receiver,
@@ -112,7 +110,7 @@ where
         shared: &SharedLinkAcceptorFields,
         remote_attach: Attach,
         control: mpsc::Sender<SessionControl>,
-        outgoing: mpsc::Sender<LinkFrame>,
+        outgoing: crate::session::transfer_queue::Sender,
         session_stop_reason: Arc<OnceLock<SessionStopReason>>,
         max_frame_size: usize,
     ) -> Result<ReceiverInner<ReceiverLink<T>>, ReceiverAttachError>
@@ -144,7 +142,13 @@ where
         };
 
         // Create channels for Session-Link communication
-        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(shared.buffer_size);
+        let capacity = crate::session::link_incoming_capacity(
+            &control,
+            shared.buffer_size,
+            &session_stop_reason,
+        )
+        .await?;
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(capacity);
 
         // Create shared flow state
         let flow_state_inner = LinkFlowStateInner {
@@ -160,7 +164,7 @@ where
         let flow_state_consumer = flow_state;
 
         // Comparing unsettled should be taken care of in `on_incoming_attach`
-        let unsettled = Arc::new(RwLock::new(None));
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
         let link_handle = LinkRelay::Receiver {
             tx: incoming_tx,
             output_handle: (),
@@ -168,6 +172,7 @@ where
             unsettled: unsettled.clone(),
             receiver_settle_mode: rcv_settle_mode.clone(),
             more: false,
+            current_tag: None,
         };
 
         // Allocate link in session
@@ -234,13 +239,8 @@ where
                 // Complete attach anyway
                 link.send_attach(&outgoing, false).await?;
                 return Err(link
-                    .handle_attach_error(
-                        attach_error,
-                        &outgoing,
-                        &mut incoming_rx,
-                        &control,
-                    )
-                    .await)
+                    .handle_attach_error(attach_error, &outgoing, &mut incoming_rx, &control)
+                    .await);
             }
             _ => link.send_attach(&outgoing, false).await?,
         }
@@ -255,6 +255,8 @@ where
             outgoing,
             incoming: incoming_rx,
             incomplete_transfer: None,
+            incoming_recovery: Default::default(),
+            receive_budget: crate::link::receive_budget::ReceiveBudget::new(32 * 1024 * 1024),
         };
 
         if let CreditMode::Auto(credit) = inner.credit_mode {

@@ -56,7 +56,13 @@ where
     async fn reallocate_output_handle(
         &mut self,
     ) -> Result<(), <Self::Link as LinkAttach>::AttachError> {
-        let (tx, incoming) = mpsc::channel(self.buffer_size());
+        let capacity = session::link_incoming_capacity(
+            self.session_control(),
+            self.buffer_size(),
+            self.session_stop_reason(),
+        )
+        .await?;
+        let (tx, incoming) = mpsc::channel(capacity);
         let link_relay = self.as_new_link_relay(tx);
         *self.reader_mut() = incoming;
         let link_name = self.link().name().to_string();

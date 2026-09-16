@@ -43,6 +43,7 @@ pub fn from_reader<T: de::DeserializeOwned>(reader: impl std::io::Read) -> Resul
 
 /// Deserialize and instance of type T from a bytes slice
 pub fn from_slice<'de, T: de::Deserialize<'de>>(slice: &'de [u8]) -> Result<T, Error> {
+    crate::admission::Scan::new(slice).all()?;
     let reader = SliceReader::new(slice);
     let mut de = Deserializer::new(reader);
     T::deserialize(&mut de)
@@ -70,6 +71,15 @@ impl<'de, R: Read<'de>> Deserializer<R> {
             struct_encoding: StructEncoding::None,
             elem_format_code: None,
         }
+    }
+
+    fn consume_empty_array_constructor(&mut self, length: usize) -> Result<(), Error> {
+        // A zero-count array still has a complete element constructor. Read in
+        // bounded chunks and validate it without fabricating an element value.
+        let bytes = self.reader.read_bytes(length)?;
+        crate::admission::validate_array_constructor(&bytes)?;
+        self.elem_format_code = None;
+        Ok(())
     }
 
     fn read_format_code(&mut self) -> Option<Result<EncodingCodes, Error>> {
@@ -884,17 +894,22 @@ where
 
                 // Reject counts that exceed the hard cap or the encoded body
                 // length. Without these checks an attacker could supply a
-                // count larger than the bytes actually present (in particular
+                // unbounded count (in particular
                 // with zero-width element format codes such as null/true/
                 // false/uint0/ulong0) and force the visitor to iterate or
                 // allocate far beyond the frame size.
-                if count > MAX_ARRAY_COUNT || count > len {
+                if count > MAX_ARRAY_COUNT {
                     return Err(Error::InvalidValue);
                 }
 
                 // If count is zero, jump to visitor
                 match count {
-                    0 => visitor.visit_seq(ArrayAccess::new(self, len, count)),
+                    0 => {
+                        self.consume_empty_array_constructor(
+                            len.checked_sub(1).ok_or(Error::InvalidValue)?,
+                        )?;
+                        visitor.visit_seq(ArrayAccess::new(self, 0, 0))
+                    }
                     _ => {
                         let format_code = self
                             .read_format_code()
@@ -902,7 +917,7 @@ where
                         self.elem_format_code = Some(format_code);
 
                         // Account for offset
-                        let len = len - OFFSET_ARRAY8;
+                        let len = len.checked_sub(OFFSET_ARRAY8).ok_or(Error::InvalidValue)?;
                         // let buf = self.reader.read_bytes(len)?;
 
                         visitor.visit_seq(ArrayAccess::new(self, len, count))
@@ -919,13 +934,18 @@ where
 
                 // See `Array8` arm above: cap the count so that a malformed
                 // frame cannot trick the visitor into iterating 2^31 times.
-                if count > MAX_ARRAY_COUNT || count > len {
+                if count > MAX_ARRAY_COUNT {
                     return Err(Error::InvalidValue);
                 }
 
                 // If count is zero, jump to visitor
                 match count {
-                    0 => visitor.visit_seq(ArrayAccess::new(self, len, count)),
+                    0 => {
+                        self.consume_empty_array_constructor(
+                            len.checked_sub(4).ok_or(Error::InvalidValue)?,
+                        )?;
+                        visitor.visit_seq(ArrayAccess::new(self, 0, 0))
+                    }
                     _ => {
                         let format_code = self
                             .read_format_code()
@@ -933,7 +953,7 @@ where
                         self.elem_format_code = Some(format_code);
 
                         // Account for offset
-                        let len = len - OFFSET_ARRAY32;
+                        let len = len.checked_sub(OFFSET_ARRAY32).ok_or(Error::InvalidValue)?;
                         // let buf = self.reader.read_bytes(len)?;
 
                         visitor.visit_seq(ArrayAccess::new(self, len, count))
@@ -958,7 +978,7 @@ where
                     as usize;
 
                 // Account for offset
-                let len = len - OFFSET_LIST8;
+                let len = len.checked_sub(OFFSET_LIST8).ok_or(Error::InvalidValue)?;
 
                 // Make sure there is no other element format code
                 self.elem_format_code = None;
@@ -979,7 +999,7 @@ where
                 }
 
                 // Account for offset
-                let len = len - OFFSET_LIST32;
+                let len = len.checked_sub(OFFSET_LIST32).ok_or(Error::InvalidValue)?;
 
                 // Make sure there is no other element format code
                 self.elem_format_code = None;
@@ -1340,7 +1360,7 @@ where
 ///
 /// Holds the residual budget for an `array8`/`array32` body so iteration can
 /// be bounded both by element count and by bytes consumed. The pre-loop
-/// `count <= len` and `count <= MAX_ARRAY_COUNT` checks in
+/// `count <= MAX_ARRAY_COUNT` check in
 /// [`Deserializer::deserialize_seq`] are the primary DoS defense; the
 /// per-element overrun check in [`Self::next_element_seed`] guards against
 /// drift between the encoded body length and what the element visitor
@@ -1394,8 +1414,8 @@ impl<'de, R: Read<'de>> de::SeqAccess<'de> for ArrayAccess<'_, R> {
                 self.count -= 1;
                 let result = seed.deserialize(self.as_mut())?;
                 // Defense in depth: bound iteration by bytes consumed, not
-                // just by `count`. The pre-loop `count <= len` /
-                // `count <= MAX_ARRAY_COUNT` checks already reject the known
+                // just by `count`. The pre-loop
+                // `count <= MAX_ARRAY_COUNT` check already reject the known
                 // attack shape (oversized count with zero-width element
                 // codes). This second check fires if a future zero-width
                 // element type is added, or if a visitor's element decoder
@@ -2092,65 +2112,36 @@ mod tests {
         assert_eq_from_reader_vs_expected(buf, expected);
     }
 
-    /// Helper function to test deserialization of en empty array
-    ///
-    /// The spec isn't really clear on how an empty array should be serialized.
-    /// So we'll try to cover all possible cases. Future test cases should be added here
     fn test_deserialize_empty_array_inner<T>()
     where
         for<'de> T: Deserialize<'de> + std::fmt::Debug + PartialEq + Clone,
     {
         use crate::primitives::Array;
-
         let expected: Array<T> = Array::from(vec![]);
-
-        // Empty array8 with no type constructor
-        let buf = [
-            EncodingCodes::Array8 as u8,
-            0x01, // length
-            0x00, // count
-                  // The type constructor could be missing if the array is empty
-                  // This behavior is observed in amqpnetlite
-        ];
-        assert_eq_from_reader_vs_expected(&buf, expected.clone());
-
-        // Empty array8 with a null type constructor
-        let buf = [
-            EncodingCodes::Array8 as u8,
-            0x02, // length
-            0x00, // count
-            0x40, // null
-        ];
-        assert_eq_from_reader_vs_expected(&buf, expected.clone());
-
-        // Empty array32 with no type constructor
-        let buf = [
-            EncodingCodes::Array32 as u8,
-            0x00,
-            0x00,
-            0x00,
-            0x04, // length
-            0x00,
-            0x00,
-            0x00,
-            0x00, // count
-        ];
-        assert_eq_from_reader_vs_expected(&buf, expected.clone());
-
-        // Empty array32 with a null type constructor
-        let buf = [
-            EncodingCodes::Array32 as u8,
-            0x00,
-            0x00,
-            0x00,
-            0x05, // length
-            0x00,
-            0x00,
-            0x00,
-            0x00, // count
-            0x40, // null
-        ];
-        assert_eq_from_reader_vs_expected(&buf, expected);
+        for constructor in [vec![0xa3], vec![0, 0x53, 0x77, 0xc0]] {
+            let mut bytes = vec![0xe0, (constructor.len() + 1) as u8, 0];
+            bytes.extend_from_slice(&constructor);
+            assert_eq_from_reader_vs_expected(&bytes, expected.clone());
+            let mut bytes32 = vec![0xf0];
+            bytes32.extend_from_slice(&((constructor.len() + 4) as u32).to_be_bytes());
+            bytes32.extend_from_slice(&0u32.to_be_bytes());
+            bytes32.extend_from_slice(&constructor);
+            assert_eq_from_reader_vs_expected(&bytes32, expected.clone());
+            // A following field must not be mistaken for the empty array's constructor.
+            bytes.push(0x52);
+            bytes.push(7);
+            let mut de = super::Deserializer::new(crate::read::SliceReader::new(&bytes));
+            assert_eq!(Array::<T>::deserialize(&mut de).unwrap(), expected);
+            assert_eq!(u32::deserialize(&mut de).unwrap(), 7);
+        }
+        for bytes in [
+            &[0xe0, 1, 0][..],
+            &[0xe0, 2, 0, 0x40][..],
+            &[0xe0, 3, 0, 0xa3, 0x40][..],
+        ] {
+            assert!(from_slice::<Array<T>>(bytes).is_err());
+            assert!(from_reader::<Array<T>>(bytes).is_err());
+        }
     }
 
     #[test]

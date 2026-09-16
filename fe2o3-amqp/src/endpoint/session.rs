@@ -131,6 +131,8 @@ pub(crate) trait Session {
     /// Returns a session-only flow (no link handle) when the session should proactively
     /// re-advertise its window after receiving transfers. Called by the session engine after
     /// every incoming transfer; returns `None` when no flow is due.
+    fn receive_window(&self) -> &Arc<crate::session::receive_window::ReceiveWindow>;
+
     fn maybe_outgoing_session_flow(&mut self) -> Option<SessionOutgoingItem>;
 
     fn on_outgoing_transfer(
@@ -138,6 +140,7 @@ pub(crate) trait Session {
         input_handle: InputHandle,
         transfer: Transfer,
         payload: Payload,
+        queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Option<SessionOutgoingItem>, Self::Error>;
 
     fn on_outgoing_disposition(

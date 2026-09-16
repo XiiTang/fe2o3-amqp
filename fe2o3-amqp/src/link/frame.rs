@@ -21,6 +21,8 @@ pub(crate) enum LinkFrame {
         input_handle: InputHandle,
         performative: Transfer,
         payload: Payload,
+        window_slot: Option<crate::session::receive_window::Slot>,
+        queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     },
     Disposition(Disposition),
     Detach(Detach),
@@ -40,6 +42,7 @@ impl std::fmt::Debug for LinkFrame {
                 input_handle,
                 performative,
                 payload,
+                ..
             } => f
                 .debug_struct("Transfer")
                 .field("input_handle", input_handle)

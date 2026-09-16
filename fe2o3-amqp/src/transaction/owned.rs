@@ -1,6 +1,5 @@
 //! Implements OwnedTransaction
 
-
 use fe2o3_amqp_types::transaction::{Declared, TransactionId};
 
 use crate::{
@@ -9,18 +8,16 @@ use crate::{
 };
 
 use super::{
-    declare_on_link, discharge_on_link, rollback_on_drop, ControlLink, Controller,
-    ControllerSendError, DEFAULT_ROLLBACK_ON_DROP_TRIALS, OwnedDeclareError,
-    OwnedDischargeError, TransactionAcquisition, TransactionBase, TransactionDischarge,
-    TransactionExt, TransactionPosting, TransactionRetirement,
+    declare_on_link, discharge_on_link, ControlLink, Controller, ControllerSendError,
+    OwnedDeclareError, OwnedDischargeError, TransactionAcquisition, TransactionBase,
+    TransactionDischarge, TransactionExt, TransactionPosting, TransactionRetirement,
 };
 
 /// An owned transaction that has exclusive access to its own control link.
 ///
-/// If the transaction is dropped without being discharged (i.e. without calling
-/// [`commit`](TransactionDischarge::commit) or
-/// [`rollback`](TransactionDischarge::rollback)), it is rolled back as a best-effort
-/// operation.
+/// Dropping a transaction performs no discharge, detach, retry, or network I/O.
+/// Commit and rollback are explicit operations. An interrupted discharge retains
+/// an unknown outcome and cannot be implicitly repeated.
 ///
 /// # Examples
 ///
@@ -95,9 +92,8 @@ pub struct OwnedTransaction {
     inner: SenderInner<ControlLink>,
     declared: Declared,
     is_discharged: bool,
-    rollback_on_drop_trials: u32,
+    discharge_started: bool,
 }
-
 
 impl TransactionDischarge for OwnedTransaction {
     type Error = OwnedDischargeError;
@@ -108,6 +104,10 @@ impl TransactionDischarge for OwnedTransaction {
 
     async fn discharge(&mut self, fail: bool) -> Result<(), Self::Error> {
         if !self.is_discharged {
+            if self.discharge_started {
+                return Err(ControllerSendError::DischargeOutcomeUnknown.into());
+            }
+            self.discharge_started = true;
             discharge_on_link(&mut self.inner, self.declared.txn_id.clone(), fail).await?;
             self.is_discharged = true;
         }
@@ -127,7 +127,6 @@ impl TransactionDischarge for OwnedTransaction {
     }
 }
 
-
 impl TransactionRetirement for OwnedTransaction {
     type RetireError = DispositionError;
 }
@@ -135,6 +134,17 @@ impl TransactionRetirement for OwnedTransaction {
 impl TransactionBase for OwnedTransaction {
     fn txn_id(&self) -> &TransactionId {
         &self.declared.txn_id
+    }
+}
+
+// Retain no implicit Detach even if declaration is cancelled after dispatch.
+struct DeclaringLink(Option<SenderInner<ControlLink>>);
+impl Drop for DeclaringLink {
+    fn drop(&mut self) {
+        use crate::endpoint::LinkExt;
+        if let Some(inner) = &mut self.0 {
+            inner.link.output_handle_mut().take();
+        }
     }
 }
 
@@ -159,26 +169,23 @@ impl OwnedTransaction {
         controller: Controller,
         global_id: impl Into<Option<TransactionId>>,
     ) -> Result<OwnedTransaction, ControllerSendError> {
-        let mut inner = controller.into_inner();
-        let declared = declare_on_link(&mut inner, global_id.into()).await?;
+        let mut pending = DeclaringLink(Some(controller.into_inner()));
+        let declared = declare_on_link(
+            pending.0.as_mut().expect("owned declaration link"),
+            global_id.into(),
+        )
+        .await?;
         Ok(Self {
-            inner,
+            inner: pending.0.take().expect("owned declaration link"),
             declared,
             is_discharged: false,
-            rollback_on_drop_trials: DEFAULT_ROLLBACK_ON_DROP_TRIALS,
+            discharge_started: false,
         })
     }
 
-    /// Number of lock-acquisition / outcome-wait trials for the best-effort rollback
-    /// performed when the transaction is dropped (see [`DEFAULT_ROLLBACK_ON_DROP_TRIALS`]).
-    pub fn rollback_on_drop_trials(&self) -> u32 {
-        self.rollback_on_drop_trials
-    }
-
-    /// Sets the number of trials for the best-effort rollback performed when the transaction
-    /// is dropped. Set to 0 to skip the rollback attempt.
-    pub fn set_rollback_on_drop_trials(&mut self, trials: u32) {
-        self.rollback_on_drop_trials = trials;
+    /// True when the one explicit discharge has no confirmed result.
+    pub fn discharge_outcome_unknown(&self) -> bool {
+        self.discharge_started && !self.is_discharged
     }
 }
 
@@ -190,12 +197,9 @@ impl TransactionExt for OwnedTransaction {}
 
 impl Drop for OwnedTransaction {
     fn drop(&mut self) {
-        if !self.is_discharged {
-            rollback_on_drop(
-                &mut self.inner,
-                &self.declared.txn_id,
-                self.rollback_on_drop_trials,
-            );
-        }
+        // SenderInner normally sends Detach on Drop. An owned control link must
+        // not close the peer transaction as an implicit cleanup side effect.
+        use crate::endpoint::LinkExt;
+        self.inner.link.output_handle_mut().take();
     }
 }

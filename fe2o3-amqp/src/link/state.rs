@@ -316,28 +316,6 @@ impl Consume for SenderFlowState {
     }
 }
 
-cfg_transaction! {
-    impl crate::util::TryConsume for SenderFlowState {
-        type Error = super::error::SenderTryConsumeError;
-
-        fn try_consume(&self, item: Self::Item) -> Result<Self::Outcome, Self::Error> {
-            let mut state = self
-                .state()
-                .lock
-                .try_write()
-                .ok_or(super::error::SenderTryConsumeError::TryLockError)?;
-            if state.link_credit < item {
-                Err(Self::Error::InsufficientCredit)
-            } else {
-                let tag = state.delivery_count.to_be_bytes();
-                state.delivery_count = state.delivery_count.wrapping_add(item);
-                state.link_credit = state.link_credit.saturating_sub(item);
-                Ok(tag)
-            }
-        }
-    }
-}
-
 fn consume_link_credit(
     lock: &RwLock<LinkFlowStateInner>,
     count: u32,

@@ -488,8 +488,12 @@ impl ser::SerializeSeq for SeqSerializer<'_> {
                 list_size(self.cumulated_size, &self.se.is_array_element)
                     .map_err(|_| Error::too_long())
             }
-            Some(SequenceType::Array) => array_size(self.cumulated_size, &self.se.is_array_element)
-                .map_err(|_| Error::too_long()),
+            Some(SequenceType::Array) => array_size(
+                self.cumulated_size.max(1),
+                self.idx,
+                &self.se.is_array_element,
+            )
+            .map_err(|_| Error::too_long()),
             Some(SequenceType::TransparentVec) => {
                 transparent_vec_size(self.cumulated_size, &self.se.is_array_element)
                     .map_err(|_| Error::too_long())
@@ -515,14 +519,14 @@ fn list_size(len: usize, is_array_element: &IsArrayElement) -> Result<usize, usi
     }
 }
 
-fn array_size(len: usize, is_array_element: &IsArrayElement) -> Result<usize, usize> {
+fn array_size(len: usize, count: usize, is_array_element: &IsArrayElement) -> Result<usize, usize> {
     let out = match len {
-        0..=U8_MAX_MINUS_1 => match is_array_element {
+        0..=U8_MAX_MINUS_1 if count <= u8::MAX as usize => match is_array_element {
             IsArrayElement::False => 1 + 2 + len,
             IsArrayElement::FirstElement => 1 + 2 + len,
             IsArrayElement::OtherElement => 2 + len,
         },
-        U8_MAX..=U32_MAX_MINUS_4 => match is_array_element {
+        0..=U32_MAX_MINUS_4 if count <= u32::MAX as usize => match is_array_element {
             IsArrayElement::False => 1 + 4 + 4 + len,
             IsArrayElement::FirstElement => 1 + 4 + 4 + len,
             IsArrayElement::OtherElement => 4 + 4 + len,

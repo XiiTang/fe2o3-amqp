@@ -203,6 +203,38 @@ impl Sender {
             .await
     }
 
+    /// Preserve an endpoint after its session stopped, without sending frames.
+    /// Already closed links and queued peer-closing Detach frames cannot resume.
+    pub fn into_detached(mut self) -> Result<DetachedSender, Self> {
+        use super::state::LinkState;
+        if matches!(
+            self.inner.link.local_state,
+            LinkState::Closed | LinkState::CloseSent
+        ) {
+            return Err(self);
+        }
+        if !matches!(self.inner.link.local_state, LinkState::Detached)
+            && self.inner.link.session_stop_reason.get().is_none()
+        {
+            return Err(self);
+        }
+        while let Ok(frame) = self.inner.incoming.try_recv() {
+            if let LinkFrame::Detach(detach) = frame {
+                if detach.closed {
+                    self.inner.link.local_state = LinkState::Closed;
+                    self.inner.link.output_handle.take();
+                    return Err(self);
+                }
+            }
+        }
+        // A stopped session has no live link handles. The endpoint and its
+        // unsettled map survive, but attachment belongs to the next session.
+        self.inner.link.local_state = LinkState::Detached;
+        self.inner.link.output_handle.take();
+        self.inner.link.input_handle.take();
+        Ok(DetachedSender::new(self.inner))
+    }
+
     /// Detach the link
     ///
     /// The Sender will send a detach frame with closed field set to false,
@@ -509,7 +541,7 @@ where
     pub(crate) session: mpsc::Sender<SessionControl>,
 
     // Outgoing mpsc channel to send the Link frames
-    pub(crate) outgoing: mpsc::Sender<LinkFrame>,
+    pub(crate) outgoing: crate::session::transfer_queue::Sender,
     pub(crate) incoming: mpsc::Receiver<LinkFrame>,
 }
 
@@ -518,6 +550,10 @@ where
     L: endpoint::SenderLink + LinkExt<Unsettled = ArcSenderUnsettledMap>,
 {
     fn drop(&mut self) {
+        if matches!(self.link.local_state(), super::state::LinkState::DetachSent) {
+            // A declared suspension must not become a closing detach on drop.
+            return;
+        }
         // A detach the relay already answered may be waiting in the engine's
         // channel. Apply it so the link state matches the detach; and once
         // any detach was drained, the peer has already ended the link, so
@@ -818,19 +854,17 @@ where
 }
 
 impl SenderInner<SenderLink<Target>> {
-    /// Switch the link to a new session, returning whether the link is being
-    /// reattached (i.e. the new session is a different session from the
-    /// current one).
+    /// Switch sessions while preserving the endpoint's unsettled state.
     ///
     /// The new session may belong to a different connection whose negotiated
     /// max frame size differs, so the link's `max_frame_size` is refreshed
     /// from the new session before any attach/transfer frame is sent.
     pub(crate) fn switch_session<R>(&mut self, new_session: &SessionHandle<R>) -> bool {
-        let is_reattaching = !self.session.same_channel(&new_session.control);
+        self.link.session_stop_reason = new_session.session_stop_reason().clone();
         self.session = new_session.control.clone();
         self.outgoing = new_session.outgoing.clone();
         self.link.max_frame_size = new_session.max_frame_size();
-        is_reattaching
+        false
     }
 
     /// Resumes a delivery with the given state and payload.
@@ -1148,6 +1182,39 @@ macro_rules! try_as_sender {
 }
 
 impl DetachedSender {
+    /// Resume with an explicit interruption future. Both success and failure
+    /// return the native endpoint; interruption performs no protocol cleanup.
+    pub async fn resume_on_session_until<R>(
+        mut self,
+        session: &SessionHandle<R>,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) -> Result<Sender, SenderResumeError> {
+        if self.inner.link.session_stop_reason.get().is_some() {
+            self = match (Sender { inner: *self.inner }).into_detached() {
+                Ok(endpoint) => endpoint,
+                Err(endpoint) => {
+                    return Err(SenderResumeError {
+                        detached_sender: DetachedSender {
+                            inner: Box::new(endpoint.inner),
+                        },
+                        kind: SenderAttachError::IllegalState.into(),
+                    })
+                }
+            };
+        }
+        self.inner.switch_session(session);
+        let result = tokio::select! { biased;
+            _ = interrupt => Err(SenderResumeErrorKind::Interrupted),
+            result = self.inner.resume_incoming_attach(None, false) => result,
+        };
+        match result {
+            Ok(()) => Ok(Sender { inner: *self.inner }),
+            Err(kind) => Err(SenderResumeError {
+                detached_sender: self,
+                kind,
+            }),
+        }
+    }
     fn new(inner: SenderInner<SenderLink<Target>>) -> Self {
         Self {
             inner: Box::new(inner),
@@ -1219,7 +1286,8 @@ impl DetachedSender {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_sender!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(SenderResumeError {
                         detached_sender: self,
                         kind: SenderResumeErrorKind::Timeout,
@@ -1252,7 +1320,8 @@ impl DetachedSender {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_sender!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(SenderResumeError {
                         detached_sender: self,
                         kind: SenderResumeErrorKind::Timeout,
@@ -1327,7 +1396,6 @@ mod tests {
     use std::marker::PhantomData;
 
     use fe2o3_amqp_types::definitions::ReceiverSettleMode;
-    use parking_lot::RwLock;
     use tokio::sync::Notify;
 
     use super::*;
@@ -1373,7 +1441,7 @@ mod tests {
             offered_capabilities: None,
             desired_capabilities: None,
             flow_state: consumer,
-            unsettled: Arc::new(RwLock::new(None)),
+            unsettled: Arc::new(super::super::unsettled_store::Store::new(None)),
             session_stop_reason: Arc::new(OnceLock::new()),
             max_frame_size,
             verify_incoming_source: true,
@@ -1383,7 +1451,7 @@ mod tests {
             link,
             buffer_size: 16,
             session: session_tx,
-            outgoing: outgoing_tx,
+            outgoing: outgoing_tx.into(),
             incoming: incoming_rx,
         };
         (inner, session_rx, outgoing_rx, incoming_tx)
@@ -1425,8 +1493,9 @@ mod tests {
             is_ended: false,
             control,
             engine_handle: tokio::spawn(async {}),
+            engine_joined: false,
             outcome,
-            outgoing: outgoing_tx,
+            outgoing: outgoing_tx.into(),
             session_stop_reason: Arc::new(OnceLock::new()),
             max_frame_size,
             link_listener: (),
@@ -1438,10 +1507,9 @@ mod tests {
         let mut inner = make_sender_inner(4092);
         let session_b = make_session_handle(1020);
 
-        // Switching to a different session marks the link as reattaching and
-        // refreshes the link's max frame size from the new session
+        // A new session refreshes frame limits without discarding recovery state.
         let is_reattaching = inner.switch_session(&session_b);
-        assert!(is_reattaching);
+        assert!(!is_reattaching);
         assert_eq!(inner.link.max_frame_size, 1020);
 
         // Switching to the same session does not mark the link as reattaching

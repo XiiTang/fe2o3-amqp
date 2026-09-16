@@ -93,7 +93,7 @@ cfg_transaction! {
             pub(crate) fn into_txn_session(
                 self,
                 control: mpsc::Sender<SessionControl>,
-                outgoing: mpsc::Sender<crate::link::LinkFrame>,
+                outgoing: crate::session::transfer_queue::Sender,
                 outgoing_channel: OutgoingChannel,
                 control_link_acceptor: ControlLinkAcceptor,
                 local_state: SessionState,
@@ -115,6 +115,7 @@ cfg_transaction! {
                     incoming_channel: None,
                     next_incoming_id: 0,
                     need_flow_count: 0,
+                    receive_window: super::receive_window::ReceiveWindow::new(self.incoming_window),
                     remote_incoming_window: 0,
                     remote_incoming_window_exhausted_buffer: VecDeque::new(),
                     remote_outgoing_window: 0,
@@ -165,6 +166,7 @@ impl Builder {
             incoming_channel: None,
             next_incoming_id: 0,
             need_flow_count: 0,
+            receive_window: super::receive_window::ReceiveWindow::new(self.incoming_window),
             remote_incoming_window: 0,
             remote_incoming_window_exhausted_buffer: VecDeque::new(),
             remote_outgoing_window: 0,
@@ -286,7 +288,7 @@ impl Builder {
             let (session_control_tx, session_control_rx) =
                 mpsc::channel::<SessionControl>(DEFAULT_SESSION_CONTROL_BUFFER_SIZE);
             let (incoming_tx, incoming_rx) = mpsc::channel(self.buffer_size);
-            let (outgoing_tx, outgoing_rx) = mpsc::channel(self.buffer_size);
+            let (outgoing_tx, outgoing_rx) = crate::session::transfer_queue::channel(self.buffer_size);
 
             // create session in connection::Engine
             let outgoing_channel = match connection.allocate_session(incoming_tx).await {
@@ -375,6 +377,7 @@ impl Builder {
 
             let handle = SessionHandle {
                 is_ended: false,
+            engine_joined: false,
                 control: session_control_tx,
                 engine_handle,
                 outcome,
@@ -408,7 +411,7 @@ impl Builder {
             let (session_control_tx, session_control_rx) =
                 mpsc::channel::<SessionControl>(DEFAULT_SESSION_CONTROL_BUFFER_SIZE);
             let (incoming_tx, incoming_rx) = mpsc::channel(self.buffer_size);
-            let (outgoing_tx, outgoing_rx) = mpsc::channel(self.buffer_size);
+            let (outgoing_tx, outgoing_rx) = crate::session::transfer_queue::channel(self.buffer_size);
 
             // create session in connection::Engine
             let outgoing_channel = match connection.allocate_session(incoming_tx).await {
@@ -445,6 +448,7 @@ impl Builder {
 
             let handle = SessionHandle {
                 is_ended: false,
+            engine_joined: false,
                 control: session_control_tx,
                 engine_handle,
                 outcome,
@@ -477,7 +481,7 @@ impl Builder {
             let (session_control_tx, session_control_rx) =
                 mpsc::channel::<SessionControl>(DEFAULT_SESSION_CONTROL_BUFFER_SIZE);
             let (incoming_tx, incoming_rx) = mpsc::channel(self.buffer_size);
-            let (outgoing_tx, outgoing_rx) = mpsc::channel(self.buffer_size);
+            let (outgoing_tx, outgoing_rx) = crate::session::transfer_queue::channel(self.buffer_size);
 
             // create session in connection::Engine
             let outgoing_channel = match connection.allocate_session(incoming_tx).await {
@@ -514,6 +518,7 @@ impl Builder {
 
             let handle = SessionHandle {
                 is_ended: false,
+            engine_joined: false,
                 control: session_control_tx,
                 engine_handle,
                 outcome,

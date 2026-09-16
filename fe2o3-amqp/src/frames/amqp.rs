@@ -4,8 +4,8 @@ use bytes::{Buf, BufMut, BytesMut};
 use fe2o3_amqp_types::performatives::{
     Attach, Begin, Close, Detach, Disposition, End, Flow, Open, Performative, Transfer,
 };
-use serde::{ser::Serialize, Deserialize};
-use serde_amqp::{de::Deserializer, read::IoReader};
+use serde::ser::Serialize;
+
 use tokio_util::codec::{Decoder, Encoder};
 
 use crate::Payload;
@@ -235,6 +235,9 @@ impl Decoder for FrameDecoder {
     type Error = Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        if src.len() < 4 {
+            return Err(serde_amqp::Error::InvalidValue.into());
+        }
         let doff = src.get_u8();
         let ftype = src.get_u8();
         let channel = src.get_u16();
@@ -244,17 +247,28 @@ impl Decoder for FrameDecoder {
             return Err(Error::NotImplemented);
         }
 
-        match doff {
-            2 => {}
-            _ => return Err(Error::NotImplemented),
+        let extended = usize::from(doff)
+            .checked_mul(4)
+            .and_then(|v| v.checked_sub(8))
+            .ok_or(serde_amqp::Error::InvalidValue)?;
+        if extended > src.len() {
+            return Err(serde_amqp::Error::InvalidValue.into());
         }
+        src.advance(extended);
 
         let body = if src.is_empty() {
             FrameBody::Empty
         } else {
-            let reader = IoReader::new(src.reader());
-            let mut deserializer = Deserializer::new(reader);
-            let performative: Performative = Deserialize::deserialize(&mut deserializer)?;
+            let length =
+                serde_amqp::admission::value_extent(src).map_err(serde_amqp::Error::from)?;
+            let performative: Performative = serde_amqp::from_slice(&src[..length])?;
+            src.advance(length);
+            if !matches!(performative, Performative::Transfer(_)) && !src.is_empty() {
+                return Err(serde_amqp::Error::InvalidValue.into());
+            }
+            if matches!(performative, Performative::Open(_)) && channel != 0 {
+                return Err(serde_amqp::Error::InvalidValue.into());
+            }
 
             match performative {
                 Performative::Open(performative) => FrameBody::Open(performative),

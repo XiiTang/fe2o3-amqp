@@ -7,14 +7,13 @@ use fe2o3_amqp_types::{
         self, DeliveryNumber, DeliveryTag, MessageFormat, ReceiverSettleMode, Role,
         SenderSettleMode, SequenceNo, SessionError,
     },
-    messaging::{DeliveryState, Received, Source, Target, TargetArchetype},
+    messaging::{DeliveryState, Received, Source, TargetArchetype},
     performatives::{Attach, Detach, Disposition, Transfer},
     primitives::{OrderedMap, Symbol},
 };
 
 pub use error::*;
 
-use parking_lot::RwLock;
 pub use receiver::{CreditMode, Receiver, ReceiverDisposer};
 pub use sender::Sender;
 use serde_amqp::serialized_size;
@@ -44,8 +43,11 @@ pub(crate) use frame::*;
 pub mod builder;
 pub mod delivery;
 mod error;
+mod incoming_recovery;
 mod incomplete_transfer;
+pub mod receive_budget;
 pub mod receiver;
+mod receiver_delivery;
 mod receiver_link;
 pub(crate) mod resumption;
 pub mod sender;
@@ -54,6 +56,7 @@ pub(crate) mod shared_inner;
 mod source;
 pub(crate) mod state;
 pub mod target_archetype;
+pub(crate) mod unsettled_store;
 
 /// Default amount of link credit
 pub const DEFAULT_CREDIT: SequenceNo = 200;
@@ -73,11 +76,11 @@ pub(crate) type SenderLink<T> = Link<role::SenderMarker, T, SenderFlowState, Uns
 
 /// Type alias for receiver link that ONLY represents the inner state of receiver
 pub(crate) type ReceiverLink<T> =
-    Link<role::ReceiverMarker, T, ReceiverFlowState, Option<DeliveryState>>;
+    Link<role::ReceiverMarker, T, ReceiverFlowState, receiver_delivery::ReceiverDelivery>;
 
-pub(crate) type ArcUnsettledMap<S> = Arc<RwLock<Option<UnsettledMap<S>>>>;
+pub(crate) type ArcUnsettledMap<S> = Arc<unsettled_store::Store<S>>;
 pub(crate) type ArcSenderUnsettledMap = ArcUnsettledMap<UnsettledMessage>;
-pub(crate) type ArcReceiverUnsettledMap = ArcUnsettledMap<Option<DeliveryState>>;
+pub(crate) type ArcReceiverUnsettledMap = ArcUnsettledMap<receiver_delivery::ReceiverDelivery>;
 
 pub mod role {
     //! Type state definition of link role
@@ -329,7 +332,7 @@ where
     /// `tokio::mpsc::Sender`, which is cancel safe.
     pub(crate) async fn send_attach_inner(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         is_reattaching: bool,
     ) -> Result<(), SendAttachErrorKind> {
         // Create Attach frame
@@ -438,7 +441,7 @@ where
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     async fn send_detach(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         closed: bool,
         error: Option<definitions::Error>,
     ) -> Result<(), Self::DetachError> {
@@ -471,7 +474,11 @@ where
                         None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
                     });
 
-                self.output_handle.take();
+                // Retain the identity while a non-closing Detach is in flight:
+                // preceding Transfer frames still belong to this endpoint.
+                if !matches!(self.local_state, LinkState::DetachSent) {
+                    self.output_handle.take();
+                }
                 result
             }
             None => Err(DetachError::IllegalState),
@@ -533,6 +540,7 @@ pub(crate) enum LinkRelay<O> {
         unsettled: ArcReceiverUnsettledMap,
         receiver_settle_mode: ReceiverSettleMode,
         more: bool,
+        current_tag: Option<DeliveryTag>,
     },
 }
 
@@ -564,6 +572,7 @@ impl LinkRelay<()> {
             unsettled,
             receiver_settle_mode,
             more: false,
+            current_tag: None,
         }
     }
 
@@ -588,6 +597,7 @@ impl LinkRelay<()> {
                 unsettled,
                 receiver_settle_mode,
                 more,
+                current_tag,
                 ..
             } => LinkRelay::Receiver {
                 tx,
@@ -596,6 +606,7 @@ impl LinkRelay<()> {
                 unsettled,
                 receiver_settle_mode,
                 more,
+                current_tag,
             },
         }
     }
@@ -718,8 +729,7 @@ impl LinkRelay<OutputHandle> {
                             // the sender and receiving a disposition indicating settlement of the
                             // delivery from the sender.
 
-                            // is_terminal
-                            true
+                            is_terminal
                         }
                     }
                 };
@@ -734,7 +744,7 @@ impl LinkRelay<OutputHandle> {
                 } else {
                     let mut guard = unsettled.write();
                     if let Some(msg_state) = guard.as_mut().and_then(|m| m.get_mut(&delivery_tag)) {
-                        *msg_state = state;
+                        msg_state.remote_state(state);
                     }
                 }
 
@@ -752,48 +762,80 @@ impl LinkRelay<OutputHandle> {
         &mut self,
         transfer: Transfer,
         payload: Payload,
+        window_slot: Option<crate::session::receive_window::Slot>,
     ) -> Result<Option<(DeliveryNumber, DeliveryTag)>, LinkRelayError> {
         match self {
             LinkRelay::Sender { .. } => Err(LinkRelayError::TransferFrameToSender),
             LinkRelay::Receiver {
                 tx,
-                receiver_settle_mode,
+                unsettled,
                 more,
+                current_tag,
                 ..
             } => {
+                let first = !*more;
+                if first
+                    && (transfer.delivery_id.is_none()
+                        || transfer.delivery_tag.is_none()
+                        || transfer.message_format.is_none())
+                {
+                    return Err(LinkRelayError::InvalidTransfer);
+                }
+                if transfer.delivery_tag.as_ref().is_some_and(|tag| {
+                    tag.len() > 32
+                        || (!first && current_tag.as_ref().is_some_and(|current| current != tag))
+                }) {
+                    return Err(LinkRelayError::InvalidTransfer);
+                }
                 let settled = transfer.settled.unwrap_or(false);
                 let delivery_id = transfer.delivery_id;
-                let delivery_tag = transfer.delivery_tag.clone();
-                let transfer_more = transfer.more;
-
+                let tag = transfer
+                    .delivery_tag
+                    .clone()
+                    .or_else(|| current_tag.clone());
+                // Publish initial unsettled identity before handing bytes to the
+                // receiver. A following disposition can otherwise race decoding.
+                let known = if let Some(tag) = &tag {
+                    let mut guard = unsettled.write();
+                    if settled || transfer.aborted {
+                        if let Some(map) = guard.as_mut() {
+                            map.swap_remove(tag);
+                        }
+                        false
+                    } else {
+                        if first
+                            && !transfer.resume
+                            && transfer.delivery_id.is_some()
+                            && transfer.message_format.is_some()
+                            && tag.len() <= 32
+                        {
+                            let map = guard.get_or_insert_with(UnsettledMap::new);
+                            if map.contains_key(tag) {
+                                return Err(LinkRelayError::InvalidTransfer);
+                            }
+                            map.insert(
+                                tag.clone(),
+                                receiver_delivery::ReceiverDelivery::new(transfer.state.clone()),
+                            );
+                        }
+                        guard.as_ref().is_some_and(|map| map.contains_key(tag))
+                    }
+                } else {
+                    false
+                };
+                *more = transfer.more && !transfer.aborted;
+                *current_tag = if *more { tag.clone() } else { None };
                 tx.send(LinkFrame::Transfer {
                     input_handle: InputHandle::from(transfer.handle.clone()),
                     performative: transfer,
                     payload,
+                    window_slot,
+                    queue_slot: None,
                 })
                 .await
                 .map_err(|_| LinkRelayError::UnattachedHandle)?;
-
-                if !settled {
-                    if let ReceiverSettleMode::Second = receiver_settle_mode {
-                        // The delivery-id MUST be supplied on the first transfer of a
-                        // multi-transfer delivery.
-                        // And self.more should be false upon the first transfer
-                        if !(*more) {
-                            // The same delivery ID should be used for a multi-transfer delivery
-                            match (delivery_id, delivery_tag) {
-                                (Some(id), Some(tag)) => return Ok(Some((id, tag))),
-                                _ => {
-                                    // This should be an error, but it will be handled by
-                                    // the link instead of the session. So just return a None
-                                    return Ok(None);
-                                }
-                            }
-                        }
-                        // The last transfer of multi-transfer delivery should have
-                        // `more` set to false
-                        *more = transfer_more;
-                    }
+                if first && known {
+                    return Ok(delivery_id.zip(tag));
                 }
                 Ok(None)
             }
@@ -944,6 +986,9 @@ pub(crate) mod test_util {
         loop {
             tokio::select! {
                 ctrl = session_rx.recv() => match ctrl {
+                    Some(SessionControl::GetIncomingWindow(responder)) => {
+                        let _ = responder.send(16);
+                    }
                     Some(SessionControl::AllocateLink {
                         link_relay,
                         responder,
@@ -1022,5 +1067,184 @@ mod tests {
 
         notified.await;
         handle.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod incoming_identity_tests {
+    use super::*;
+    fn transfer() -> Transfer {
+        serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x55, 0x43])
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn second_settlement_waits_for_a_terminal_peer_outcome() {
+        let (tx, _rx) = mpsc::channel(8);
+        let (reply, mut outcome) = oneshot::channel();
+        let tag: DeliveryTag = vec![1].into();
+        let mut messages = UnsettledMap::new();
+        messages.insert(
+            tag.clone(),
+            UnsettledMessage::new(Payload::new(), None, 0, reply),
+        );
+        let unsettled = Arc::new(unsettled_store::Store::new(Some(messages)));
+        let flow = Arc::new(LinkFlowState::sender(state::LinkFlowStateInner {
+            initial_delivery_count: 0,
+            delivery_count: 0,
+            link_credit: 1,
+            available: 0,
+            drain: false,
+            properties: None,
+        }));
+        let mut relay = LinkRelay::new_sender(
+            tx,
+            Producer::new(Arc::new(tokio::sync::Notify::new()), flow),
+            unsettled.clone(),
+        )
+        .with_output_handle(OutputHandle(0));
+        if let LinkRelay::Sender {
+            receiver_settle_mode,
+            ..
+        } = &mut relay
+        {
+            *receiver_settle_mode = ReceiverSettleMode::Second;
+        }
+        let received = fe2o3_amqp_types::messaging::Received {
+            section_number: 1,
+            section_offset: 0,
+        };
+        assert!(!relay.on_incoming_disposition(
+            Role::Receiver,
+            false,
+            Some(received.into()),
+            tag.clone()
+        ));
+        assert!(matches!(
+            outcome.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(unsettled.read().as_ref().unwrap().contains_key(&tag));
+        assert!(relay.on_incoming_disposition(
+            Role::Receiver,
+            false,
+            Some(fe2o3_amqp_types::messaging::Accepted {}.into()),
+            tag
+        ));
+        assert!(matches!(
+            outcome.await.unwrap(),
+            Ok(Some(DeliveryState::Accepted(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn settlement_before_application_decode_and_fragment_continuations_use_one_identity() {
+        for mode in [ReceiverSettleMode::First, ReceiverSettleMode::Second] {
+            let (tx, mut input) = mpsc::channel(8);
+            let unsettled = Arc::new(unsettled_store::Store::new(None));
+            let flow = Arc::new(LinkFlowState::receiver(state::LinkFlowStateInner {
+                initial_delivery_count: 0,
+                delivery_count: 0,
+                link_credit: 4,
+                available: 0,
+                drain: false,
+                properties: None,
+            }));
+            let mut relay = LinkRelay::new_receiver(tx, flow, unsettled.clone(), mode)
+                .with_output_handle(OutputHandle(0));
+            let mut first = transfer();
+            first.more = true;
+            let tag = first.delivery_tag.clone().unwrap();
+            assert_eq!(
+                relay
+                    .on_incoming_transfer(first.clone(), Payload::new(), None)
+                    .await
+                    .unwrap(),
+                Some((0, tag.clone()))
+            );
+            assert!(unsettled.read().as_ref().unwrap().contains_key(&tag));
+            assert!(!relay.on_incoming_disposition(Role::Sender, true, None, tag.clone()));
+            assert!(!unsettled.read().as_ref().unwrap().contains_key(&tag));
+            let mut next = first.clone();
+            next.delivery_id = None;
+            next.delivery_tag = None;
+            next.message_format = None;
+            assert_eq!(
+                relay
+                    .on_incoming_transfer(next.clone(), Payload::new(), None)
+                    .await
+                    .unwrap(),
+                None
+            );
+            next.more = false;
+            assert_eq!(
+                relay
+                    .on_incoming_transfer(next, Payload::new(), None)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert!(!unsettled.read().as_ref().unwrap().contains_key(&tag));
+            first.delivery_id = Some(1);
+            first.delivery_tag = Some(vec![0x56].into());
+            first.more = false;
+            assert_eq!(
+                relay
+                    .on_incoming_transfer(first, Payload::new(), None)
+                    .await
+                    .unwrap(),
+                Some((1, vec![0x56].into()))
+            );
+            assert!(matches!(
+                input.recv().await.unwrap(),
+                LinkFrame::Transfer { .. }
+            ));
+        }
+    }
+    #[test]
+    fn completed_decode_never_recreates_a_delivery_settled_before_application_read() {
+        use crate::endpoint::ReceiverLink as _;
+        for settled in [false, true] {
+            let map = Arc::new(unsettled_store::Store::new(None));
+            let tag = transfer().delivery_tag.unwrap();
+            if !settled {
+                map.write()
+                    .get_or_insert_with(UnsettledMap::new)
+                    .insert(tag.clone(), receiver_delivery::ReceiverDelivery::new(None));
+            }
+            let flow = Arc::new(LinkFlowState::receiver(state::LinkFlowStateInner {
+                initial_delivery_count: 0,
+                delivery_count: 0,
+                link_credit: 4,
+                available: 0,
+                drain: false,
+                properties: None,
+            }));
+            let mut link = Receiver::builder()
+                .name("race")
+                .source("source")
+                .target("target")
+                .receiver_settle_mode(ReceiverSettleMode::Second)
+                .create_link(
+                    map.clone(),
+                    OutputHandle(0),
+                    flow,
+                    Arc::new(OnceLock::new()),
+                    65532,
+                );
+            link.local_state = LinkState::Attached;
+            let delivery: Delivery<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>> = link
+                .on_complete_transfer(
+                    transfer(),
+                    &Payload::from_static(&[0, 0x53, 0x77, 0x40]),
+                    1,
+                    0,
+                )
+                .unwrap();
+            assert_eq!(delivery.delivery_tag(), &tag);
+            assert_eq!(
+                map.read().as_ref().is_some_and(|m| m.contains_key(&tag)),
+                !settled
+            );
+        }
     }
 }

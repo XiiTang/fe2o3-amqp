@@ -18,6 +18,8 @@ use super::{delivery::DeliveryInfo, receiver::DetachedReceiver, sender::Detached
 /// the connection's own stop reason (see [`ConnectionStopReason`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SessionStopReason {
+    /// The owner stopped local processing without an End exchange.
+    Stopped,
     /// The session ended cleanly (locally)
     Ended,
     /// We ended the session with this error
@@ -125,6 +127,9 @@ impl From<ApplyRemoteDetachError> for LinkStateError {
 /// Errors associated with attaching a link as sender
 #[derive(Debug, thiserror::Error)]
 pub enum SenderAttachError {
+    /// The declared session window cannot fit the native queue address space.
+    #[error("Session window exceeds native queue capacity")]
+    NativeBufferTooLarge,
     /// The session (or its connection) stopped before the attach completed
     #[error("The session stopped before the link was attached: {:?}", .0)]
     SessionStopped(SessionStopReason),
@@ -253,8 +258,8 @@ pub enum SendError {
     #[error("A non-terminal delivery state is received when an outcome is expected")]
     NonTerminalDeliveryState,
 
-    /// Transactional state found on non-transactional delivery
-    #[error("Transactional state found on non-transactional delivery")]
+    /// Settlement omitted an outcome or supplied a state incompatible with this send.
+    #[error("Delivery did not provide a valid outcome for this send")]
     IllegalDeliveryState,
 
     /// The encoded message is larger than the maximum message size
@@ -285,28 +290,6 @@ impl From<DetachError> for SendError {
     }
 }
 
-cfg_transaction! {
-    /// Error with the sender trying consume link credit
-    ///
-    /// This is only used in
-    #[derive(Debug, thiserror::Error)]
-    pub(crate) enum SenderTryConsumeError {
-        /// The sender is unable to acquire lock to inner state
-        #[error("Try lock error")]
-        TryLockError,
-
-        /// There is not enough link credit
-        #[error("Insufficient link credit")]
-        InsufficientCredit,
-    }
-
-    impl From<tokio::sync::TryLockError> for SenderTryConsumeError {
-        fn from(_: tokio::sync::TryLockError) -> Self {
-            Self::TryLockError
-        }
-    }
-}
-
 /// The desired filter(s) on the receiver is not supported by the remote peer
 #[derive(Debug)]
 pub struct DesiredFilterNotSupported {
@@ -329,6 +312,9 @@ impl std::error::Error for DesiredFilterNotSupported {}
 /// Errors associated with attaching a link as receiver
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiverAttachError {
+    /// The declared session window cannot fit the native queue address space.
+    #[error("Session window exceeds native queue capacity")]
+    NativeBufferTooLarge,
     /// The session (or its connection) stopped before the attach completed
     #[error("The session stopped before the link was attached: {:?}", .0)]
     SessionStopped(SessionStopReason),
@@ -401,6 +387,7 @@ impl From<AllocLinkError> for ReceiverAttachError {
     fn from(value: AllocLinkError) -> Self {
         match value {
             AllocLinkError::SessionNotMapped => Self::SessionNotMapped,
+            AllocLinkError::NativeBufferTooLarge => Self::NativeBufferTooLarge,
             AllocLinkError::SessionStopped(reason) => Self::SessionStopped(reason),
             AllocLinkError::DuplicatedLinkName => Self::DuplicatedLinkName,
         }
@@ -439,6 +426,7 @@ impl From<AllocLinkError> for SenderAttachError {
     fn from(value: AllocLinkError) -> Self {
         match value {
             AllocLinkError::SessionNotMapped => Self::SessionNotMapped,
+            AllocLinkError::NativeBufferTooLarge => Self::NativeBufferTooLarge,
             AllocLinkError::SessionStopped(reason) => Self::SessionStopped(reason),
             AllocLinkError::DuplicatedLinkName => Self::DuplicatedLinkName,
         }
@@ -568,6 +556,12 @@ pub(crate) enum ReceiverTransferError {
     #[error("Illegal local state")]
     IllegalState,
 
+    /// Incoming message data exceeded the native or negotiated materialization bound.
+    #[error("Incoming message exceeds its materialization bound")]
+    MessageSizeExceeded,
+    /// The encoded sections or explicit recovery point are invalid.
+    #[error("Invalid message encoding or retained recovery position: {0}")]
+    InvalidMessageEncoding(serde_amqp::Error),
     /// The peer sent more message transfers than currently allowed on the link.
     #[error("The peer sent more message transfers than currently allowed on the link")]
     TransferLimitExceeded,
@@ -619,6 +613,12 @@ pub enum RecvError {
     #[error("Local error: {:?}", .0)]
     LinkStateError(LinkStateError),
 
+    /// Incoming message data exceeded the native or negotiated materialization bound.
+    #[error("Incoming message exceeds its materialization bound")]
+    MaterializationBoundExceeded,
+    /// The encoded sections or explicit recovery point are invalid.
+    #[error("Invalid message encoding or retained recovery position: {0}")]
+    InvalidMessageEncoding(serde_amqp::Error),
     /// The peer sent more message transfers than currently allowed on the link.
     #[error("The peer sent more message transfers than currently allowed on the link")]
     TransferLimitExceeded,
@@ -662,6 +662,10 @@ pub enum RecvError {
 impl From<ReceiverTransferError> for RecvError {
     fn from(value: ReceiverTransferError) -> Self {
         match value {
+            ReceiverTransferError::MessageSizeExceeded => RecvError::MaterializationBoundExceeded,
+            ReceiverTransferError::InvalidMessageEncoding(error) => {
+                RecvError::InvalidMessageEncoding(error)
+            }
             ReceiverTransferError::TransferLimitExceeded => RecvError::TransferLimitExceeded,
             ReceiverTransferError::DeliveryIdIsNone => RecvError::DeliveryIdIsNone,
             ReceiverTransferError::DeliveryTagIsNone => RecvError::DeliveryTagIsNone,
@@ -777,6 +781,10 @@ pub enum SenderResumeErrorKind {
     /// Resume timed out
     #[error("Resume timed out")]
     Timeout,
+
+    /// The caller interrupted the exchange; the endpoint remains owned.
+    #[error("Resume interrupted")]
+    Interrupted,
 }
 
 /// Sender encountered error with resumption
@@ -815,6 +823,10 @@ pub enum ReceiverResumeErrorKind {
     /// Resume timed out
     #[error("Resume timed out")]
     Timeout,
+
+    /// The caller interrupted the exchange; the endpoint remains owned.
+    #[error("Resume interrupted")]
+    Interrupted,
 }
 
 /// Receiver resumption error
@@ -838,6 +850,8 @@ impl std::error::Error for ReceiverResumeError {}
 /// Error with link relay
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LinkRelayError {
+    #[error("Invalid or duplicate transfer identity")]
+    InvalidTransfer,
     /// Link is not attached
     #[error("Link is not attached")]
     UnattachedHandle,
@@ -850,6 +864,9 @@ pub(crate) enum LinkRelayError {
 impl From<LinkRelayError> for definitions::Error {
     fn from(error: LinkRelayError) -> Self {
         match error {
+            LinkRelayError::InvalidTransfer => {
+                definitions::Error::new(AmqpError::InvalidField, None, None)
+            }
             LinkRelayError::UnattachedHandle => definitions::Error {
                 condition: SessionError::UnattachedHandle.into(),
                 description: None,

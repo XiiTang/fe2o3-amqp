@@ -7,7 +7,6 @@ use fe2o3_amqp_types::{
     messaging::{Source, Target, TargetArchetype},
     primitives::{Symbol, Ulong},
 };
-use parking_lot::RwLock;
 use tokio::sync::{mpsc, Notify};
 
 use crate::{
@@ -534,10 +533,16 @@ where
         session: &mut SessionHandle<R>,
     ) -> Result<SenderInner<SenderLink<T>>, SenderAttachError> {
         let buffer_size = self.buffer_size;
-        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(self.buffer_size);
+        let capacity = session::link_incoming_capacity(
+            &session.control,
+            self.buffer_size,
+            session.session_stop_reason(),
+        )
+        .await?;
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(capacity);
         let outgoing = session.outgoing.clone();
         let (producer, consumer) = self.create_flow_state_containers();
-        let unsettled = Arc::new(RwLock::new(None));
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
 
         let link_relay = LinkRelay::new_sender(incoming_tx, producer, unsettled.clone());
         let output_handle = session::allocate_link(
@@ -649,10 +654,16 @@ where
         // TODO: how to avoid clone?
         let buffer_size = self.buffer_size;
         let credit_mode = self.credit_mode.clone();
-        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(self.buffer_size);
+        let capacity = session::link_incoming_capacity(
+            &session.control,
+            self.buffer_size,
+            session.session_stop_reason(),
+        )
+        .await?;
+        let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(capacity);
         let outgoing = session.outgoing.clone();
         let (relay_flow_state, flow_state) = self.create_flow_state_containers();
-        let unsettled = Arc::new(RwLock::new(None));
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
         let auto_accept = self.auto_accept;
 
         let link_relay = LinkRelay::new_receiver(
@@ -706,6 +717,8 @@ where
             outgoing,
             incoming: incoming_rx,
             incomplete_transfer: None,
+            incoming_recovery: Default::default(),
+            receive_budget: crate::link::receive_budget::ReceiveBudget::new(32 * 1024 * 1024),
         };
 
         if let CreditMode::Auto(credit) = inner.credit_mode {
@@ -728,6 +741,108 @@ cfg_transaction! {
             self.attach_inner(session).await.map(|inner| Controller {
                 inner: Mutex::new(inner),
             })
+        }
+    }
+}
+
+#[cfg(test)]
+mod suspension_tests {
+    use super::*;
+    use crate::link::{unsettled_store::Store, LinkFrame};
+    use fe2o3_amqp_types::performatives::Detach;
+
+    #[tokio::test]
+    async fn suspend_only_stopped_nonclosed_sender_without_protocol_cleanup() {
+        for (stopped, closed, queued_close, allowed) in [
+            (false, false, false, false),
+            (true, false, false, true),
+            (true, true, false, false),
+            (true, false, true, false),
+        ] {
+            let mut builder = Sender::builder().name("retained").target("queue");
+            let (_producer, consumer) = builder.create_flow_state_containers();
+            let stop = Arc::new(OnceLock::new());
+            if stopped {
+                stop.set(SessionStopReason::Stopped).unwrap();
+            }
+            let mut link = builder.create_link(
+                Arc::new(Store::new(None)),
+                OutputHandle(0),
+                consumer,
+                stop,
+                65532,
+            );
+            link.local_state = if closed {
+                LinkState::Closed
+            } else {
+                LinkState::Attached
+            };
+            let (session, _control) = mpsc::channel(8);
+            let (outgoing, mut sent) = mpsc::channel(8);
+            let (frames, incoming) = mpsc::channel(8);
+            if queued_close {
+                frames
+                    .send(LinkFrame::Detach(Detach {
+                        handle: 0.into(),
+                        closed: true,
+                        error: None,
+                    }))
+                    .await
+                    .unwrap();
+            }
+            let (_outcome, outcome) = tokio::sync::oneshot::channel();
+            let mut next_session = SessionHandle {
+                is_ended: true,
+                engine_joined: false,
+                control: session.clone(),
+                outgoing: outgoing.clone().into(),
+                engine_handle: tokio::spawn(std::future::pending()),
+                outcome,
+                session_stop_reason: Arc::new(OnceLock::new()),
+                link_listener: (),
+                max_frame_size: 65532,
+            };
+            let sender = Sender {
+                inner: SenderInner {
+                    link,
+                    buffer_size: 8,
+                    session,
+                    outgoing: outgoing.into(),
+                    incoming,
+                },
+            };
+            let retained = sender.into_detached();
+            assert_eq!(retained.is_ok(), allowed);
+            assert!(matches!(
+                sent.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            // An active endpoint was rejected, so its normal Drop semantics still apply.
+            if let Ok(endpoint) = retained {
+                let first = endpoint
+                    .resume_on_session_until(&next_session, std::future::ready(()))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    first.kind,
+                    crate::link::SenderResumeErrorKind::Interrupted
+                ));
+                let second = first
+                    .detached_sender
+                    .resume_on_session_until(&next_session, std::future::ready(()))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(
+                    second.kind,
+                    crate::link::SenderResumeErrorKind::Interrupted
+                ));
+                assert!(matches!(
+                    sent.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+                drop(second);
+            }
+            next_session.stop_and_join().await.unwrap();
         }
     }
 }

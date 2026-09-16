@@ -20,8 +20,7 @@ use crate::{
         delivery::DeliveryInfo,
         receiver::ReceiverInner,
         shared_inner::{LinkEndpointInner, LinkEndpointInnerDetach},
-        IllegalLinkStateError, LinkFrame, ReceiverAttachError, ReceiverLink, RecvError,
-        SessionStopReason,
+        IllegalLinkStateError, ReceiverAttachError, ReceiverLink, RecvError, SessionStopReason,
     },
     util::{Initialized, Running},
     Delivery,
@@ -72,7 +71,7 @@ impl ControlLinkAcceptor {
         &self,
         remote_attach: Attach,
         control: mpsc::Sender<SessionControl>,
-        outgoing: mpsc::Sender<LinkFrame>,
+        outgoing: crate::session::transfer_queue::Sender,
         session_stop_reason: Arc<OnceLock<SessionStopReason>>,
         max_frame_size: usize,
     ) -> Result<TxnCoordinator, ReceiverAttachError> {
@@ -222,17 +221,26 @@ impl TxnCoordinator {
                     Running::Stop
                 }
             },
-            RecvError::TransferLimitExceeded => {
+            RecvError::TransferLimitExceeded | RecvError::MaterializationBoundExceeded => {
                 #[cfg(feature = "tracing")]
                 tracing::error!(?error);
                 #[cfg(feature = "log")]
                 log::error!("error = {:?}", error);
-                let error = definitions::Error::new(LinkError::TransferLimitExceeded, None, None);
+                let error = definitions::Error::new(
+                    if matches!(error, RecvError::MaterializationBoundExceeded) {
+                        LinkError::MessageSizeExceeded
+                    } else {
+                        LinkError::TransferLimitExceeded
+                    },
+                    None,
+                    None,
+                );
                 // TODO: detach instead of closing
                 let _ = self.inner.close_with_error(Some(error)).await;
                 Running::Stop
             }
-            RecvError::DeliveryIdIsNone
+            RecvError::InvalidMessageEncoding(_)
+            | RecvError::DeliveryIdIsNone
             | RecvError::DeliveryTagIsNone
             | RecvError::MessageDecode(_)
             | RecvError::IllegalRcvSettleModeInTransfer
@@ -364,7 +372,9 @@ impl Drop for TxnCoordinator {
             {
                 // Session must have dropped
                 #[cfg(feature = "tracing")]
-                tracing::warn!("Failed to send AbortTransaction on coordinator drop: session dropped");
+                tracing::warn!(
+                    "Failed to send AbortTransaction on coordinator drop: session dropped"
+                );
                 #[cfg(feature = "log")]
                 log::warn!("Failed to send AbortTransaction on coordinator drop: session dropped");
                 return;

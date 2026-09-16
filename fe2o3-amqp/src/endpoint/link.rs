@@ -48,7 +48,7 @@ pub(crate) trait LinkDetach {
 
     async fn send_detach(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         closed: bool,
         error: Option<Error>,
     ) -> Result<(), Self::DetachError>;
@@ -84,7 +84,7 @@ pub(crate) trait LinkAttach {
 
     async fn send_attach(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         is_reattaching: bool,
     ) -> Result<(), Self::AttachError>;
 }
@@ -123,7 +123,7 @@ pub(crate) trait LinkExt: Link {
 
     async fn exchange_attach(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         reader: &mut mpsc::Receiver<LinkFrame>,
         is_reattaching: bool,
     ) -> Result<Self::AttachExchange, Self::AttachError>;
@@ -131,7 +131,7 @@ pub(crate) trait LinkExt: Link {
     async fn handle_attach_error(
         &mut self,
         attach_error: Self::AttachError,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         reader: &mut mpsc::Receiver<LinkFrame>,
         session: &mpsc::Sender<SessionControl>,
     ) -> Self::AttachError;
@@ -146,7 +146,7 @@ pub(crate) trait SenderLink: Link + LinkExt {
     #[allow(clippy::too_many_arguments)]
     async fn send_payload<Fut>(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         detached: Fut,
         payload: Payload,
         message_format: MessageFormat,
@@ -164,7 +164,7 @@ pub(crate) trait SenderLink: Link + LinkExt {
     /// Send message with delivery tag that is obtained by consuming a link credit
     async fn send_payload_with_transfer(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         message_format: MessageFormat,
         transfer: Transfer,
         payload: Payload,
@@ -178,7 +178,7 @@ pub(crate) trait SenderLink: Link + LinkExt {
     #[allow(dead_code)]
     async fn dispose(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         delivery_id: DeliveryNumber,
         delivery_tag: DeliveryTag,
         settled: bool,
@@ -194,7 +194,7 @@ pub(crate) trait SenderLink: Link + LinkExt {
     #[allow(dead_code)]
     async fn batch_dispose(
         &mut self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         ids_and_tags: Vec<(DeliveryNumber, DeliveryTag)>,
         settled: bool,
         state: DeliveryState,
@@ -210,7 +210,7 @@ pub(crate) trait ReceiverLink: Link + LinkExt {
     /// Set and send flow state
     async fn send_flow(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         link_credit: Option<u32>,
         drain: Option<bool>,
         echo: bool,
@@ -247,7 +247,7 @@ pub(crate) trait ReceiverLink: Link + LinkExt {
 
     async fn dispose(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         delivery_info: DeliveryInfo,
         settled: Option<bool>,
         state: DeliveryState,
@@ -256,7 +256,7 @@ pub(crate) trait ReceiverLink: Link + LinkExt {
 
     async fn dispose_all(
         &self,
-        writer: &mpsc::Sender<LinkFrame>,
+        writer: &crate::session::transfer_queue::Sender,
         delivery_infos: Vec<DeliveryInfo>,
         settled: Option<bool>,
         state: DeliveryState,

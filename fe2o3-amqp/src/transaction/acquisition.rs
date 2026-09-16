@@ -57,14 +57,23 @@ where
         // clear txn-id
         {
             let mut writer = self.recver.inner.link.flow_state.lock.write();
-            writer.properties.as_mut().map(|map| map.swap_remove(TXN_ID_KEY));
+            writer
+                .properties
+                .as_mut()
+                .map(|map| map.swap_remove(TXN_ID_KEY));
         }
 
         // set drain to true
         self.recver
             .inner
             .link
-            .send_flow(&self.recver.inner.outgoing, Some(0), Some(true), true, false)
+            .send_flow(
+                &self.recver.inner.outgoing,
+                Some(0),
+                Some(true),
+                true,
+                false,
+            )
             .await?;
 
         // self.cleaned_up = true;
@@ -100,7 +109,10 @@ where
     }
 
     /// Accept the message
-    pub async fn accept<T>(&mut self, delivery: &Delivery<T>) -> Result<(), <Txn as TransactionRetirement>::RetireError>
+    pub async fn accept<T>(
+        &mut self,
+        delivery: &Delivery<T>,
+    ) -> Result<(), <Txn as TransactionRetirement>::RetireError>
     where
         T: Send + Sync,
     {
@@ -120,7 +132,10 @@ where
     }
 
     /// Release the message
-    pub async fn release<T>(&mut self, delivery: &Delivery<T>) -> Result<(), <Txn as TransactionRetirement>::RetireError>
+    pub async fn release<T>(
+        &mut self,
+        delivery: &Delivery<T>,
+    ) -> Result<(), <Txn as TransactionRetirement>::RetireError>
     where
         T: Send + Sync,
     {
@@ -140,34 +155,5 @@ where
     }
 }
 
-impl<'r, T> Drop for TxnAcquisition<'r, T>
-where
-    T: TransactionBase + TransactionDischarge + TransactionRetirement,
-{
-    fn drop(&mut self) {
-        if !self.txn.is_discharged() {
-            // clear txn-id from the link's properties
-            {
-                let mut writer = self.recver.inner.link.flow_state.lock.write();
-                writer
-                    .properties
-                    .as_mut()
-                    .map(|fields| fields.swap_remove(TXN_ID_KEY));
-            }
-
-            // Set drain to true
-            if let Err(_err) = self.recver.inner.link.blocking_send_flow(
-                &self.recver.inner.outgoing,
-                Some(0),
-                Some(true),
-                true,
-                false
-            ) {
-                #[cfg(feature = "tracing")]
-                tracing::error!("error {:?}", _err);
-                #[cfg(feature = "log")]
-                log::error!("error {:?}", _err);
-            }
-        }
-    }
-}
+// Dropping an acquisition leaves the link's transaction association intact.
+// Only explicit cleanup/commit/rollback changes peer-visible flow state.

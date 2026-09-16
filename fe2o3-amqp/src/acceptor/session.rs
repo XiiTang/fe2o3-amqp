@@ -1,6 +1,5 @@
 //! Session Listener
 
-
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
@@ -22,12 +21,11 @@ use crate::{
     session::{
         self,
         engine::SessionEngine,
-        frame::{SessionFrame, SessionIncomingItem, SessionOutgoingItem},
         error::{
             connection_stop_reason_or_closed, AllocLinkError, BeginError, Error, SessionInnerError,
         },
-        SessionHandle,
-        DEFAULT_SESSION_CONTROL_BUFFER_SIZE,
+        frame::{SessionFrame, SessionIncomingItem, SessionOutgoingItem},
+        SessionHandle, DEFAULT_SESSION_CONTROL_BUFFER_SIZE,
     },
     util::Initialized,
     Payload,
@@ -37,10 +35,9 @@ use super::{builder::Builder, IncomingSession, ListenerConnectionHandle};
 
 cfg_transaction! {
     use fe2o3_amqp_types::{messaging::Accepted, transaction::TransactionError};
-    
+
     use crate::transaction::{manager::TransactionManager, session::TxnSession, AllocTxnIdError};
 }
-
 
 /// An empty marker trait that acts as a constraint for session engine
 pub trait ListenerSessionEndpoint {}
@@ -168,7 +165,7 @@ impl SessionAcceptor {
         async fn launch_listener_session_engine<R>(
             &self,
             listener_session: ListenerSession,
-            _control_link_outgoing: &mpsc::Sender<LinkFrame>,
+            _control_link_outgoing: &crate::session::transfer_queue::Sender,
             connection: &crate::connection::ConnectionHandle<R>,
             _session_control_tx: &mpsc::Sender<SessionControl>,
             session_control_rx: mpsc::Receiver<SessionControl>,
@@ -193,7 +190,7 @@ impl SessionAcceptor {
         async fn launch_listener_session_engine<R>(
             &self,
             listener_session: ListenerSession,
-            control_link_outgoing: &mpsc::Sender<LinkFrame>,
+            control_link_outgoing: &crate::session::transfer_queue::Sender,
             connection: &crate::connection::ConnectionHandle<R>,
             session_control_tx: &mpsc::Sender<SessionControl>,
             session_control_rx: mpsc::Receiver<SessionControl>,
@@ -210,7 +207,7 @@ impl SessionAcceptor {
                         txn_manager,
                         max_frame_size: connection.max_frame_size(),
                     };
-    
+
                     let engine = SessionEngine::begin_listener_session(
                         connection.control.clone(),
                         listener_session,
@@ -247,7 +244,8 @@ impl SessionAcceptor {
         let local_state = SessionState::Unmapped;
         let (session_control_tx, session_control_rx) =
             mpsc::channel::<SessionControl>(DEFAULT_SESSION_CONTROL_BUFFER_SIZE);
-        let (outgoing_tx, outgoing_rx) = mpsc::channel(self.0.buffer_size);
+        let (outgoing_tx, outgoing_rx) =
+            crate::session::transfer_queue::channel(self.0.buffer_size);
         let (link_listener_tx, link_listener_rx) = mpsc::channel(self.0.buffer_size);
 
         // If the connection engine pre-allocated the session relay (to handle
@@ -323,6 +321,7 @@ impl SessionAcceptor {
 
         let handle = SessionHandle {
             is_ended: false,
+            engine_joined: false,
             control: session_control_tx,
             engine_handle,
             outcome,
@@ -340,12 +339,13 @@ impl SessionAcceptor {
         &self,
         connection: &mut ListenerConnectionHandle,
     ) -> Result<ListenerSessionHandle, BeginError> {
-        let incoming_session = connection
-            .next_incoming_session()
-            .await
-            .ok_or(BeginError::ConnectionStopped(connection_stop_reason_or_closed(
-                &connection.connection_stop_reason,
-            )))?;
+        let incoming_session =
+            connection
+                .next_incoming_session()
+                .await
+                .ok_or(BeginError::ConnectionStopped(
+                    connection_stop_reason_or_closed(&connection.connection_stop_reason),
+                ))?;
         self.accept_incoming_session(incoming_session, connection)
             .await
     }
@@ -438,8 +438,9 @@ impl endpoint::Session for ListenerSession {
         link_handle: LinkRelay<()>,
         input_handle: InputHandle,
     ) -> Result<OutputHandle, Self::AllocError> {
-        let output_handle = self.session
-            .allocate_incoming_link(link_name, link_handle, input_handle.clone())?;
+        let output_handle =
+            self.session
+                .allocate_incoming_link(link_name, link_handle, input_handle.clone())?;
 
         // Replay any buffered link-level Flow frames that arrived before this
         // link handle was registered (due to pipelining).
@@ -634,6 +635,10 @@ impl endpoint::Session for ListenerSession {
         self.session.on_outgoing_flow(flow)
     }
 
+    fn receive_window(&self) -> &Arc<crate::session::receive_window::ReceiveWindow> {
+        self.session.receive_window()
+    }
+
     fn maybe_outgoing_session_flow(&mut self) -> Option<SessionOutgoingItem> {
         self.session.maybe_outgoing_session_flow()
     }
@@ -643,9 +648,10 @@ impl endpoint::Session for ListenerSession {
         input_handle: InputHandle,
         transfer: Transfer,
         payload: Payload,
+        queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Option<SessionOutgoingItem>, Self::Error> {
         self.session
-            .on_outgoing_transfer(input_handle, transfer, payload)
+            .on_outgoing_transfer(input_handle, transfer, payload, queue_slot)
     }
 
     fn on_outgoing_disposition(
@@ -669,8 +675,8 @@ cfg_transaction! {
             Err(AllocTxnIdError::NotImplemented)
         }
     }
-    
-    
+
+
     impl endpoint::HandleDischarge for ListenerSession {
         async fn commit_transaction(
             &mut self,
@@ -679,7 +685,7 @@ cfg_transaction! {
             // FIXME: This should be impossible
             Ok(Err(TransactionError::UnknownId))
         }
-    
+
         fn rollback_transaction(
             &mut self,
             _txn_id: fe2o3_amqp_types::transaction::TransactionId,

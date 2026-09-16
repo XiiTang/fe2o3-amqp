@@ -2,7 +2,6 @@
 
 use std::{io, marker::PhantomData, time::Duration};
 
-
 use fe2o3_amqp_types::{
     definitions::{self},
     performatives::{Begin, Close, End, Open},
@@ -205,14 +204,15 @@ impl<Tls, Sasl> ConnectionAcceptor<Tls, Sasl> {
             session_listener: begin_tx,
         };
 
-        let engine = ConnectionEngine::open(transport, listener_connection, control_rx, outgoing_rx)
-            .await?;
+        let engine =
+            ConnectionEngine::open(transport, listener_connection, control_rx, outgoing_rx).await?;
         let connection_stop_reason = engine.connection_stop_reason().clone();
         let max_frame_size = engine.max_frame_size();
         let (handle, outcome) = engine.spawn();
 
         let connection_handle = ConnectionHandle {
             is_closed: false,
+            engine_joined: false,
             control: control_tx,
             handle,
             outcome,
@@ -364,9 +364,11 @@ macro_rules! connect_tls {
             let buf: [u8; 8] = tls_header.into();
             stream.write_all(&buf).await?;
 
-            let tls_stream = self.tls_acceptor.accept(stream).await.map_err(|e| {
-                OpenError::Io(io::Error::other(format!("{:?}", e)))
-            })?;
+            let tls_stream = self
+                .tls_acceptor
+                .accept(stream)
+                .await
+                .map_err(|e| OpenError::Io(io::Error::other(format!("{:?}", e))))?;
 
             self.$next_proto_header_handler(tls_stream).await
         }
@@ -377,7 +379,7 @@ cfg_native_tls! {
     impl ConnectionAcceptor<tokio_native_tls::TlsAcceptor, ()> {
         connect_tls!(negotiate_tls_with_native_tls, negotiate_amqp_with_stream);
     }
-    
+
     impl<Sasl> ConnectionAcceptor<tokio_native_tls::TlsAcceptor, Sasl>
     where
         Sasl: SaslAcceptor,
@@ -390,7 +392,7 @@ cfg_rustls! {
     impl ConnectionAcceptor<tokio_rustls::TlsAcceptor, ()> {
         connect_tls!(negotiate_tls_with_rustls, negotiate_amqp_with_stream);
     }
-    
+
     impl<Sasl> ConnectionAcceptor<tokio_rustls::TlsAcceptor, Sasl>
     where
         Sasl: SaslAcceptor,
@@ -398,7 +400,6 @@ cfg_rustls! {
         connect_tls!(negotiate_tls_with_rustls, negotiate_sasl_with_stream);
     }
 }
-
 
 impl ConnectionAcceptor<(), ()> {
     /// Accepts an incoming connection
@@ -433,7 +434,7 @@ cfg_native_tls! {
             self.negotiate_tls_with_native_tls(stream).await
         }
     }
-    
+
     impl<Sasl> ConnectionAcceptor<tokio_native_tls::TlsAcceptor, Sasl>
     where
         Sasl: SaslAcceptor,
@@ -458,7 +459,7 @@ cfg_rustls! {
             self.negotiate_tls_with_rustls(stream).await
         }
     }
-    
+
     impl<Sasl> ConnectionAcceptor<tokio_rustls::TlsAcceptor, Sasl>
     where
         Sasl: SaslAcceptor,
@@ -479,7 +480,6 @@ pub struct ListenerConnection {
     pub(crate) connection: connection::Connection,
     pub(crate) session_listener: mpsc::Sender<IncomingSession>,
 }
-
 
 impl endpoint::Connection for ListenerConnection {
     type AllocError = <connection::Connection as endpoint::Connection>::AllocError;
@@ -551,8 +551,7 @@ impl endpoint::Connection for ListenerConnection {
                 // incoming channel so that pipelined Attach frames arriving
                 // before the user code accepts the session are buffered
                 // instead of triggering a `NotFound` connection error.
-                let (incoming_tx, incoming_rx) =
-                    mpsc::channel(DEFAULT_OUTGOING_BUFFER_SIZE);
+                let (incoming_tx, incoming_rx) = mpsc::channel(DEFAULT_OUTGOING_BUFFER_SIZE);
                 let outgoing_channel = self
                     .connection
                     .allocate_session(incoming_tx)

@@ -62,6 +62,7 @@ pub(crate) enum SessionControl {
     DeallocateLink(OutputHandle),
     Disposition(Disposition),
     CloseConnectionWithError((ConnectionError, Option<String>)),
+    GetIncomingWindow(oneshot::Sender<u32>),
 
     // Transaction related controls
     #[cfg(feature = "transaction")]
@@ -100,6 +101,7 @@ impl std::fmt::Display for SessionControl {
             SessionControl::DeallocateLink(name) => write!(f, "DeallocateLink({:?})", name),
             SessionControl::Disposition(_) => write!(f, "Disposition"),
             SessionControl::CloseConnectionWithError(_) => write!(f, "CloseConnectionWithError"),
+            SessionControl::GetIncomingWindow(_) => write!(f, "GetIncomingWindow"),
 
             #[cfg(feature = "transaction")]
             SessionControl::AllocateTransactionId { .. } => write!(f, "AllocateTransactionId"),

@@ -57,6 +57,10 @@ impl<'s> Read<'s> for SliceReader<'s> {
         }
     }
 
+    fn read_bytes(&mut self, n: usize) -> Result<Vec<u8>, io::Error> {
+        // Check actual availability before allocating from a peer length.
+        Ok(self.get_byte_slice(n)?.to_vec())
+    }
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), io::Error> {
         std::io::Read::read_exact(&mut self.slice, buf)
     }

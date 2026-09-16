@@ -135,6 +135,27 @@ impl Receiver {
         self.inner.link.name()
     }
 
+    /// Observe the engine's unsettled map without a second disposition ledger.
+    pub fn settlement_view(&self) -> ReceiverSettlementView {
+        ReceiverSettlementView {
+            changed: self.inner.link.unsettled.subscribe(),
+            unsettled: self.inner.link.unsettled.clone(),
+        }
+    }
+
+    /// Set the shared native budget before receiving any message fragments.
+    /// Existing retained fragments cannot be silently moved to another budget.
+    pub fn set_receive_budget(
+        &mut self,
+        budget: Arc<super::receive_budget::ReceiveBudget>,
+    ) -> Result<(), RecvError> {
+        if self.inner.incomplete_transfer.is_some() {
+            return Err(LinkStateError::IllegalState.into());
+        }
+        self.inner.receive_budget = budget;
+        Ok(())
+    }
+
     /// Returns the `max_message_size` of the link. A value of zero indicates that the link has no
     /// maximum message size, and thus a zero value is turned into a `None`
     ///
@@ -351,6 +372,39 @@ impl Receiver {
     /// Send the link properties to the remote peer via a `Flow` performative
     pub async fn send_properties(&self) -> Result<(), FlowError> {
         self.inner.send_properties().await
+    }
+
+    /// Begin an explicit non-closing Detach while retaining the receive owner.
+    /// Continue calling recv() to deliver in-flight messages and preserve partial
+    /// transfers until it reports RemoteDetached, then call into_detached().
+    pub async fn request_detach(&mut self) -> Result<(), DetachError> {
+        self.inner.send_detach(false, None).await
+    }
+
+    /// Preserve the actual endpoint after Detach or a stopped parent session.
+    /// A still-active endpoint is returned unchanged as an error; this method
+    /// does not perform I/O or manufacture an attached link's suspension.
+    pub fn into_detached(mut self) -> Result<DetachedReceiver, Self> {
+        if matches!(
+            self.inner.link.local_state,
+            super::state::LinkState::Closed | super::state::LinkState::CloseSent
+        ) {
+            return Err(self);
+        }
+        if matches!(
+            self.inner.link.local_state,
+            super::state::LinkState::Detached
+        ) || self.inner.link.session_stop_reason.get().is_some()
+        {
+            self.inner.link.local_state = super::state::LinkState::Detached;
+            self.inner.link.output_handle.take();
+            self.inner.link.input_handle.take();
+            Ok(DetachedReceiver {
+                inner: Box::new(self.inner),
+            })
+        } else {
+            Err(self)
+        }
     }
 
     /// Detach the link.
@@ -636,7 +690,7 @@ impl Receiver {
 /// Cloning a `ReceiverDisposer` is cheap: all internal state is reference-counted.
 #[derive(Clone, Debug)]
 pub struct ReceiverDisposer {
-    outgoing: mpsc::Sender<LinkFrame>,
+    outgoing: crate::session::transfer_queue::Sender,
     unsettled: ArcReceiverUnsettledMap,
     rcv_settle_mode: ReceiverSettleMode,
     flow_state: ReceiverFlowState,
@@ -687,8 +741,12 @@ impl ReceiverDisposer {
                 .and_then(|map| map.swap_remove(&delivery_info.delivery_tag))
         } else {
             let mut lock = self.unsettled.write();
-            lock.get_or_insert(Default::default())
-                .insert(delivery_info.delivery_tag.clone(), Some(state.clone()))
+            lock.as_mut()
+                .and_then(|map| map.get_mut(&delivery_info.delivery_tag))
+                .map(|entry| {
+                    entry.local_state(state.clone());
+                    entry.clone()
+                })
         };
 
         if unsettled_state.is_some() {
@@ -815,6 +873,38 @@ impl From<Modified> for TerminalDeliveryState {
     }
 }
 
+/// A read-only view of the receiver engine's unsettled delivery state.
+#[derive(Debug)]
+pub struct ReceiverSettlementView {
+    unsettled: ArcReceiverUnsettledMap,
+    changed: tokio::sync::watch::Receiver<u64>,
+}
+impl ReceiverSettlementView {
+    /// Whether this exact tag remains unsettled in the engine.
+    pub fn contains(&self, tag: &DeliveryTag) -> bool {
+        self.unsettled
+            .read()
+            .as_ref()
+            .is_some_and(|map| map.contains_key(tag))
+    }
+    /// The current session delivery identity, only after a complete message or
+    /// its state-only resumed Transfer has been received. Attach alone cannot
+    /// supply a delivery-id; an identity from the prior session is never returned.
+    pub fn delivery_info(&self, tag: &DeliveryTag) -> Option<DeliveryInfo> {
+        self.unsettled
+            .read()
+            .as_ref()?
+            .get(tag)
+            .filter(|entry| entry.received)?
+            .info
+            .clone()
+    }
+    /// Wait for any map change. Updates coalesce and never form a frame queue.
+    pub async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
+        self.changed.changed().await
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ReceiverInner<L: endpoint::ReceiverLink> {
     pub(crate) link: L,
@@ -827,15 +917,21 @@ pub(crate) struct ReceiverInner<L: endpoint::ReceiverLink> {
     pub(crate) session: mpsc::Sender<SessionControl>,
 
     // Outgoing mpsc channel to send the Link Frames
-    pub(crate) outgoing: mpsc::Sender<LinkFrame>,
+    pub(crate) outgoing: crate::session::transfer_queue::Sender,
     pub(crate) incoming: mpsc::Receiver<LinkFrame>,
 
     // Wrap in a box to avoid clippy warning large_enum_variant on link acceptor's output
     pub(crate) incomplete_transfer: Option<Box<IncompleteTransfer>>,
+    pub(crate) incoming_recovery: super::incoming_recovery::IncomingRecovery,
+    pub(crate) receive_budget: Arc<super::receive_budget::ReceiveBudget>,
 }
 
 impl<L: endpoint::ReceiverLink> Drop for ReceiverInner<L> {
     fn drop(&mut self) {
+        if matches!(self.link.local_state(), super::state::LinkState::DetachSent) {
+            // A declared suspension must not become a closing detach on drop.
+            return;
+        }
         // A detach the relay already answered may be waiting in the engine's
         // channel. Apply it so the link state matches the detach; and once
         // any detach was drained, the peer has already ended the link, so
@@ -924,6 +1020,7 @@ where
             // This only controls whether a multi-transfer delivery id
             // will be added to sessions map
             more: false,
+            current_tag: None,
         }
     }
 
@@ -939,6 +1036,7 @@ where
         &mut self,
         is_reattaching: bool,
     ) -> Result<ReceiverAttachExchange, <Self::Link as LinkAttach>::AttachError> {
+        self.incoming_recovery.reset();
         self.link
             .exchange_attach(&self.outgoing, &mut self.incoming, is_reattaching)
             .await
@@ -1060,7 +1158,13 @@ where
                 input_handle: _,
                 performative,
                 payload,
-            } => self.on_incoming_transfer(performative, payload).await, // cancel safe
+                window_slot,
+                queue_slot: _,
+            } => {
+                let result = self.on_incoming_transfer(performative, payload).await;
+                drop(window_slot);
+                result
+            } // cancel safe
             LinkFrame::Attach(_) => Err(LinkStateError::IllegalState.into()),
             LinkFrame::Flow(_) | LinkFrame::Disposition(_) => {
                 // Flow and Disposition are handled by LinkRelay which runs
@@ -1086,18 +1190,6 @@ where
         settled: Option<bool>,
         state: DeliveryState,
     ) -> Result<(), RecvError> {
-        match &mut self.incomplete_transfer {
-            Some(incomplete) if *delivery_tag == incomplete.performative.delivery_tag => {
-                if let DeliveryState::Received(received) = &state {
-                    incomplete.keep_buffer_till_section_number_and_offset(
-                        received.section_number,
-                        received.section_offset,
-                    );
-                }
-            }
-            Some(_) | None => {}
-        }
-
         self.link
             .on_transfer_state(delivery_tag, settled, state)
             .map_err(Into::into)
@@ -1112,7 +1204,7 @@ where
         match &mut self.incomplete_transfer {
             Some(incomplete) => {
                 incomplete.or_assign(transfer)?;
-                incomplete.append(payload);
+                incomplete.append(payload)?;
 
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
@@ -1124,7 +1216,7 @@ where
                 }
             }
             None => {
-                let incomplete = IncompleteTransfer::new(transfer, payload);
+                let incomplete = IncompleteTransfer::new(transfer, payload, &self.receive_budget)?;
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
                     self.link.on_incomplete_transfer(
@@ -1140,66 +1232,16 @@ where
         Ok(())
     }
 
-    /// # Cancel safety
-    ///
-    /// This is cancel safe because all internal `.await` point(s) are cancel safe
-    async fn on_resuming_transfer<T>(
-        &mut self,
-        transfer: Transfer,
-        payload: Payload,
-    ) -> Result<Option<Delivery<T>>, RecvError>
-    where
-        for<'de> T: FromBody<'de> + Send,
-    {
-        // need to check whether the incoming transfer matches
-        match (
-            &transfer.delivery_tag,
-            self.incomplete_transfer
-                .as_ref()
-                .map(|i| &i.performative.delivery_tag),
-        ) {
-            (Some(remote), Some(Some(local))) => {
-                // The transfer does not belong to the buffer incomplete transfer
-                if remote != local {
-                    let (section_number, section_offset) =
-                        count_number_of_sections_and_offset(&payload);
-                    let delivery = self.link.on_complete_transfer(
-                        transfer,
-                        &payload,
-                        section_number,
-                        section_offset,
-                    )?;
-
-                    // Auto accept the message and leave settled to be determined based on rcv_settle_mode
-                    if self.auto_accept {
-                        self.dispose(&delivery, None, Accepted {}.into()).await?;
-                        // cancel safe
-                    }
-
-                    Ok(Some(delivery))
-                } else {
-                    // The new Transfer belongs to the buffered incomplete transfer
-                    self.on_complete_transfer(transfer, payload).await // cancel safe
-                }
-            }
-            _ => {
-                // The new Transfer belongs to the buffered incomplete transfer that there isn't an incomplete_transfer
-                self.on_complete_transfer(transfer, payload).await // cancel safe
-            }
-        }
-    }
-
     /// The bytes of the delivery accumulated so far that belong to the same
     /// delivery as `transfer` (i.e. the buffered chunks of the incomplete
     /// multi-frame delivery, when the transfer is a continuation of it).
     fn accumulated_message_size(&self, transfer: &Transfer) -> u64 {
         match &self.incomplete_transfer {
-            Some(incomplete) if incomplete.performative.delivery_tag == transfer.delivery_tag => {
-                incomplete
-                    .buffer
-                    .iter()
-                    .map(|p| p.len() as u64)
-                    .sum::<u64>()
+            Some(incomplete)
+                if transfer.delivery_tag.is_none()
+                    || incomplete.performative.delivery_tag == transfer.delivery_tag =>
+            {
+                incomplete.buffer.len() as u64
             }
             _ => 0,
         }
@@ -1266,8 +1308,10 @@ where
                 // assembly), and this size check runs before either of those.
                 {
                     let mut lock = self.link.unsettled().write();
-                    lock.get_or_insert(OrderedMap::new())
-                        .insert(info.delivery_tag.clone(), Some(state.clone()));
+                    let map = lock.get_or_insert_with(OrderedMap::new);
+                    let mut entry = map.get(&info.delivery_tag).cloned().unwrap_or_default();
+                    entry.info = Some(info.clone());
+                    map.insert(info.delivery_tag.clone(), entry);
                 }
                 self.dispose(info, Some(true), state).await?;
             } else {
@@ -1316,7 +1360,7 @@ where
         let delivery = match self.incomplete_transfer.take() {
             Some(mut incomplete) => {
                 incomplete.or_assign(transfer)?;
-                incomplete.append(payload); // This also computes the section number and offset incrementally
+                incomplete.append(payload)?; // This also computes the section number and offset incrementally
 
                 self.link.on_complete_transfer(
                     incomplete.performative,
@@ -1327,7 +1371,7 @@ where
             }
             None => {
                 let (section_number, section_offset) =
-                    count_number_of_sections_and_offset(&payload);
+                    count_number_of_sections_and_offset(&payload)?;
                 self.link.on_complete_transfer(
                     transfer,
                     &payload,
@@ -1351,20 +1395,137 @@ where
     #[inline]
     async fn on_incoming_transfer<T>(
         &mut self,
-        transfer: Transfer,
+        mut transfer: Transfer,
         payload: Payload,
     ) -> Result<Option<Delivery<T>>, RecvError>
     where
         for<'de> T: FromBody<'de> + Send,
     {
-        // Aborted messages SHOULD be discarded by the recipient (any payload
-        // within the frame carrying the performative MUST be ignored). An aborted
-        // message is implicitly settled
-        if transfer.aborted {
-            let _ = self.incomplete_transfer.take();
+        use super::incoming_recovery::Kind;
+        let continuation = self.incoming_recovery.continuation(&mut transfer)?;
+        let mut kind = continuation;
+        if continuation.is_none() && transfer.resume {
+            let tag = transfer
+                .delivery_tag
+                .as_ref()
+                .ok_or(RecvError::DeliveryTagIsNone)?;
+            if transfer.delivery_id.is_none() {
+                return Err(RecvError::DeliveryIdIsNone);
+            }
+            let known = self
+                .link
+                .unsettled()
+                .read()
+                .as_ref()
+                .and_then(|m| m.get(tag))
+                .cloned();
+            kind = Some(match known {
+                None => Kind::Ignore,
+                Some(entry) if entry.received => Kind::StateOnly,
+                Some(_) => Kind::Payload,
+            });
+            if kind == Some(Kind::Payload) {
+                let (number, offset) = match &transfer.state {
+                    Some(DeliveryState::Received(r)) => (r.section_number, r.section_offset),
+                    _ => (0, 0),
+                };
+                if let Some(partial) = self.incomplete_transfer.as_mut() {
+                    if partial.performative.delivery_tag.as_ref() != Some(tag) {
+                        return Err(RecvError::InconsistentFieldInMultiFrameDelivery);
+                    }
+                    partial.keep_buffer_till_section_number_and_offset(number, offset)?;
+                    partial.performative.delivery_id = transfer.delivery_id;
+                } else if number != 0 || offset != 0 {
+                    return Err(RecvError::InvalidMessageEncoding(
+                        serde_amqp::Error::InvalidValue,
+                    ));
+                }
+            }
+            self.incoming_recovery
+                .start(&transfer, kind.expect("resume classification"));
+        }
+        if kind == Some(Kind::Ignore) {
             return Ok(None);
         }
-
+        if kind == Some(Kind::StateOnly) {
+            if continuation.is_none() {
+                if let Some(entry) = self.link.unsettled().write().as_mut().and_then(|map| {
+                    transfer
+                        .delivery_tag
+                        .as_ref()
+                        .and_then(|tag| map.get_mut(tag))
+                }) {
+                    entry.info = Some(DeliveryInfo {
+                        delivery_id: transfer.delivery_id.ok_or(RecvError::DeliveryIdIsNone)?,
+                        delivery_tag: transfer
+                            .delivery_tag
+                            .clone()
+                            .ok_or(RecvError::DeliveryTagIsNone)?,
+                        rcv_settle_mode: transfer.rcv_settle_mode.clone(),
+                        _sealed: crate::util::Sealed {},
+                    });
+                }
+            }
+            if transfer.aborted || transfer.settled == Some(true) {
+                if let Some(map) = self.link.unsettled().write().as_mut() {
+                    if let Some(tag) = &transfer.delivery_tag {
+                        map.swap_remove(tag);
+                    }
+                }
+            } else if let Some(state) = transfer.state {
+                self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state)?;
+            }
+            return Ok(None);
+        }
+        if transfer.aborted {
+            self.incomplete_transfer = None;
+            return Ok(None);
+        }
+        if matches!(transfer.state, Some(DeliveryState::Received(_)))
+            && !transfer.resume
+            && continuation.is_none()
+        {
+            return Err(RecvError::InvalidMessageEncoding(
+                serde_amqp::Error::InvalidValue,
+            ));
+        }
+        if self.incomplete_transfer.is_none() {
+            if transfer.delivery_id.is_none() {
+                return Err(RecvError::DeliveryIdIsNone);
+            }
+            if transfer.delivery_tag.is_none() {
+                return Err(RecvError::DeliveryTagIsNone);
+            }
+            if transfer.message_format.is_none() {
+                return Err(RecvError::InvalidMessageEncoding(
+                    serde_amqp::Error::InvalidValue,
+                ));
+            }
+        } else if transfer.delivery_tag.is_none() {
+            transfer.delivery_tag = self
+                .incomplete_transfer
+                .as_ref()
+                .and_then(|p| p.performative.delivery_tag.clone());
+        }
+        let retained = self
+            .incomplete_transfer
+            .as_ref()
+            .map_or(0, |p| p.buffer.len());
+        let size = retained
+            .checked_add(payload.len())
+            .ok_or(RecvError::MaterializationBoundExceeded)?;
+        if size > 16 * 1024 * 1024 {
+            return Err(RecvError::MaterializationBoundExceeded);
+        }
+        if transfer
+            .delivery_tag
+            .as_ref()
+            .is_some_and(|tag| tag.len() > 32)
+        {
+            return Err(RecvError::InvalidMessageEncoding(
+                serde_amqp::Error::InvalidValue,
+            ));
+        }
         if let Some(state) = transfer.state.clone() {
             // Setting the state
             // on the transfer can be thought of as being equivalent to sending a disposition immediately before
@@ -1394,8 +1555,6 @@ where
             self.on_incomplete_transfer(transfer, payload)?;
             // Partial delivery doesn't yield a complete message
             Ok(None)
-        } else if transfer.resume {
-            self.on_resuming_transfer(transfer, payload).await // cancel safe
         } else {
             // Final transfer of the delivery
             self.on_complete_transfer(transfer, payload).await // cancel safe
@@ -1499,19 +1658,17 @@ where
 }
 
 impl ReceiverInner<ReceiverLink<Target>> {
-    /// Switch the link to a new session, returning whether the link is being
-    /// reattached (i.e. the new session is a different session from the
-    /// current one).
+    /// Switch sessions while preserving the endpoint's unsettled state.
     ///
     /// The new session may belong to a different connection whose negotiated
     /// max frame size differs, so the link's `max_frame_size` is refreshed
     /// from the new session before any attach/transfer frame is sent.
     pub(crate) fn switch_session<R>(&mut self, new_session: &SessionHandle<R>) -> bool {
-        let is_reattaching = !self.session.same_channel(&new_session.control);
+        self.link.session_stop_reason = new_session.session_stop_reason().clone();
         self.session = new_session.control.clone();
         self.outgoing = new_session.outgoing.clone();
         self.link.max_frame_size = new_session.max_frame_size();
-        is_reattaching
+        false
     }
 
     pub(crate) async fn resume_incoming_attach(
@@ -1519,6 +1676,11 @@ impl ReceiverInner<ReceiverLink<Target>> {
         mut initial_remote_attach: Option<Attach>,
         is_reattaching: bool,
     ) -> Result<ReceiverAttachExchange, ReceiverResumeErrorKind> {
+        if let Some(map) = self.link.unsettled.write().as_mut() {
+            for entry in map.values_mut() {
+                entry.info = None;
+            }
+        }
         self.reallocate_output_handle().await?;
 
         let exchange = match initial_remote_attach.take() {
@@ -1659,6 +1821,48 @@ impl From<ResumingReceiver> for Receiver {
 }
 
 impl DetachedReceiver {
+    /// Resume with an explicit interruption future while retaining ownership.
+    /// No Detach, settlement, or additional exchange is inferred on interruption.
+    pub async fn resume_on_session_until<R>(
+        mut self,
+        session: &SessionHandle<R>,
+        interrupt: impl std::future::Future<Output = ()>,
+    ) -> Result<ResumingReceiver, ReceiverResumeError> {
+        if self.inner.link.session_stop_reason.get().is_some() {
+            self = match (Receiver { inner: *self.inner }).into_detached() {
+                Ok(endpoint) => endpoint,
+                Err(endpoint) => {
+                    return Err(ReceiverResumeError {
+                        detached_recver: DetachedReceiver {
+                            inner: Box::new(endpoint.inner),
+                        },
+                        kind: ReceiverAttachError::IllegalState.into(),
+                    })
+                }
+            };
+        }
+        self.inner.switch_session(session);
+        let result = tokio::select! { biased;
+            _ = interrupt => Err(ReceiverResumeErrorKind::Interrupted),
+            result = self.inner.resume_incoming_attach(None, false) => result,
+        };
+        match result {
+            Ok(exchange) => {
+                let receiver = Receiver { inner: *self.inner };
+                Ok(match exchange {
+                    ReceiverAttachExchange::Complete => ResumingReceiver::Complete(receiver),
+                    ReceiverAttachExchange::IncompleteUnsettled => {
+                        ResumingReceiver::IncompleteUnsettled(receiver)
+                    }
+                    ReceiverAttachExchange::Resume => ResumingReceiver::Resume(receiver),
+                })
+            }
+            Err(kind) => Err(ReceiverResumeError {
+                detached_recver: self,
+                kind,
+            }),
+        }
+    }
     /// Get a reference to the link's source field
     pub fn source(&self) -> &Option<Source> {
         &self.inner.link.source
@@ -1734,7 +1938,8 @@ impl DetachedReceiver {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_recver!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(ReceiverResumeError {
                         detached_recver: self,
                         kind: ReceiverResumeErrorKind::Timeout,
@@ -1866,7 +2071,8 @@ impl DetachedReceiver {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_recver!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(ReceiverResumeError {
                         detached_recver: self,
                         kind: ReceiverResumeErrorKind::Timeout,
@@ -1906,7 +2112,8 @@ impl DetachedReceiver {
                     kind,
                 }),
                 Err(_) => {
-                    try_as_recver!(self, self.inner.detach_with_error(None).await);
+                    // Keep ownership and the actual in-progress state. A timeout
+                    // does not authorize a new protocol exchange.
                     Err(ReceiverResumeError {
                         detached_recver: self,
                         kind: ReceiverResumeErrorKind::Timeout,
@@ -1943,7 +2150,7 @@ mod tests {
         credit_mode: CreditMode,
     ) -> ReceiverDisposer {
         ReceiverDisposer {
-            outgoing: tx,
+            outgoing: tx.into(),
             unsettled,
             rcv_settle_mode: ReceiverSettleMode::First,
             flow_state: make_flow_state(200),
@@ -1967,14 +2174,267 @@ mod tests {
         let mut lock = map.write();
         let m = lock.get_or_insert_with(Default::default);
         for tag in tags {
-            m.insert(DeliveryTag::from(tag.clone()), None);
+            m.insert(
+                DeliveryTag::from(tag.clone()),
+                crate::link::receiver_delivery::ReceiverDelivery::new(None),
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn explicit_detach_delivers_inflight_message_and_retains_partial_without_extra_detach() {
+        use super::super::{state::LinkState, unsettled_store::Store};
+        use fe2o3_amqp_types::messaging::Body;
+        let map = Arc::new(Store::new(None));
+        seed_unsettled(&map, &[vec![0x42], vec![0x43]]);
+        let mut link = Receiver::builder()
+            .name("detach")
+            .source("source")
+            .target("target")
+            .create_link(
+                map.clone(),
+                OutputHandle(0),
+                make_flow_state(2),
+                Arc::new(OnceLock::new()),
+                65532,
+            );
+        link.local_state = LinkState::Attached;
+        let (control, _controls) = mpsc::channel(8);
+        let (outgoing, mut sent) = mpsc::channel(8);
+        let (incoming, frames) = mpsc::channel(8);
+        let mut receiver = Receiver {
+            inner: ReceiverInner {
+                link,
+                buffer_size: 8,
+                credit_mode: CreditMode::Manual,
+                processed: Arc::new(AtomicU32::new(0)),
+                auto_accept: false,
+                session: control,
+                outgoing: outgoing.into(),
+                incoming: frames,
+                incomplete_transfer: None,
+                incoming_recovery: Default::default(),
+                receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
+            },
+        };
+        receiver.request_detach().await.unwrap();
+        assert!(matches!(
+            sent.recv().await.unwrap(),
+            LinkFrame::Detach(Detach { closed: false, .. })
+        ));
+        let mut transfer: Transfer =
+            serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x42, 0x43])
+                .unwrap();
+        let full = vec![0, 0x53, 0x75, 0xa0, 2, 0, 255];
+        incoming
+            .send(LinkFrame::Transfer {
+                input_handle: crate::endpoint::InputHandle(0),
+                performative: transfer.clone(),
+                payload: full.into(),
+                window_slot: None,
+                queue_slot: None,
+            })
+            .await
+            .unwrap();
+        transfer.delivery_id = Some(1);
+        transfer.delivery_tag = Some(vec![0x43].into());
+        transfer.more = true;
+        incoming
+            .send(LinkFrame::Transfer {
+                input_handle: crate::endpoint::InputHandle(0),
+                performative: transfer,
+                payload: vec![0, 0x53, 0x75, 0xa0, 2, 0].into(),
+                window_slot: None,
+                queue_slot: None,
+            })
+            .await
+            .unwrap();
+        incoming
+            .send(LinkFrame::Detach(Detach {
+                handle: 0.into(),
+                closed: false,
+                error: None,
+            }))
+            .await
+            .unwrap();
+        let delivery = receiver.recv::<Body<serde_amqp::Value>>().await.unwrap();
+        assert_eq!(delivery.delivery_tag().as_ref(), &[0x42]);
+        assert!(matches!(
+            receiver.recv::<Body<serde_amqp::Value>>().await,
+            Err(RecvError::LinkStateError(LinkStateError::RemoteDetached))
+        ));
+        let detached = receiver.into_detached().unwrap();
+        assert_eq!(
+            detached
+                .inner
+                .incomplete_transfer
+                .as_ref()
+                .unwrap()
+                .buffer
+                .as_slice(),
+            &[0, 0x53, 0x75, 0xa0, 2, 0]
+        );
+        assert!(
+            map.read()
+                .as_ref()
+                .unwrap()
+                .get(&DeliveryTag::from(vec![0x42]))
+                .unwrap()
+                .received
+        );
+        assert!(
+            !map.read()
+                .as_ref()
+                .unwrap()
+                .get(&DeliveryTag::from(vec![0x43]))
+                .unwrap()
+                .received
+        );
+        let (control, _controls) = mpsc::channel(8);
+        let (outgoing, mut next_sent) = mpsc::channel(8);
+        let (_outcome, outcome) = tokio::sync::oneshot::channel();
+        let mut next_session = SessionHandle {
+            is_ended: true,
+            engine_joined: false,
+            control,
+            outgoing: outgoing.into(),
+            engine_handle: tokio::spawn(std::future::pending()),
+            outcome,
+            session_stop_reason: Arc::new(OnceLock::new()),
+            max_frame_size: 65532,
+            link_listener: (),
+        };
+        let interrupted = detached
+            .resume_on_session_until(&next_session, std::future::ready(()))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            interrupted.kind,
+            ReceiverResumeErrorKind::Interrupted
+        ));
+        assert_eq!(
+            interrupted
+                .detached_recver
+                .inner
+                .incomplete_transfer
+                .as_ref()
+                .unwrap()
+                .buffer
+                .as_slice(),
+            &[0, 0x53, 0x75, 0xa0, 2, 0]
+        );
+        assert!(matches!(
+            next_sent.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        drop(interrupted);
+        next_session.stop_and_join().await.unwrap();
+        assert!(
+            sent.try_recv().is_err(),
+            "no second Detach or automatic disposition"
+        );
+    }
+
+    #[tokio::test]
+    async fn state_only_resume_rebinds_delivery_identity_without_redelivery() {
+        use super::super::{
+            receiver_delivery::ReceiverDelivery, state::LinkState, unsettled_store::Store,
+        };
+        use fe2o3_amqp_types::{
+            messaging::{Body, Received},
+            primitives::OrderedMap,
+        };
+        let tag: DeliveryTag = vec![0x42].into();
+        let mut retained = ReceiverDelivery::new(None);
+        retained.received(
+            Received {
+                section_number: 1,
+                section_offset: 0,
+            }
+            .into(),
+            true,
+        );
+        // No identity is carried across Attach. Only the resumed Transfer can
+        // assign this delivery a new session delivery-id.
+        let map = Arc::new(Store::new(Some(
+            [(tag.clone(), retained)]
+                .into_iter()
+                .collect::<OrderedMap<_, _>>(),
+        )));
+        let mut link = Receiver::builder()
+            .name("resume")
+            .source("source")
+            .target("target")
+            .create_link(
+                map.clone(),
+                OutputHandle(0),
+                make_flow_state(0),
+                Arc::new(OnceLock::new()),
+                65532,
+            );
+        link.local_state = LinkState::Attached;
+        let (control, _controls) = mpsc::channel(8);
+        let (outgoing, _outgoing) = mpsc::channel(8);
+        let (_incoming, incoming) = mpsc::channel(8);
+        let mut receiver = Receiver {
+            inner: ReceiverInner {
+                link,
+                buffer_size: 8,
+                credit_mode: CreditMode::Manual,
+                processed: Arc::new(AtomicU32::new(0)),
+                auto_accept: false,
+                session: control,
+                outgoing: outgoing.into(),
+                incoming,
+                incomplete_transfer: None,
+                incoming_recovery: Default::default(),
+                receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
+            },
+        };
+        let view = receiver.settlement_view();
+        assert!(view.contains(&tag));
+        assert!(view.delivery_info(&tag).is_none());
+        let mut transfer: Transfer =
+            serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x42, 0x43])
+                .unwrap();
+        transfer.delivery_id = Some(99);
+        transfer.resume = true;
+        let result = receiver
+            .inner
+            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
+            .await
+            .unwrap();
+        assert!(
+            result.is_none(),
+            "a completed message must not be emitted again"
+        );
+        assert_eq!(view.delivery_info(&tag).unwrap().delivery_id(), 99);
+        // Unknown tags and terminally settled transfers never become disposable.
+        transfer.delivery_tag = Some(vec![0x43].into());
+        assert!(receiver
+            .inner
+            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(view.delivery_info(&vec![0x43].into()).is_none());
+        transfer.delivery_tag = Some(tag.clone());
+        transfer.settled = Some(true);
+        assert!(receiver
+            .inner
+            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer, Vec::new().into())
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!view.contains(&tag));
+        assert!(view.delivery_info(&tag).is_none());
     }
 
     #[tokio::test]
     async fn accept_sends_disposition_frame() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![0x01]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -1997,7 +2457,8 @@ mod tests {
     #[tokio::test]
     async fn release_sends_released_disposition() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![0x02]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -2019,7 +2480,8 @@ mod tests {
     #[tokio::test]
     async fn accept_removes_from_unsettled_map() {
         let (tx, _rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![0x0A], vec![0x0B]]);
 
         let disposer = make_disposer(tx, unsettled.clone(), CreditMode::Manual);
@@ -2036,7 +2498,8 @@ mod tests {
     #[tokio::test]
     async fn processed_counter_increments() {
         let (tx, _rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![1], vec![2], vec![3]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -2062,7 +2525,8 @@ mod tests {
         // Auto(10) → triggers refresh after 5 dispositions
         let max_credit = 10u32;
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(32);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         let tags: Vec<Vec<u8>> = (1..=5).map(|i| vec![i]).collect();
         seed_unsettled(&unsettled, &tags);
 
@@ -2096,9 +2560,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn second_mode_unknown_receipt_does_not_create_phantom_unsettled_state() {
+        let (tx, mut rx) = mpsc::channel::<LinkFrame>(8);
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
+        let mut disposer = make_disposer(tx, unsettled.clone(), CreditMode::Manual);
+        disposer.rcv_settle_mode = ReceiverSettleMode::Second;
+        disposer
+            .accept(make_delivery_info(9, vec![9]))
+            .await
+            .unwrap();
+        assert!(unsettled.read().is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
     async fn no_disposition_for_unknown_delivery_tag() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![0x01]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -2116,7 +2595,8 @@ mod tests {
     #[tokio::test]
     async fn clone_shares_state() {
         let (tx, _rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         seed_unsettled(&unsettled, &[vec![1], vec![2]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -2138,7 +2618,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_accepts_are_safe() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(1024);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(crate::link::unsettled_store::Store::new(None));
         let tags: Vec<Vec<u8>> = (0..100u8).map(|i| vec![i]).collect();
         seed_unsettled(&unsettled, &tags);
 
@@ -2178,7 +2659,8 @@ mod tests {
         let (session_tx, session_rx) = mpsc::channel::<SessionControl>(16);
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<LinkFrame>(16);
         let (incoming_tx, incoming_rx) = mpsc::channel::<LinkFrame>(16);
-        let unsettled: ArcReceiverUnsettledMap = Arc::new(parking_lot::RwLock::new(None));
+        let unsettled: ArcReceiverUnsettledMap =
+            Arc::new(super::super::unsettled_store::Store::new(None));
         let link = ReceiverLink::<Target> {
             role: std::marker::PhantomData,
             local_state: LinkState::Attached,
@@ -2206,9 +2688,11 @@ mod tests {
             processed: Arc::new(AtomicU32::new(0)),
             auto_accept: false,
             session: session_tx,
-            outgoing: outgoing_tx,
+            outgoing: outgoing_tx.into(),
             incoming: incoming_rx,
             incomplete_transfer: None,
+            incoming_recovery: Default::default(),
+            receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
         };
         (inner, session_rx, outgoing_rx, incoming_tx)
     }
@@ -2248,8 +2732,9 @@ mod tests {
             is_ended: false,
             control,
             engine_handle: tokio::spawn(async {}),
+            engine_joined: false,
             outcome,
-            outgoing: outgoing_tx,
+            outgoing: outgoing_tx.into(),
             session_stop_reason: Arc::new(OnceLock::new()),
             max_frame_size,
             link_listener: (),
@@ -2261,10 +2746,9 @@ mod tests {
         let mut inner = make_receiver_inner(4092);
         let session_b = make_session_handle(1020);
 
-        // Switching to a different session marks the link as reattaching and
-        // refreshes the link's max frame size from the new session
+        // A new session refreshes frame limits without discarding recovery state.
         let is_reattaching = inner.switch_session(&session_b);
-        assert!(is_reattaching);
+        assert!(!is_reattaching);
         assert_eq!(inner.link.max_frame_size, 1020);
 
         // Switching to the same session does not mark the link as reattaching

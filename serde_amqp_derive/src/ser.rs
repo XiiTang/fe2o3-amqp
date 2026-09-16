@@ -230,13 +230,23 @@ fn expand_serialize_struct(
                 .zip(field_types.iter())
                 .zip(field_attrs.iter())
             {
-                let token = match attr.default {
-                    true => quote! {
-                        buffer_if_eq_default!(state, nulls, &self.#id, #name, #ty);
-                    },
-                    false => quote! {
-                        buffer_if_none!(state, nulls, &self.#id, #name, #ty);
-                    },
+                let token = if attr.multiple {
+                    quote! {
+                        if self.#id.as_ref().is_some_and(|array|array.is_empty()) {
+                            nulls.push(#name);
+                        } else {
+                            buffer_if_none!(state, nulls, &self.#id, #name, #ty);
+                        }
+                    }
+                } else {
+                    match attr.default {
+                        true => quote! {
+                            buffer_if_eq_default!(state, nulls, &self.#id, #name, #ty);
+                        },
+                        false => quote! {
+                            buffer_if_none!(state, nulls, &self.#id, #name, #ty);
+                        },
+                    }
                 };
                 field_impls.push(token);
             }

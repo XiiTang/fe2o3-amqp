@@ -33,6 +33,7 @@ use self::{error::NegotiationError, protocol_header::ProtocolHeaderCodec};
 
 pub(crate) mod error;
 pub use error::Error;
+pub mod observation;
 pub mod protocol_header;
 
 pin_project! {
@@ -49,6 +50,7 @@ pin_project! {
         idle_timeout: Option<IdleTimeout>,
         // frame type
         ftype: PhantomData<Ftype>,
+        observer: Option<std::sync::Arc<dyn observation::IncomingFrameObserver>>,
     }
 }
 
@@ -56,6 +58,13 @@ impl<Io, Ftype> Transport<Io, Ftype>
 where
     Io: AsyncRead + AsyncWrite + Unpin,
 {
+    /// Install the observer after SASL negotiation and before AMQP Open.
+    pub fn set_incoming_frame_observer(
+        &mut self,
+        observer: Option<std::sync::Arc<dyn observation::IncomingFrameObserver>>,
+    ) {
+        self.observer = observer;
+    }
     /// Consume the transport and return the underlying codec
     pub fn into_framed_codec(
         self,
@@ -98,6 +107,7 @@ where
             framed_read,
             idle_timeout,
             ftype: PhantomData,
+            observer: None,
         }
     }
 }
@@ -485,6 +495,34 @@ where
     }
 }
 
+/// Progress from the duplex driver. A flush completion wakes the engine to
+/// admit its next outbound frame; it is not exposed as a peer protocol event.
+pub(crate) enum DuplexEvent {
+    Flushed,
+    Incoming(Option<Result<amqp::Frame, Error>>),
+}
+impl<Io> Transport<Io, amqp::Frame>
+where
+    Io: AsyncRead + AsyncWrite + Unpin,
+{
+    pub(crate) async fn next_event(&mut self, flush_pending: bool) -> DuplexEvent {
+        futures_util::future::poll_fn(|cx| {
+            let mut this = std::pin::Pin::new(&mut *self);
+            if flush_pending {
+                match this.as_mut().poll_flush(cx) {
+                    Poll::Ready(Ok(())) => return Poll::Ready(DuplexEvent::Flushed),
+                    Poll::Ready(Err(error)) => {
+                        return Poll::Ready(DuplexEvent::Incoming(Some(Err(error))))
+                    }
+                    Poll::Pending => {}
+                }
+            }
+            this.poll_next(cx).map(DuplexEvent::Incoming)
+        })
+        .await
+    }
+}
+
 impl<Io> Stream for Transport<Io, amqp::Frame>
 where
     Io: AsyncRead + Unpin,
@@ -511,8 +549,17 @@ where
                             Err(err) => return Poll::Ready(Some(Err(err.into()))),
                         };
                         // tracing::debug!("raw bytes {:#x?}", &src[..]);
+                        let raw = this.observer.as_ref().map(|_| src.clone().freeze());
                         let mut decoder = amqp::FrameDecoder {};
-                        Poll::Ready(decoder.decode(&mut src).map_err(Into::into).transpose())
+                        let decoded = decoder.decode(&mut src).map_err(Into::into);
+                        if let (Ok(Some(frame)), Some(raw), Some(observer)) =
+                            (&decoded, raw, this.observer.as_ref())
+                        {
+                            observer.incoming(std::sync::Arc::new(
+                                observation::IncomingFrame::from_decoded(raw, frame),
+                            ));
+                        }
+                        Poll::Ready(decoded.transpose())
                     }
                     None => Poll::Ready(None),
                 }
@@ -743,5 +790,65 @@ mod tests {
         let frame = Frame::new(0u16, body);
 
         transport.send(frame).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod duplex_progress_tests {
+    use super::*;
+    use fe2o3_amqp_types::performatives::Open;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    #[tokio::test]
+    async fn inbound_frame_and_idle_processing_continue_while_outbound_flush_is_blocked() {
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let mut transport = Transport::<_, amqp::Frame>::bind(socket, 512, None);
+        let open = Open {
+            container_id: "x".repeat(256),
+            hostname: None,
+            max_frame_size: 512u32.into(),
+            channel_max: Default::default(),
+            idle_time_out: None,
+            outgoing_locales: None,
+            incoming_locales: None,
+            offered_capabilities: None,
+            desired_capabilities: None,
+            properties: None,
+        };
+        transport
+            .feed(amqp::Frame::new(0u16, amqp::FrameBody::Open(open)))
+            .await
+            .unwrap();
+        peer.write_all(&[0, 0, 0, 8, 2, 0, 0, 0]).await.unwrap();
+        let event = tokio::time::timeout(Duration::from_secs(1), transport.next_event(true))
+            .await
+            .unwrap();
+        assert!(matches!(
+            event,
+            DuplexEvent::Incoming(Some(Ok(amqp::Frame {
+                body: amqp::FrameBody::Empty,
+                ..
+            })))
+        ));
+        assert!(
+            !transport.framed_write.write_buffer().is_empty(),
+            "the test must actually have a blocked write"
+        );
+        let (raw, event) = tokio::join!(
+            async {
+                let mut size = [0u8; 4];
+                peer.read_exact(&mut size).await.unwrap();
+                let mut frame = vec![0; u32::from_be_bytes(size) as usize];
+                frame[..4].copy_from_slice(&size);
+                peer.read_exact(&mut frame[4..]).await.unwrap();
+                frame
+            },
+            transport.next_event(true)
+        );
+        assert!(matches!(event, DuplexEvent::Flushed));
+        let observed = observation::IncomingFrame::decode(raw.into()).unwrap();
+        assert!(
+            matches!(&observed.performative, Some(fe2o3_amqp_types::performatives::Performative::Open(value)) if value.container_id == "x".repeat(256))
+        );
+        assert!(transport.framed_write.write_buffer().is_empty());
     }
 }

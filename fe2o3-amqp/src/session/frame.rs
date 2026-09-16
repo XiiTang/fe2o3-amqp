@@ -21,6 +21,7 @@ pub(crate) enum SessionOutgoingItem {
 pub(crate) struct SessionFrame {
     pub channel: u16, // outgoing/local channel number
     pub body: SessionFrameBody,
+    pub queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
 }
 
 impl SessionFrame {
@@ -28,6 +29,7 @@ impl SessionFrame {
         Self {
             channel: channel.into(),
             body,
+            queue_slot: None,
         }
     }
 }

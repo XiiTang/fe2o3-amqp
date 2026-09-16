@@ -223,6 +223,13 @@ impl AsByteIterator for Vec<u8> {
     }
 }
 
+impl IntoReader<'static> for Vec<u8> {
+    type Reader = IoReader<std::io::Cursor<Vec<u8>>>;
+    fn into_reader(self) -> Self::Reader {
+        IoReader::new(std::io::Cursor::new(self))
+    }
+}
+
 impl IntoReader<'static> for Vec<Payload> {
     type Reader = IoReader<ByteReader<Payload>>;
 

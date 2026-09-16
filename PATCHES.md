@@ -56,3 +56,26 @@ cargo test -p fe2o3-amqp --features transaction,acceptor \
 The consolidated integration passes 83 library and 22 in-memory integration
 tests on macOS arm64. These are not a replacement for the consumer's independent
 broker, frozen-authentication, recovery, cancellation, or platform acceptance.
+
+## Partial-transfer recovery
+
+After a successful receiver Attach reconciliation, discard buffered partial
+payload only when its delivery tag is no longer in the native unsettled map.
+Releasing that buffer also returns its shared receive-budget reservation.
+Keep both payload and reservation for deliveries still retained by the map,
+including those absent from an incomplete peer map.
+
+This follows AMQP 1.0 transport section 2.6.13 settlement reconciliation:
+https://docs.oasis-open.org/amqp/core/v1.0/os/amqp-core-transport-v1.0-os.html
+
+The defect was reproduced with an independent Artemis 2.57.0 broker: interrupt
+a 128 KiB message after one 8192-byte Transfer, explicitly reconnect/resume,
+then receive a complete redelivery after an empty complete peer unsettled map.
+Previously the old prefix was prepended to the redelivery, corrupting encoding.
+The regression checks exact binary payload, stale link-generation rejection,
+and no delivery of partial data. A native unit test checks retained versus
+settled prefixes and receive-budget release.
+
+With this fix, 84 native library tests, 22 in-memory upstream integration
+tests, and all 20 consumer AMQP 1.0 tests (including the independent interrupted
+Artemis transfer) pass on macOS arm64.

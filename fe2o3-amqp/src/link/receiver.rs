@@ -1697,10 +1697,32 @@ impl ReceiverInner<ReceiverLink<Target>> {
         #[cfg(feature = "log")]
         log::debug!("exchange = {:?}", exchange);
 
+        self.discard_settled_partial();
         let credit = self.link.flow_state.link_credit();
         self.set_credit(credit).await?;
 
         Ok(exchange)
+    }
+
+    fn discard_settled_partial(&mut self) {
+        // Attach reconciliation can settle the old delivery without resuming
+        // its payload. Its prefix must not be prepended to a new delivery.
+        let retained = self.incomplete_transfer.as_ref().is_some_and(|partial| {
+            partial
+                .performative
+                .delivery_tag
+                .as_ref()
+                .is_some_and(|tag| {
+                    self.link
+                        .unsettled
+                        .read()
+                        .as_ref()
+                        .is_some_and(|map| map.contains_key(tag))
+                })
+        });
+        if !retained {
+            self.incomplete_transfer = None;
+        }
     }
 }
 
@@ -2333,6 +2355,62 @@ mod tests {
             sent.try_recv().is_err(),
             "no second Detach or automatic disposition"
         );
+    }
+
+    #[test]
+    fn settled_partial_is_released_without_discarding_a_retained_delivery() {
+        use super::super::{state::LinkState, unsettled_store::Store};
+        let map = Arc::new(Store::new(None));
+        seed_unsettled(&map, &[vec![0x42]]);
+        let tag: DeliveryTag = vec![0x42].into();
+        let mut link = Receiver::builder()
+            .name("partial")
+            .source("source")
+            .target("target")
+            .create_link(
+                map.clone(),
+                OutputHandle(0),
+                make_flow_state(1),
+                Arc::new(OnceLock::new()),
+                65532,
+            );
+        link.local_state = LinkState::Attached;
+        let (control, _controls) = mpsc::channel(8);
+        let (outgoing, _outgoing) = mpsc::channel(8);
+        let (_incoming, incoming) = mpsc::channel(8);
+        let budget = super::super::receive_budget::ReceiveBudget::new(65536);
+        let mut receiver = ReceiverInner {
+            link,
+            buffer_size: 8,
+            credit_mode: CreditMode::Manual,
+            processed: Arc::new(AtomicU32::new(0)),
+            auto_accept: false,
+            session: control,
+            outgoing: outgoing.into(),
+            incoming,
+            incomplete_transfer: None,
+            incoming_recovery: Default::default(),
+            receive_budget: budget.clone(),
+        };
+        let mut transfer: Transfer =
+            serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x42, 0x43])
+                .unwrap();
+        transfer.more = true;
+        let prefix = vec![0, 0x53, 0x75, 0xa0, 2, 0];
+        receiver
+            .on_incomplete_transfer(transfer, prefix.clone().into())
+            .unwrap();
+        receiver.discard_settled_partial();
+        assert_eq!(
+            receiver.incomplete_transfer.as_ref().unwrap().buffer,
+            prefix
+        );
+        assert_eq!(budget.retained_bytes(), prefix.len());
+        // A complete peer unsettled map without this tag removes its entry.
+        map.write().as_mut().unwrap().swap_remove(&tag);
+        receiver.discard_settled_partial();
+        assert!(receiver.incomplete_transfer.is_none());
+        assert_eq!(budget.retained_bytes(), 0);
     }
 
     #[tokio::test]

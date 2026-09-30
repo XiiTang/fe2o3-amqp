@@ -13,37 +13,37 @@ cfg_not_wasm32! {
 use fe2o3_amqp_types::{
     definitions::{self, DeliveryTag, Fields, MessageFormat, SenderSettleMode},
     messaging::{
-        message::__private::Serializable, Address, DeliveryState, Outcome, SerializableBody,
-        Source, Target,
+        Address, DeliveryState, Outcome, SerializableBody, Source, Target,
+        message::__private::Serializable,
     },
     performatives::{Attach, Detach, Transfer},
     primitives::OrderedMap,
 };
 
 use crate::{
+    Payload,
     control::SessionControl,
     endpoint::{self, LinkAttach, LinkDetach, LinkExt, Settlement},
     session::SessionHandle,
-    Payload,
 };
 
 use super::{
+    ArcSenderUnsettledMap, DetachThenResumeSenderError, LinkFrame, LinkRelay, LinkStateError,
+    MessageSizeExceeded, SendError, SenderAttachError, SenderAttachExchange, SenderFlowState,
+    SenderLink, SenderResumeError, SenderResumeErrorKind, SessionStopReason,
     builder::{self, WithSource, WithoutName, WithoutTarget},
     delivery::{DeliveryFut, Sendable, UnsettledMessage},
     error::DetachError,
     resumption::ResumingDelivery,
     role,
     shared_inner::{
-        recv_remote_detach, LinkEndpointInner, LinkEndpointInnerDetach, LinkEndpointInnerReattach,
+        LinkEndpointInner, LinkEndpointInnerDetach, LinkEndpointInnerReattach, recv_remote_detach,
     },
-    ArcSenderUnsettledMap, DetachThenResumeSenderError, LinkFrame, LinkRelay, LinkStateError,
-    MessageSizeExceeded, SendError, SenderAttachError, SenderAttachExchange, SenderFlowState,
-    SenderLink, SenderResumeError, SenderResumeErrorKind, SessionStopReason,
 };
 
 #[cfg(docsrs)]
 use fe2o3_amqp_types::messaging::{
-    AmqpSequence, AmqpValue, Batch, Body, Data, IntoBody, Message, MESSAGE_FORMAT,
+    AmqpSequence, AmqpValue, Batch, Body, Data, IntoBody, MESSAGE_FORMAT, Message,
 };
 
 /// An AMQP1.0 sender
@@ -109,8 +109,8 @@ impl std::fmt::Debug for Sender {
 
 impl Sender {
     /// Creates a builder for [`Sender`] link
-    pub fn builder(
-    ) -> builder::Builder<role::SenderMarker, Target, WithoutName, WithSource, WithoutTarget> {
+    pub fn builder()
+    -> builder::Builder<role::SenderMarker, Target, WithoutName, WithSource, WithoutTarget> {
         builder::Builder::<role::SenderMarker, Target, _, _, _>::new()
     }
 
@@ -235,15 +235,21 @@ impl Sender {
         Ok(DetachedSender::new(self.inner))
     }
 
-    /// Detach the link
-    ///
-    /// The Sender will send a detach frame with closed field set to false,
-    /// and wait for a detach with closed field set to false from the remote peer.
-    ///
-    /// # Error
-    ///
-    /// If the remote peer sends a detach frame with closed field set to true,
-    /// the Sender will re-attach and send a closing detach
+    /// Send a non-closing Detach and wait for the reply while retaining ownership.
+    /// Cancellation preserves the in-progress exchange. A later call continues
+    /// waiting without sending another Detach. After success, `into_detached`
+    /// transfers the suspended endpoint to the caller.
+    pub async fn detach_borrowed(&mut self) -> Result<(), DetachError> {
+        if matches!(
+            self.inner.link.local_state,
+            super::state::LinkState::Detached
+        ) {
+            return Ok(());
+        }
+        self.inner.detach_with_error(None).await.map(|_| ())
+    }
+
+    /// Detach and transfer ownership of the suspended endpoint to the caller.
     pub async fn detach(mut self) -> Result<DetachedSender, (DetachedSender, DetachError)> {
         match self.inner.detach_with_error(None).await {
             Ok(_) => Ok(DetachedSender::new(self.inner)),
@@ -1198,7 +1204,7 @@ impl DetachedSender {
                             inner: Box::new(endpoint.inner),
                         },
                         kind: SenderAttachError::IllegalState.into(),
-                    })
+                    });
                 }
             };
         }
@@ -1516,6 +1522,35 @@ mod tests {
         let is_reattaching = inner.switch_session(&session_b);
         assert!(!is_reattaching);
         assert_eq!(inner.link.max_frame_size, 1020);
+    }
+
+    #[tokio::test]
+    async fn borrowed_detach_survives_timeout_without_replaying_detach() {
+        let (inner, _session, mut outgoing, incoming) = make_sender_inner_with_channels(4096);
+        let mut sender = Sender { inner };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), sender.detach_borrowed())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            outgoing.recv().await.unwrap(),
+            LinkFrame::Detach(_)
+        ));
+        incoming
+            .send(LinkFrame::Detach(fe2o3_amqp_types::performatives::Detach {
+                handle: 0.into(),
+                closed: false,
+                error: None,
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), sender.detach_borrowed())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(outgoing.try_recv().is_err());
+        assert!(sender.into_detached().is_ok());
     }
 
     /// A peer that suspends (non-closing detach) while this side is closing

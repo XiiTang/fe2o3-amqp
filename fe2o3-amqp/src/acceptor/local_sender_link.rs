@@ -152,6 +152,7 @@ where
         });
 
         let mut link = SenderLink::<Target> {
+            operation_dispatch: None,
             role: PhantomData,
             local_state: LinkState::Unattached, // will be set in `on_incoming_attach`
 

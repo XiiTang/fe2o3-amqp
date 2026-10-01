@@ -2740,6 +2740,7 @@ mod tests {
         let unsettled: ArcReceiverUnsettledMap =
             Arc::new(super::super::unsettled_store::Store::new(None));
         let link = ReceiverLink::<Target> {
+            operation_dispatch: None,
             role: std::marker::PhantomData,
             local_state: LinkState::Attached,
             name: String::from("test-receiver"),

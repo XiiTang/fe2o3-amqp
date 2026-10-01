@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, OnceLock,
+};
 
 use fe2o3_amqp_types::{definitions::Fields, messaging::MESSAGE_FORMAT};
 use futures_util::Future;
@@ -17,14 +20,64 @@ where
         + Send
         + Sync,
 {
+    pub(crate) async fn send_payload_with_transfer_tracked(
+        &self,
+        writer: &crate::session::transfer_queue::Sender,
+        message_format: MessageFormat,
+        transfer: Transfer,
+        payload: Payload,
+        dispatched: Option<&AtomicBool>,
+    ) -> Result<Settlement, LinkStateError> {
+        // Keep a copy for unsettled message
+        // Clone should be very cheap on Bytes
+        let payload_copy = payload.clone();
+        let delivery_tag = transfer
+            .delivery_tag
+            .clone()
+            .ok_or(LinkStateError::IllegalState)?;
+        let settled = self
+            .send_transfer_tracked(writer, transfer, payload, dispatched)
+            .await?;
+        match settled {
+            true => Ok(Settlement::Settled(delivery_tag)),
+            // If not set on the first (or only) transfer for a (multi-transfer)
+            // delivery, then the settled flag MUST be interpreted as being false.
+            false => {
+                let (tx, rx) = oneshot::channel();
+                let unsettled = UnsettledMessage::new(payload_copy, None, message_format, tx);
+                {
+                    let mut guard = self.unsettled.write();
+                    guard
+                        .get_or_insert(OrderedMap::new())
+                        .insert(delivery_tag.clone(), unsettled);
+                }
+
+                Ok(Settlement::Unsettled {
+                    delivery_tag,
+                    outcome: rx,
+                })
+            }
+        }
+    }
+
     /// # Cancel safety
     ///
     /// This is cancel safe because all internal `.await` are cancel safe
     pub(crate) async fn send_transfer_without_modifying_unsettled_map(
         &self,
         writer: &crate::session::transfer_queue::Sender,
+        transfer: Transfer,
+        payload: Payload,
+    ) -> Result<bool, LinkStateError> {
+        self.send_transfer_tracked(writer, transfer, payload, None)
+            .await
+    }
+    pub(crate) async fn send_transfer_tracked(
+        &self,
+        writer: &crate::session::transfer_queue::Sender,
         mut transfer: Transfer,
         mut payload: Payload,
+        dispatched: Option<&AtomicBool>,
     ) -> Result<bool, LinkStateError> {
         let settled = transfer.settled.unwrap_or(match self.snd_settle_mode {
             SenderSettleMode::Settled => true,
@@ -78,6 +131,7 @@ where
                 transfer,
                 payload.clone(),
                 &self.session_stop_reason,
+                dispatched,
             )
             .await?;
         // cancel safe
@@ -91,6 +145,7 @@ where
                 transfer.clone(),
                 partial,
                 &self.session_stop_reason,
+                dispatched,
             )
             .await?; // cancel safe
 
@@ -113,6 +168,7 @@ where
                     transfer.clone(),
                     partial,
                     &self.session_stop_reason,
+                    dispatched,
                 )
                 .await?;
                 // cancel safe
@@ -129,6 +185,7 @@ where
                 transfer,
                 payload,
                 &self.session_stop_reason,
+                dispatched,
             )
             .await?;
             // cancel safe
@@ -298,36 +355,8 @@ where
         transfer: Transfer,
         payload: Payload,
     ) -> Result<Settlement, Self::TransferError> {
-        // Keep a copy for unsettled message
-        // Clone should be very cheap on Bytes
-        let payload_copy = payload.clone();
-        let delivery_tag = transfer
-            .delivery_tag
-            .clone()
-            .ok_or(LinkStateError::IllegalState)?;
-        let settled = self
-            .send_transfer_without_modifying_unsettled_map(writer, transfer, payload)
-            .await?;
-        match settled {
-            true => Ok(Settlement::Settled(delivery_tag)),
-            // If not set on the first (or only) transfer for a (multi-transfer)
-            // delivery, then the settled flag MUST be interpreted as being false.
-            false => {
-                let (tx, rx) = oneshot::channel();
-                let unsettled = UnsettledMessage::new(payload_copy, None, message_format, tx);
-                {
-                    let mut guard = self.unsettled.write();
-                    guard
-                        .get_or_insert(OrderedMap::new())
-                        .insert(delivery_tag.clone(), unsettled);
-                }
-
-                Ok(Settlement::Unsettled {
-                    delivery_tag,
-                    outcome: rx,
-                })
-            }
-        }
+        self.send_payload_with_transfer_tracked(writer, message_format, transfer, payload, None)
+            .await
     }
 
     async fn dispose(
@@ -464,6 +493,7 @@ async fn send_transfer(
     transfer: Transfer,
     payload: Payload,
     session_stop_reason: &OnceLock<SessionStopReason>,
+    dispatched: Option<&AtomicBool>,
 ) -> Result<(), LinkStateError> {
     let frame = LinkFrame::Transfer {
         window_slot: None,
@@ -478,7 +508,11 @@ async fn send_transfer(
         .map_err(|_| match session_stop_reason.get() {
             Some(reason) => LinkStateError::SessionStopped(reason.clone()),
             None => LinkStateError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-        })
+        })?;
+    if let Some(dispatched) = dispatched {
+        dispatched.store(true, Ordering::Release);
+    }
+    Ok(())
 }
 
 #[inline]

@@ -185,6 +185,7 @@ pub(crate) struct Link<R, T, F, M> {
     pub(crate) role: PhantomData<R>,
 
     pub(crate) local_state: LinkState,
+    pub(crate) operation_dispatch: Option<Arc<std::sync::atomic::AtomicBool>>,
     // pub(crate) state_code: Arc<AtomicU8>,
     pub(crate) name: String,
 
@@ -376,6 +377,9 @@ where
                         Some(reason) => SendAttachErrorKind::SessionStopped(reason.clone()),
                         None => SendAttachErrorKind::IllegalState, // defensive: no stop reason recorded; failure is link-local
                     })?;
+                if let Some(flag) = &self.operation_dispatch {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
                 if incomplete_unsettled {
                     self.local_state = LinkState::IncompleteAttachSent
                 } else {
@@ -445,10 +449,10 @@ where
         closed: bool,
         error: Option<definitions::Error>,
     ) -> Result<(), Self::DetachError> {
-        // Change the state whether sending the detach frame succeeds or not
-        match (&self.local_state, closed) {
-            (LinkState::Attached, false) => self.local_state = LinkState::DetachSent,
-            (LinkState::Attached, true) => self.local_state = LinkState::CloseSent,
+        // Preserve the attached state if queuing is cancelled before dispatch.
+        let next_state = match (&self.local_state, closed) {
+            (LinkState::Attached, false) => LinkState::DetachSent,
+            (LinkState::Attached, true) => LinkState::CloseSent,
             _ => return Err(DetachError::IllegalState),
         };
 
@@ -474,6 +478,12 @@ where
                         None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
                     });
 
+                self.local_state = next_state;
+                if result.is_ok() {
+                    if let Some(flag) = &self.operation_dispatch {
+                        flag.store(true, std::sync::atomic::Ordering::Release);
+                    }
+                }
                 // Retain the identity while a non-closing Detach is in flight:
                 // preceding Transfer frames still belong to this endpoint.
                 if !matches!(self.local_state, LinkState::DetachSent) {

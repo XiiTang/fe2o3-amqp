@@ -428,6 +428,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
 
         // Create a link
         Link::<Role, T, C, M> {
+            operation_dispatch: None,
             role: PhantomData,
             local_state,
             // state_code,
@@ -529,8 +530,15 @@ where
     }
 
     async fn attach_inner<R>(
+        self,
+        session: &mut SessionHandle<R>,
+    ) -> Result<SenderInner<SenderLink<T>>, SenderAttachError> {
+        self.attach_inner_tracked(session, None).await
+    }
+    async fn attach_inner_tracked<R>(
         mut self,
         session: &mut SessionHandle<R>,
+        dispatch: Option<Arc<std::sync::atomic::AtomicBool>>,
     ) -> Result<SenderInner<SenderLink<T>>, SenderAttachError> {
         let buffer_size = self.buffer_size;
         let capacity = session::link_incoming_capacity(
@@ -560,6 +568,7 @@ where
             session.max_frame_size(),
         );
 
+        link.operation_dispatch = dispatch;
         match link
             .exchange_attach(&session.outgoing, &mut incoming_rx, false)
             .await
@@ -731,6 +740,11 @@ where
 
 cfg_transaction! {
     impl Builder<role::SenderMarker, Coordinator, WithName, WithSource, WithTarget> {
+        /// Attach with metadata set when Attach enters the session's queue.
+        pub async fn attach_tracked<R>(self, session: &mut SessionHandle<R>, dispatch: Arc<std::sync::atomic::AtomicBool>) -> Result<Controller, SenderAttachError> {
+            self.attach_inner_tracked(session, Some(dispatch)).await.map(|inner| Controller { inner: tokio::sync::Mutex::new(Some(inner)) })
+        }
+
         /// Attach the link as a transaction controller
         pub async fn attach<R>(
             self,
@@ -739,7 +753,7 @@ cfg_transaction! {
             use tokio::sync::Mutex;
 
             self.attach_inner(session).await.map(|inner| Controller {
-                inner: Mutex::new(inner),
+                inner: Mutex::new(Some(inner)),
             })
         }
     }

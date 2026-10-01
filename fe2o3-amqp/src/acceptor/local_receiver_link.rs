@@ -213,6 +213,7 @@ where
             });
 
         let mut link = ReceiverLink::<T> {
+            operation_dispatch: None,
             role: PhantomData,
             local_state: LinkState::Unattached, // State change will be taken care of in `on_incoming_attach`
             name: remote_attach.name.clone(),

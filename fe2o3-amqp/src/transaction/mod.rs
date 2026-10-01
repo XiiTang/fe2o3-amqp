@@ -535,7 +535,12 @@ impl<'t> TransactionDischarge for Transaction<'t> {
             }
             self.discharge_started = true;
             let mut inner = self.controller.inner.lock().await;
-            discharge_on_link(&mut inner, self.declared.txn_id.clone(), fail).await?;
+            discharge_on_link(
+                inner.as_mut().expect("borrowed controller"),
+                self.declared.txn_id.clone(),
+                fail,
+            )
+            .await?;
             self.is_discharged = true;
         }
         Ok(())
@@ -561,7 +566,11 @@ impl<'t> Transaction<'t> {
         global_id: impl Into<Option<TransactionId>>,
     ) -> Result<Transaction<'t>, ControllerSendError> {
         let mut inner = controller.inner.lock().await;
-        let declared = declare_on_link(&mut inner, global_id.into()).await?;
+        let declared = declare_on_link(
+            inner.as_mut().expect("borrowed controller"),
+            global_id.into(),
+        )
+        .await?;
         Ok(Self {
             controller,
             declared,

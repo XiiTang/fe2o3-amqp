@@ -13,37 +13,37 @@ cfg_not_wasm32! {
 use fe2o3_amqp_types::{
     definitions::{self, DeliveryTag, Fields, MessageFormat, SenderSettleMode},
     messaging::{
-        Address, DeliveryState, Outcome, SerializableBody, Source, Target,
-        message::__private::Serializable,
+        message::__private::Serializable, Address, DeliveryState, Outcome, SerializableBody,
+        Source, Target,
     },
     performatives::{Attach, Detach, Transfer},
     primitives::OrderedMap,
 };
 
 use crate::{
-    Payload,
     control::SessionControl,
     endpoint::{self, LinkAttach, LinkDetach, LinkExt, Settlement},
     session::SessionHandle,
+    Payload,
 };
 
 use super::{
-    ArcSenderUnsettledMap, DetachThenResumeSenderError, LinkFrame, LinkRelay, LinkStateError,
-    MessageSizeExceeded, SendError, SenderAttachError, SenderAttachExchange, SenderFlowState,
-    SenderLink, SenderResumeError, SenderResumeErrorKind, SessionStopReason,
     builder::{self, WithSource, WithoutName, WithoutTarget},
     delivery::{DeliveryFut, Sendable, UnsettledMessage},
     error::DetachError,
     resumption::ResumingDelivery,
     role,
     shared_inner::{
-        LinkEndpointInner, LinkEndpointInnerDetach, LinkEndpointInnerReattach, recv_remote_detach,
+        recv_remote_detach, LinkEndpointInner, LinkEndpointInnerDetach, LinkEndpointInnerReattach,
     },
+    ArcSenderUnsettledMap, DetachThenResumeSenderError, LinkFrame, LinkRelay, LinkStateError,
+    MessageSizeExceeded, SendError, SenderAttachError, SenderAttachExchange, SenderFlowState,
+    SenderLink, SenderResumeError, SenderResumeErrorKind, SessionStopReason,
 };
 
 #[cfg(docsrs)]
 use fe2o3_amqp_types::messaging::{
-    AmqpSequence, AmqpValue, Batch, Body, Data, IntoBody, MESSAGE_FORMAT, Message,
+    AmqpSequence, AmqpValue, Batch, Body, Data, IntoBody, Message, MESSAGE_FORMAT,
 };
 
 /// An AMQP1.0 sender
@@ -109,8 +109,8 @@ impl std::fmt::Debug for Sender {
 
 impl Sender {
     /// Creates a builder for [`Sender`] link
-    pub fn builder()
-    -> builder::Builder<role::SenderMarker, Target, WithoutName, WithSource, WithoutTarget> {
+    pub fn builder(
+    ) -> builder::Builder<role::SenderMarker, Target, WithoutName, WithSource, WithoutTarget> {
         builder::Builder::<role::SenderMarker, Target, _, _, _>::new()
     }
 
@@ -1434,6 +1434,7 @@ mod tests {
         let consumer = Consumer::new(Arc::new(Notify::new()), flow_state);
 
         let link = SenderLink::<Target> {
+            operation_dispatch: None,
             role: PhantomData,
             local_state: LinkState::Attached,
             name: String::from("test-sender"),

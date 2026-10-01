@@ -2,7 +2,7 @@
 
 use fe2o3_amqp_types::{
     definitions::{DeliveryNumber, DeliveryTag, Handle, MessageFormat, ReceiverSettleMode},
-    messaging::{Accepted, DeliveryState, Message, Outcome, SerializableBody, MESSAGE_FORMAT},
+    messaging::{Accepted, DeliveryState, MESSAGE_FORMAT, Message, Outcome, SerializableBody},
     primitives::BinaryRef,
 };
 use futures_util::FutureExt;
@@ -15,17 +15,18 @@ use std::{
 };
 use tokio::sync::oneshot::{self, error::RecvError};
 
+use crate::{Payload, util::AsDeliveryState};
 use crate::{
     endpoint::Settlement,
     util::{Sealed, Uninitialized},
 };
-use crate::{util::AsDeliveryState, Payload};
 
 use super::{LinkStateError, SendError, SessionStopReason};
 
 /// Delivery information that is needed for disposing a message
 #[derive(Clone)]
 pub struct DeliveryInfo {
+    pub(crate) identity: std::sync::Arc<()>,
     /// Delivery ID carried by the transfer frame
     pub(crate) delivery_id: DeliveryNumber,
 
@@ -39,6 +40,12 @@ pub struct DeliveryInfo {
 }
 
 impl DeliveryInfo {
+    /// Exact native receipt binding, including the physical delivery generation.
+    pub fn same_delivery(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.identity, &other.identity)
+            && self.delivery_id == other.delivery_id
+            && self.delivery_tag == other.delivery_tag
+    }
     /// Get the delivery ID carried by the transfer frame
     pub fn delivery_id(&self) -> DeliveryNumber {
         self.delivery_id
@@ -71,6 +78,7 @@ impl<T> From<Delivery<T>> for DeliveryInfo {
             delivery_id: delivery.delivery_id,
             delivery_tag: delivery.delivery_tag,
             rcv_settle_mode: delivery.rcv_settle_mode,
+            identity: delivery.identity.clone(),
             _sealed: Sealed {},
         }
     }
@@ -82,6 +90,7 @@ impl<T> From<&Delivery<T>> for DeliveryInfo {
             delivery_id: delivery.delivery_id,
             delivery_tag: delivery.delivery_tag.clone(),
             rcv_settle_mode: delivery.rcv_settle_mode.clone(),
+            identity: delivery.identity.clone(),
             _sealed: Sealed {},
         }
     }
@@ -90,6 +99,7 @@ impl<T> From<&Delivery<T>> for DeliveryInfo {
 /// Reserved for receiver side
 #[derive(Debug)]
 pub struct Delivery<T> {
+    pub(crate) identity: std::sync::Arc<()>,
     /// Verify whether this message is bound to a link
     pub(crate) link_output_handle: Handle,
     pub(crate) delivery_id: DeliveryNumber,
@@ -147,6 +157,7 @@ impl<T> Delivery<T> {
     pub fn into_parts(self) -> (DeliveryInfo, Message<T>) {
         (
             DeliveryInfo {
+                identity: self.identity.clone(),
                 delivery_id: self.delivery_id,
                 delivery_tag: self.delivery_tag,
                 rcv_settle_mode: self.rcv_settle_mode,

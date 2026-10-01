@@ -21,14 +21,19 @@ cfg_not_wasm32! {
 }
 
 use crate::{
+    Payload,
     control::SessionControl,
     endpoint::{self, LinkAttach, LinkDetach, LinkExt, LinkFlow, OutputHandle},
     session::SessionHandle,
     util::Sealed,
-    Payload,
 };
 
 use super::{
+    ArcReceiverUnsettledMap, DEFAULT_CREDIT, DetachThenResumeReceiverError, DispositionError,
+    FlowError, IllegalLinkStateError, LinkFrame, LinkRelay, LinkStateError, MessageSizeExceeded,
+    ReceiverAttachError, ReceiverAttachExchange, ReceiverFlowState, ReceiverLink,
+    ReceiverResumeError, ReceiverResumeErrorKind, ReceiverTransferError, RecvError,
+    SessionStopReason,
     builder::{self, WithTarget, WithoutName, WithoutSource},
     delivery::{Delivery, DeliveryInfo},
     error::DetachError,
@@ -36,11 +41,6 @@ use super::{
     receiver_link::count_number_of_sections_and_offset,
     role,
     shared_inner::{LinkEndpointInner, LinkEndpointInnerDetach, LinkEndpointInnerReattach},
-    ArcReceiverUnsettledMap, DetachThenResumeReceiverError, DispositionError, FlowError,
-    IllegalLinkStateError, LinkFrame, LinkRelay, LinkStateError, MessageSizeExceeded,
-    ReceiverAttachError, ReceiverAttachExchange, ReceiverFlowState, ReceiverLink,
-    ReceiverResumeError, ReceiverResumeErrorKind, ReceiverTransferError, RecvError,
-    SessionStopReason, DEFAULT_CREDIT,
 };
 
 cfg_transaction! {
@@ -124,9 +124,8 @@ pub struct Receiver {
 
 impl Receiver {
     /// Creates a builder for the [`Receiver`]
-    pub fn builder(
-    ) -> builder::Builder<role::ReceiverMarker, Target, WithoutName, WithoutSource, WithTarget>
-    {
+    pub fn builder()
+    -> builder::Builder<role::ReceiverMarker, Target, WithoutName, WithoutSource, WithTarget> {
         builder::Builder::<role::ReceiverMarker, Target, _, _, _>::new()
     }
 
@@ -735,18 +734,28 @@ impl ReceiverDisposer {
             ReceiverSettleMode::Second => false,
         };
 
-        let unsettled_state = if settled {
+        let unsettled_state = {
             let mut lock = self.unsettled.write();
-            lock.as_mut()
-                .and_then(|map| map.swap_remove(&delivery_info.delivery_tag))
-        } else {
-            let mut lock = self.unsettled.write();
-            lock.as_mut()
-                .and_then(|map| map.get_mut(&delivery_info.delivery_tag))
-                .map(|entry| {
-                    entry.local_state(state.clone());
-                    entry.clone()
-                })
+            let Some(map) = lock.as_mut() else {
+                return Ok(());
+            };
+            let Some(entry) = map.get(&delivery_info.delivery_tag) else {
+                return Ok(());
+            };
+            if !entry
+                .info
+                .as_ref()
+                .is_some_and(|current| current.same_delivery(&delivery_info))
+            {
+                return Err(DispositionError::IllegalState);
+            }
+            if settled {
+                map.swap_remove(&delivery_info.delivery_tag)
+            } else {
+                let entry = map.get_mut(&delivery_info.delivery_tag).unwrap();
+                entry.local_state(state.clone());
+                Some(entry.clone())
+            }
         };
 
         if unsettled_state.is_some() {
@@ -898,6 +907,21 @@ impl ReceiverSettlementView {
             .filter(|entry| entry.received)?
             .info
             .clone()
+    }
+    /// Current identity bound by an explicit resumed Transfer, never an ordinary tag reuse.
+    pub fn resumed_delivery_info(&self, tag: &DeliveryTag) -> Option<DeliveryInfo> {
+        self.unsettled
+            .read()
+            .as_ref()?
+            .get(tag)
+            .filter(|entry| entry.received && entry.resumed)?
+            .info
+            .clone()
+    }
+    /// Whether this exact physical delivery binding is still unsettled.
+    pub fn contains_delivery(&self, info: &DeliveryInfo) -> bool {
+        self.delivery_info(info.delivery_tag())
+            .is_some_and(|current| current.same_delivery(info))
     }
     /// Wait for any map change. Updates coalesce and never form a frame queue.
     pub async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
@@ -1295,6 +1319,7 @@ where
                 let error = definitions::Error::new(LinkError::MessageSizeExceeded, None, None);
                 let state = DeliveryState::Rejected(Rejected { error: Some(error) });
                 let info = DeliveryInfo {
+                    identity: std::sync::Arc::new(()),
                     delivery_id,
                     delivery_tag,
                     rcv_settle_mode: None,
@@ -1455,7 +1480,9 @@ where
                         .as_ref()
                         .and_then(|tag| map.get_mut(tag))
                 }) {
+                    entry.resumed = true;
                     entry.info = Some(DeliveryInfo {
+                        identity: std::sync::Arc::new(()),
                         delivery_id: transfer.delivery_id.ok_or(RecvError::DeliveryIdIsNone)?,
                         delivery_tag: transfer
                             .delivery_tag
@@ -1679,6 +1706,7 @@ impl ReceiverInner<ReceiverLink<Target>> {
         if let Some(map) = self.link.unsettled.write().as_mut() {
             for entry in map.values_mut() {
                 entry.info = None;
+                entry.resumed = false;
             }
         }
         self.reallocate_output_handle().await?;
@@ -1859,7 +1887,7 @@ impl DetachedReceiver {
                             inner: Box::new(endpoint.inner),
                         },
                         kind: ReceiverAttachError::IllegalState.into(),
-                    })
+                    });
                 }
             };
         }
@@ -2171,6 +2199,13 @@ mod tests {
         unsettled: ArcReceiverUnsettledMap,
         credit_mode: CreditMode,
     ) -> ReceiverDisposer {
+        if let Some(map) = unsettled.write().as_mut() {
+            for (tag, entry) in map.as_inner_mut().iter_mut() {
+                if entry.info.is_none() {
+                    entry.info = Some(make_delivery_info(tag[0] as u32, tag.to_vec()));
+                }
+            }
+        }
         ReceiverDisposer {
             outgoing: tx.into(),
             unsettled,
@@ -2185,11 +2220,28 @@ mod tests {
 
     fn make_delivery_info(id: u32, tag: Vec<u8>) -> DeliveryInfo {
         DeliveryInfo {
+            identity: std::sync::Arc::new(()),
             delivery_id: id,
             delivery_tag: DeliveryTag::from(tag),
             rcv_settle_mode: None,
             _sealed: Sealed {},
         }
+    }
+
+    fn current_delivery_info(disposer: &ReceiverDisposer, id: u32, tag: Vec<u8>) -> DeliveryInfo {
+        let info = disposer
+            .unsettled
+            .read()
+            .as_ref()
+            .unwrap()
+            .get(&DeliveryTag::from(tag))
+            .unwrap()
+            .info
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert_eq!(info.delivery_id(), id);
+        info
     }
 
     fn seed_unsettled(map: &ArcReceiverUnsettledMap, tags: &[Vec<u8>]) {
@@ -2489,21 +2541,28 @@ mod tests {
         assert_eq!(view.delivery_info(&tag).unwrap().delivery_id(), 99);
         // Unknown tags and terminally settled transfers never become disposable.
         transfer.delivery_tag = Some(vec![0x43].into());
-        assert!(receiver
-            .inner
-            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            receiver
+                .inner
+                .on_incoming_transfer::<Body<serde_amqp::Value>>(
+                    transfer.clone(),
+                    Vec::new().into()
+                )
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(view.delivery_info(&vec![0x43].into()).is_none());
         transfer.delivery_tag = Some(tag.clone());
         transfer.settled = Some(true);
-        assert!(receiver
-            .inner
-            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer, Vec::new().into())
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            receiver
+                .inner
+                .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer, Vec::new().into())
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(!view.contains(&tag));
         assert!(view.delivery_info(&tag).is_none());
     }
@@ -2516,7 +2575,7 @@ mod tests {
         seed_unsettled(&unsettled, &[vec![0x01]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
-        let info = make_delivery_info(1, vec![0x01]);
+        let info = current_delivery_info(&disposer, 1, vec![0x01]);
 
         disposer.accept(info).await.unwrap();
 
@@ -2540,7 +2599,7 @@ mod tests {
         seed_unsettled(&unsettled, &[vec![0x02]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
-        let info = make_delivery_info(2, vec![0x02]);
+        let info = current_delivery_info(&disposer, 2, vec![0x02]);
 
         disposer.release(info).await.unwrap();
 
@@ -2563,7 +2622,7 @@ mod tests {
         seed_unsettled(&unsettled, &[vec![0x0A], vec![0x0B]]);
 
         let disposer = make_disposer(tx, unsettled.clone(), CreditMode::Manual);
-        let info = make_delivery_info(10, vec![0x0A]);
+        let info = current_delivery_info(&disposer, 10, vec![0x0A]);
 
         disposer.accept(info).await.unwrap();
 
@@ -2583,15 +2642,15 @@ mod tests {
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
 
         disposer
-            .accept(make_delivery_info(1, vec![1]))
+            .accept(current_delivery_info(&disposer, 1, vec![1]))
             .await
             .unwrap();
         disposer
-            .accept(make_delivery_info(2, vec![2]))
+            .accept(current_delivery_info(&disposer, 2, vec![2]))
             .await
             .unwrap();
         disposer
-            .accept(make_delivery_info(3, vec![3]))
+            .accept(current_delivery_info(&disposer, 3, vec![3]))
             .await
             .unwrap();
 
@@ -2612,7 +2671,7 @@ mod tests {
 
         for i in 1..=5u32 {
             disposer
-                .accept(make_delivery_info(i, vec![i as u8]))
+                .accept(current_delivery_info(&disposer, i, vec![i as u8]))
                 .await
                 .unwrap();
         }
@@ -2666,8 +2725,36 @@ mod tests {
 
         // No Disposition frame should be sent
         assert!(rx.try_recv().is_err());
-        // But processed still incremented
-        assert_eq!(disposer.processed.load(Ordering::Acquire), 1);
+        // An absent delivery cannot consume credit or change settlement state.
+        assert_eq!(disposer.processed.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn stale_identity_cannot_settle_reused_tag_and_id() {
+        let (tx, mut rx) = mpsc::channel::<LinkFrame>(8);
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
+        seed_unsettled(&unsettled, &[vec![1]]);
+        let disposer = make_disposer(tx, unsettled.clone(), CreditMode::Manual);
+        let old = current_delivery_info(&disposer, 1, vec![1]);
+        let fresh = make_delivery_info(1, vec![1]);
+        unsettled
+            .write()
+            .as_mut()
+            .unwrap()
+            .get_mut(&fresh.delivery_tag)
+            .unwrap()
+            .info = Some(fresh.clone());
+        assert!(disposer.accept(old).await.is_err());
+        assert!(rx.try_recv().is_err());
+        assert!(
+            unsettled
+                .read()
+                .as_ref()
+                .unwrap()
+                .contains_key(&fresh.delivery_tag)
+        );
+        disposer.accept(fresh).await.unwrap();
+        assert!(matches!(rx.try_recv().unwrap(), LinkFrame::Disposition(_)));
     }
 
     #[tokio::test]
@@ -2681,7 +2768,10 @@ mod tests {
         let clone = disposer.clone();
 
         // Accept via the clone
-        clone.accept(make_delivery_info(1, vec![1])).await.unwrap();
+        clone
+            .accept(current_delivery_info(&disposer, 1, vec![1]))
+            .await
+            .unwrap();
 
         // Original sees the incremented counter
         assert_eq!(disposer.processed.load(Ordering::Acquire), 1);
@@ -2708,7 +2798,7 @@ mod tests {
             .map(|i| {
                 let d = disposer.clone();
                 tokio::spawn(async move {
-                    d.accept(make_delivery_info(i as u32, vec![i]))
+                    d.accept(current_delivery_info(&d, i as u32, vec![i]))
                         .await
                         .unwrap();
                 })

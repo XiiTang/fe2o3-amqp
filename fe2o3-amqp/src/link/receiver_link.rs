@@ -2,12 +2,12 @@ use std::sync::{Arc, OnceLock};
 
 use fe2o3_amqp_types::{
     definitions::{Fields, Handle},
-    messaging::{message::DecodeIntoMessage, FromBody},
+    messaging::{FromBody, message::DecodeIntoMessage},
 };
 
 use crate::{
     endpoint::LinkExt,
-    util::{is_consecutive, AsByteIterator, IntoReader, Sealed},
+    util::{AsByteIterator, IntoReader, Sealed, is_consecutive},
 };
 
 use super::{delivery::DeliveryInfo, *};
@@ -135,6 +135,7 @@ where
             .delivery_tag
             .ok_or(Self::TransferError::DeliveryTagIsNone)?;
         let message_format = transfer.message_format;
+        let identity = std::sync::Arc::new(());
 
         let encoded: Vec<u8> = payload.as_byte_iterator().copied().collect();
         let admission = fe2o3_amqp_types::messaging::message::admission::validate(&encoded);
@@ -184,7 +185,9 @@ where
                 let mut lock = self.unsettled.write();
                 if let Some(current) = lock.as_mut().and_then(|map| map.get_mut(&delivery_tag)) {
                     current.received(state, result.is_ok());
+                    current.resumed = false;
                     current.info = Some(DeliveryInfo {
+                        identity: identity.clone(),
                         delivery_id,
                         delivery_tag: delivery_tag.clone(),
                         rcv_settle_mode: mode.clone(),
@@ -199,6 +202,7 @@ where
             Ok(message) => message,
             Err(source) => {
                 let info = DeliveryInfo {
+                    identity: identity.clone(),
                     delivery_id,
                     delivery_tag,
                     rcv_settle_mode: mode,
@@ -215,6 +219,7 @@ where
             .into();
 
         let delivery = Delivery {
+            identity,
             link_output_handle,
             delivery_id,
             delivery_tag,
@@ -258,20 +263,28 @@ where
             }
         });
 
-        let unsettled_state = if settled {
+        let unsettled_state = {
             let mut lock = self.unsettled.write();
-            lock.as_mut()
-                .and_then(|map| map.swap_remove(&delivery_info.delivery_tag))
-        } else {
-            let mut lock = self.unsettled.write();
-            // If the key is present in the map, the old value will be returned, which
-            // we don't really need
-            lock.as_mut()
-                .and_then(|map| map.get_mut(&delivery_info.delivery_tag))
-                .map(|entry| {
-                    entry.local_state(state.clone());
-                    entry.clone()
-                })
+            let Some(map) = lock.as_mut() else {
+                return Ok(());
+            };
+            let Some(entry) = map.get(&delivery_info.delivery_tag) else {
+                return Ok(());
+            };
+            if !entry
+                .info
+                .as_ref()
+                .is_some_and(|current| current.same_delivery(&delivery_info))
+            {
+                return Err(Self::DispositionError::IllegalState);
+            }
+            if settled {
+                map.swap_remove(&delivery_info.delivery_tag)
+            } else {
+                let entry = map.get_mut(&delivery_info.delivery_tag).unwrap();
+                entry.local_state(state.clone());
+                Some(entry.clone())
+            }
         };
 
         // Only dispose if message is found in unsettled map
@@ -313,7 +326,11 @@ where
             delivery_infos.retain(|info| {
                 reader
                     .as_ref()
-                    .map(|m| m.contains_key(&info.delivery_tag))
+                    .map(|m| {
+                        m.get(&info.delivery_tag)
+                            .and_then(|entry| entry.info.as_ref())
+                            .is_some_and(|current| current.same_delivery(info))
+                    })
                     .unwrap_or(false)
             });
         }
@@ -418,21 +435,24 @@ impl<T> ReceiverLink<T> {
             }
         });
 
-        // TODO: Individually checking whether a delivery is already dropped is probably too heavy?
-        if settled {
+        // Validate every identity before changing the range, under one lock.
+        {
             let mut lock = self.unsettled.write();
-            for info in consecutive_infos {
-                lock.as_mut()
-                    .and_then(|map| map.swap_remove(&info.delivery_tag));
+            let map = lock.as_mut().ok_or(DispositionError::IllegalState)?;
+            if consecutive_infos.iter().any(|info| {
+                !map.get(&info.delivery_tag)
+                    .and_then(|entry| entry.info.as_ref())
+                    .is_some_and(|current| current.same_delivery(info))
+            }) {
+                return Err(DispositionError::IllegalState);
             }
-        } else {
-            let mut lock = self.unsettled.write();
             for info in consecutive_infos {
-                if let Some(entry) = lock
-                    .as_mut()
-                    .and_then(|map| map.get_mut(&info.delivery_tag))
-                {
-                    entry.local_state(state.clone());
+                if settled {
+                    map.swap_remove(&info.delivery_tag);
+                } else {
+                    map.get_mut(&info.delivery_tag)
+                        .unwrap()
+                        .local_state(state.clone());
                 }
             }
         }
@@ -899,8 +919,8 @@ where
 mod tests {
     use fe2o3_amqp_types::{
         messaging::{
-            message::{__private::Serializable, Body},
             AmqpValue, DeliveryAnnotations, Header, Message, MessageAnnotations,
+            message::{__private::Serializable, Body},
         },
         primitives::{OrderedMap, Value},
     };

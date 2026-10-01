@@ -350,6 +350,27 @@ impl super::TransactionRetirement for SharedTransaction {
     type RetireError = link::DispositionError;
 }
 
+/// Return locally reserved credit when no Transfer reached the session queue.
+struct ControlCredit<'a> {
+    flow: Arc<crate::link::state::LinkFlowState<role::SenderMarker>>,
+    tag: u32,
+    dispatched: &'a AtomicBool,
+}
+impl Drop for ControlCredit<'_> {
+    fn drop(&mut self) {
+        if self.dispatched.load(Ordering::Acquire) {
+            return;
+        }
+        let mut state = self.flow.lock.write();
+        // A peer drain can advance the sequence independently; preserve that
+        // newer flow epoch rather than undoing its discarded credit.
+        if state.delivery_count == self.tag.wrapping_add(1) {
+            state.delivery_count = self.tag;
+            state.link_credit = state.link_credit.saturating_add(1);
+        }
+    }
+}
+
 impl SenderInner<ControlLink> {
     async fn send_control_tracked<T: SerializableBody>(
         &mut self,
@@ -376,6 +397,11 @@ impl SenderInner<ControlLink> {
             .link
             .get_delivery_tag_or_detached(self.incoming.recv())
             .await?;
+        let _credit = ControlCredit {
+            flow: self.link.flow_state.state().clone(),
+            tag: u32::from_be_bytes(tag),
+            dispatched,
+        };
         let transfer = self.link.generate_non_resuming_transfer_performative(
             tag.to_vec().into(),
             0,
@@ -403,5 +429,97 @@ impl SenderInner<ControlLink> {
                 None => LinkStateError::IllegalState,
             })??
             .ok_or(ControllerSendError::NonTerminalDeliveryState)
+    }
+}
+
+#[cfg(test)]
+mod tracked_credit_tests {
+    use super::*;
+    use crate::{
+        link::{
+            state::{LinkFlowState, LinkFlowStateInner},
+            LinkFrame,
+        },
+        util::{Consume, Consumer},
+    };
+    use fe2o3_amqp_types::performatives::Transfer;
+    fn credit(count: u32) -> crate::link::SenderFlowState {
+        Consumer::new(
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(LinkFlowState::sender(LinkFlowStateInner {
+                initial_delivery_count: count,
+                delivery_count: count,
+                link_credit: 1,
+                available: 0,
+                drain: false,
+                properties: None,
+            })),
+        )
+    }
+    fn frame(tag: [u8; 4]) -> LinkFrame {
+        LinkFrame::Transfer {
+            input_handle: crate::endpoint::InputHandle(0),
+            window_slot: None,
+            performative: Transfer {
+                handle: 0.into(),
+                delivery_id: None,
+                delivery_tag: Some(tag.to_vec().into()),
+                message_format: Some(0),
+                settled: Some(false),
+                more: false,
+                rcv_settle_mode: None,
+                state: None,
+                resume: false,
+                aborted: false,
+                batchable: false,
+            },
+            payload: bytes::Bytes::from_static(b"control"),
+            queue_slot: None,
+        }
+    }
+    #[tokio::test]
+    async fn cancelled_control_before_queue_dispatch_restores_credit_and_sequence() {
+        for count in [0, u32::MAX] {
+            let flow = credit(count);
+            let dispatched = AtomicBool::new(false);
+            let (writer, mut queued) = crate::session::transfer_queue::channel(1);
+            writer.send(frame([0; 4])).await.unwrap();
+            let mut operation = Box::pin(async {
+                let tag = flow.consume(1).await;
+                let _credit = ControlCredit {
+                    flow: flow.state().clone(),
+                    tag: u32::from_be_bytes(tag),
+                    dispatched: &dispatched,
+                };
+                writer.send(frame(tag)).await.unwrap();
+                dispatched.store(true, Ordering::Release);
+            });
+            assert!(futures_util::poll!(&mut operation).is_pending());
+            drop(operation);
+            assert!(!dispatched.load(Ordering::Acquire));
+            assert_eq!(flow.state().lock.read().delivery_count, count);
+            assert_eq!(flow.state().lock.read().link_credit, 1);
+            queued.recv().await.unwrap();
+            assert!(queued.try_recv().is_err());
+            assert_eq!(u32::from_be_bytes(flow.consume(1).await), count);
+        }
+    }
+    #[tokio::test]
+    async fn dispatched_control_keeps_consumed_credit() {
+        let flow = credit(0);
+        let dispatched = AtomicBool::new(false);
+        let tag = flow.consume(1).await;
+        let (writer, mut queued) = crate::session::transfer_queue::channel(1);
+        let reservation = ControlCredit {
+            flow: flow.state().clone(),
+            tag: u32::from_be_bytes(tag),
+            dispatched: &dispatched,
+        };
+        writer.send(frame(tag)).await.unwrap();
+        dispatched.store(true, Ordering::Release);
+        drop(reservation);
+        assert_eq!(flow.state().lock.read().delivery_count, 1);
+        assert_eq!(flow.state().lock.read().link_credit, 0);
+        assert!(queued.recv().await.is_some());
     }
 }

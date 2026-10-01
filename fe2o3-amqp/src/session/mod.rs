@@ -695,6 +695,26 @@ impl endpoint::Session for Session {
             }
         };
 
+        // A cancelled Attach waiter can leave an unbound local allocation.
+        // Bound links have moved to link_by_input_handle; prune only pending
+        // allocations whose receiving endpoint no longer exists.
+        let orphaned: Vec<_> = self
+            .link_by_name
+            .values()
+            .filter_map(|relay| match relay.as_ref()? {
+                LinkRelay::Sender {
+                    tx, output_handle, ..
+                }
+                | LinkRelay::Receiver {
+                    tx, output_handle, ..
+                } if tx.is_closed() => Some(output_handle.clone()),
+                _ => None,
+            })
+            .collect();
+        for handle in orphaned {
+            self.deallocate_link(handle);
+        }
+
         // check whether link name is duplciated
         if self.link_by_name.contains_key(&link_name) {
             return Err(AllocLinkError::DuplicatedLinkName);

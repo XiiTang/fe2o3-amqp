@@ -325,10 +325,12 @@ where
                 responder,
             } => {
                 let result = self.session.allocate_link(link_name, Some(link_relay));
-                responder
-                    .send(result.map_err(Into::into))
-                    // The receiving end (ie. link) must have been stopped
-                    .map_err(|_| SessionInnerError::UnattachedHandle)?;
+                if let Err(result) = responder.send(result.map_err(Into::into)) {
+                    // Cancelling a local allocator must not end sibling links.
+                    if let Ok(handle) = result {
+                        self.session.deallocate_link(handle);
+                    }
+                }
             }
             SessionControl::AllocateIncomingLink {
                 link_name,
@@ -760,5 +762,106 @@ where
             other => other.map_err(Into::into),
         };
         let _ = tx.send(result);
+    }
+}
+
+#[cfg(test)]
+mod allocation_cancel_tests {
+    use super::*;
+    use crate::{
+        endpoint::OutgoingChannel,
+        link::{
+            state::{LinkFlowState, LinkFlowStateInner},
+            unsettled_store::Store,
+            LinkRelay,
+        },
+        session::{Builder, SessionState},
+    };
+    use fe2o3_amqp_types::definitions::ReceiverSettleMode;
+    fn engine() -> SessionEngine<super::super::Session> {
+        let (conn_control, _) = mpsc::channel(1);
+        let (_, control) = mpsc::channel(1);
+        let (_, incoming) = mpsc::channel(1);
+        let (outgoing, _) = mpsc::channel(1);
+        let (_, outgoing_link_frames) = mpsc::channel(1);
+        SessionEngine {
+            conn_control,
+            control,
+            incoming,
+            outgoing,
+            outgoing_link_frames,
+            session: Builder::new().into_session(
+                OutgoingChannel(0),
+                SessionState::Mapped,
+                Arc::new(OnceLock::new()),
+            ),
+        }
+    }
+    fn relay() -> (LinkRelay<()>, mpsc::Receiver<crate::link::LinkIncomingItem>) {
+        let (tx, rx) = mpsc::channel(1);
+        let flow = Arc::new(LinkFlowState::receiver(LinkFlowStateInner {
+            initial_delivery_count: 0,
+            delivery_count: 0,
+            link_credit: 0,
+            available: 0,
+            drain: false,
+            properties: None,
+        }));
+        (
+            LinkRelay::new_receiver(
+                tx,
+                flow,
+                Arc::new(Store::new(None)),
+                ReceiverSettleMode::First,
+            ),
+            rx,
+        )
+    }
+    #[tokio::test]
+    async fn cancelled_allocator_releases_handle_without_ending_session() {
+        let mut engine = engine();
+        let (link_relay, _inbox) = relay();
+        let (responder, waiter) = oneshot::channel();
+        drop(waiter);
+        engine
+            .on_control(SessionControl::AllocateLink {
+                link_name: "cancelled".into(),
+                link_relay,
+                responder,
+            })
+            .await
+            .unwrap();
+        assert!(engine.session.link_by_name.is_empty());
+        assert!(engine.session.link_name_by_output_handle.is_empty());
+        assert!(matches!(engine.session.local_state, SessionState::Mapped));
+    }
+    #[tokio::test]
+    async fn cancelled_unattached_endpoint_allows_same_name_reuse() {
+        let mut engine = engine();
+        let (link_relay, inbox) = relay();
+        let (responder, waiter) = oneshot::channel();
+        engine
+            .on_control(SessionControl::AllocateLink {
+                link_name: "reuse".into(),
+                link_relay,
+                responder,
+            })
+            .await
+            .unwrap();
+        waiter.await.unwrap().unwrap();
+        drop(inbox);
+        let (link_relay, _inbox) = relay();
+        let (responder, waiter) = oneshot::channel();
+        engine
+            .on_control(SessionControl::AllocateLink {
+                link_name: "reuse".into(),
+                link_relay,
+                responder,
+            })
+            .await
+            .unwrap();
+        waiter.await.unwrap().unwrap();
+        assert_eq!(engine.session.link_name_by_output_handle.len(), 1);
+        assert!(matches!(engine.session.local_state, SessionState::Mapped));
     }
 }

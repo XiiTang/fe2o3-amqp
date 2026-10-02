@@ -20,6 +20,73 @@ where
         + Send
         + Sync,
 {
+    /// Whether a transfer goes out settled, which leaves no outcome to wait for.
+    ///
+    /// If not set on the first (or only) transfer for a (multi-transfer) delivery, then the
+    /// settled flag MUST be interpreted as being false.
+    pub(crate) fn is_settled_on_send(&self, transfer: &Transfer) -> bool {
+        transfer.settled.unwrap_or(match self.snd_settle_mode {
+            SenderSettleMode::Settled => true,
+            SenderSettleMode::Unsettled => false,
+            SenderSettleMode::Mixed => false,
+        })
+    }
+
+    /// Hands the transfer of an unsettled delivery to the session, registering the delivery in
+    /// the unsettled map first.
+    ///
+    /// The session engine is a task of its own: it can write the transfer, receive the peer's
+    /// settled disposition and look the delivery up in the unsettled map before the sending task
+    /// resumes. A disposition that finds no entry is dropped, so a delivery registered after the
+    /// hand-over could wait for its outcome forever.
+    ///
+    /// # Cancel safety
+    ///
+    /// This is cancel safe: an error, or a future dropped before the session has taken the whole
+    /// transfer, withdraws the registration, so the map keeps only deliveries whose transfer was
+    /// handed over.
+    pub(crate) async fn send_unsettled_transfer(
+        &self,
+        writer: &crate::session::transfer_queue::Sender,
+        transfer: Transfer,
+        payload: Payload,
+        delivery_tag: DeliveryTag,
+        unsettled: UnsettledMessage,
+    ) -> Result<(), LinkStateError> {
+        self.send_unsettled_transfer_tracked(
+            writer,
+            transfer,
+            payload,
+            delivery_tag,
+            unsettled,
+            None,
+        )
+        .await
+    }
+
+    async fn send_unsettled_transfer_tracked(
+        &self,
+        writer: &crate::session::transfer_queue::Sender,
+        transfer: Transfer,
+        payload: Payload,
+        delivery_tag: DeliveryTag,
+        unsettled: UnsettledMessage,
+        dispatched: Option<&AtomicBool>,
+    ) -> Result<(), LinkStateError> {
+        self.unsettled
+            .write()
+            .get_or_insert(OrderedMap::new())
+            .insert(delivery_tag.clone(), unsettled);
+        let registration = UnsettledRegistration {
+            unsettled: &self.unsettled,
+            delivery_tag: Some(&delivery_tag),
+        };
+        self.send_transfer_tracked(writer, transfer, payload, dispatched)
+            .await?;
+        registration.keep();
+        Ok(())
+    }
+
     pub(crate) async fn send_payload_with_transfer_tracked(
         &self,
         writer: &crate::session::transfer_queue::Sender,
@@ -28,36 +95,30 @@ where
         payload: Payload,
         dispatched: Option<&AtomicBool>,
     ) -> Result<Settlement, LinkStateError> {
-        // Keep a copy for unsettled message
-        // Clone should be very cheap on Bytes
-        let payload_copy = payload.clone();
         let delivery_tag = transfer
             .delivery_tag
             .clone()
             .ok_or(LinkStateError::IllegalState)?;
-        let settled = self
-            .send_transfer_tracked(writer, transfer, payload, dispatched)
-            .await?;
-        match settled {
-            true => Ok(Settlement::Settled(delivery_tag)),
-            // If not set on the first (or only) transfer for a (multi-transfer)
-            // delivery, then the settled flag MUST be interpreted as being false.
-            false => {
-                let (tx, rx) = oneshot::channel();
-                let unsettled = UnsettledMessage::new(payload_copy, None, message_format, tx);
-                {
-                    let mut guard = self.unsettled.write();
-                    guard
-                        .get_or_insert(OrderedMap::new())
-                        .insert(delivery_tag.clone(), unsettled);
-                }
-
-                Ok(Settlement::Unsettled {
-                    delivery_tag,
-                    outcome: rx,
-                })
-            }
+        if self.is_settled_on_send(&transfer) {
+            self.send_transfer_tracked(writer, transfer, payload, dispatched)
+                .await?;
+            return Ok(Settlement::Settled(delivery_tag));
         }
+        let (tx, rx) = oneshot::channel();
+        let unsettled = UnsettledMessage::new(payload.clone(), None, message_format, tx);
+        self.send_unsettled_transfer_tracked(
+            writer,
+            transfer,
+            payload,
+            delivery_tag.clone(),
+            unsettled,
+            dispatched,
+        )
+        .await?;
+        Ok(Settlement::Unsettled {
+            delivery_tag,
+            outcome: rx,
+        })
     }
 
     /// # Cancel safety
@@ -79,11 +140,7 @@ where
         mut payload: Payload,
         dispatched: Option<&AtomicBool>,
     ) -> Result<bool, LinkStateError> {
-        let settled = transfer.settled.unwrap_or(match self.snd_settle_mode {
-            SenderSettleMode::Settled => true,
-            SenderSettleMode::Unsettled => false,
-            SenderSettleMode::Mixed => false,
-        });
+        let settled = self.is_settled_on_send(&transfer);
         let input_handle = self
             .input_handle
             .clone()
@@ -974,5 +1031,28 @@ where
             Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
             None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
         },
+    }
+}
+
+/// Withdraws a delivery registered in the unsettled map unless its whole transfer was handed to
+/// the session: on an error, and when the sending future is dropped before the hand-over.
+struct UnsettledRegistration<'a> {
+    unsettled: &'a ArcSenderUnsettledMap,
+    delivery_tag: Option<&'a DeliveryTag>,
+}
+
+impl UnsettledRegistration<'_> {
+    fn keep(mut self) {
+        self.delivery_tag = None;
+    }
+}
+
+impl Drop for UnsettledRegistration<'_> {
+    fn drop(&mut self) {
+        if let Some(delivery_tag) = self.delivery_tag.take() {
+            if let Some(map) = self.unsettled.write().as_mut() {
+                let _ = map.swap_remove(delivery_tag);
+            }
+        }
     }
 }

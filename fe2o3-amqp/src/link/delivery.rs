@@ -2,7 +2,7 @@
 
 use fe2o3_amqp_types::{
     definitions::{DeliveryNumber, DeliveryTag, Handle, MessageFormat, ReceiverSettleMode},
-    messaging::{Accepted, DeliveryState, MESSAGE_FORMAT, Message, Outcome, SerializableBody},
+    messaging::{Accepted, DeliveryState, Message, Outcome, SerializableBody, MESSAGE_FORMAT},
     primitives::BinaryRef,
 };
 use futures_util::FutureExt;
@@ -15,11 +15,11 @@ use std::{
 };
 use tokio::sync::oneshot::{self, error::RecvError};
 
-use crate::{Payload, util::AsDeliveryState};
 use crate::{
     endpoint::Settlement,
     util::{Sealed, Uninitialized},
 };
+use crate::{util::AsDeliveryState, Payload};
 
 use super::{LinkStateError, SendError, SessionStopReason};
 

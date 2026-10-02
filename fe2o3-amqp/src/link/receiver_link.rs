@@ -2,12 +2,12 @@ use std::sync::{Arc, OnceLock};
 
 use fe2o3_amqp_types::{
     definitions::{Fields, Handle},
-    messaging::{FromBody, message::DecodeIntoMessage},
+    messaging::{message::DecodeIntoMessage, FromBody},
 };
 
 use crate::{
     endpoint::LinkExt,
-    util::{AsByteIterator, IntoReader, Sealed, is_consecutive},
+    util::{is_consecutive, AsByteIterator, IntoReader, Sealed},
 };
 
 use super::{delivery::DeliveryInfo, *};
@@ -919,8 +919,8 @@ where
 mod tests {
     use fe2o3_amqp_types::{
         messaging::{
-            AmqpValue, DeliveryAnnotations, Header, Message, MessageAnnotations,
             message::{__private::Serializable, Body},
+            AmqpValue, DeliveryAnnotations, Header, Message, MessageAnnotations,
         },
         primitives::{OrderedMap, Value},
     };

@@ -21,19 +21,14 @@ cfg_not_wasm32! {
 }
 
 use crate::{
-    Payload,
     control::SessionControl,
     endpoint::{self, LinkAttach, LinkDetach, LinkExt, LinkFlow, OutputHandle},
     session::SessionHandle,
     util::Sealed,
+    Payload,
 };
 
 use super::{
-    ArcReceiverUnsettledMap, DEFAULT_CREDIT, DetachThenResumeReceiverError, DispositionError,
-    FlowError, IllegalLinkStateError, LinkFrame, LinkRelay, LinkStateError, MessageSizeExceeded,
-    ReceiverAttachError, ReceiverAttachExchange, ReceiverFlowState, ReceiverLink,
-    ReceiverResumeError, ReceiverResumeErrorKind, ReceiverTransferError, RecvError,
-    SessionStopReason,
     builder::{self, WithTarget, WithoutName, WithoutSource},
     delivery::{Delivery, DeliveryInfo},
     error::DetachError,
@@ -41,6 +36,11 @@ use super::{
     receiver_link::count_number_of_sections_and_offset,
     role,
     shared_inner::{LinkEndpointInner, LinkEndpointInnerDetach, LinkEndpointInnerReattach},
+    ArcReceiverUnsettledMap, DetachThenResumeReceiverError, DispositionError, FlowError,
+    IllegalLinkStateError, LinkFrame, LinkRelay, LinkStateError, MessageSizeExceeded,
+    ReceiverAttachError, ReceiverAttachExchange, ReceiverFlowState, ReceiverLink,
+    ReceiverResumeError, ReceiverResumeErrorKind, ReceiverTransferError, RecvError,
+    SessionStopReason, DEFAULT_CREDIT,
 };
 
 cfg_transaction! {
@@ -124,8 +124,9 @@ pub struct Receiver {
 
 impl Receiver {
     /// Creates a builder for the [`Receiver`]
-    pub fn builder()
-    -> builder::Builder<role::ReceiverMarker, Target, WithoutName, WithoutSource, WithTarget> {
+    pub fn builder(
+    ) -> builder::Builder<role::ReceiverMarker, Target, WithoutName, WithoutSource, WithTarget>
+    {
         builder::Builder::<role::ReceiverMarker, Target, _, _, _>::new()
     }
 
@@ -2541,28 +2542,21 @@ mod tests {
         assert_eq!(view.delivery_info(&tag).unwrap().delivery_id(), 99);
         // Unknown tags and terminally settled transfers never become disposable.
         transfer.delivery_tag = Some(vec![0x43].into());
-        assert!(
-            receiver
-                .inner
-                .on_incoming_transfer::<Body<serde_amqp::Value>>(
-                    transfer.clone(),
-                    Vec::new().into()
-                )
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(receiver
+            .inner
+            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
+            .await
+            .unwrap()
+            .is_none());
         assert!(view.delivery_info(&vec![0x43].into()).is_none());
         transfer.delivery_tag = Some(tag.clone());
         transfer.settled = Some(true);
-        assert!(
-            receiver
-                .inner
-                .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer, Vec::new().into())
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(receiver
+            .inner
+            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer, Vec::new().into())
+            .await
+            .unwrap()
+            .is_none());
         assert!(!view.contains(&tag));
         assert!(view.delivery_info(&tag).is_none());
     }
@@ -2746,13 +2740,11 @@ mod tests {
             .info = Some(fresh.clone());
         assert!(disposer.accept(old).await.is_err());
         assert!(rx.try_recv().is_err());
-        assert!(
-            unsettled
-                .read()
-                .as_ref()
-                .unwrap()
-                .contains_key(&fresh.delivery_tag)
-        );
+        assert!(unsettled
+            .read()
+            .as_ref()
+            .unwrap()
+            .contains_key(&fresh.delivery_tag));
         disposer.accept(fresh).await.unwrap();
         assert!(matches!(rx.try_recv().unwrap(), LinkFrame::Disposition(_)));
     }

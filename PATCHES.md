@@ -79,3 +79,18 @@ settled prefixes and receive-budget release.
 With this fix, 84 native library tests, 22 in-memory upstream integration
 tests, and all 20 consumer AMQP 1.0 tests (including the independent interrupted
 Artemis transfer) pass on macOS arm64.
+
+## Settlement registration (2026-10-02)
+
+Adapt #397 (6d64a5697408e4397e8b9ce9190e8560e0d5ae17) so send, resume, resend,
+abort and outcome restatement register before session admission. Both normal
+and tracked sends use the same registration guard and existing bounded byte
+queue. Refusal/cancellation before completed handover withdraws registration;
+a fully admitted transfer retains its outcome owner. Preserve frame splitting,
+tracked dispatch and receive/materialization budgets. 93 library tests and the
+22 selected in-memory lifecycle/splitting tests pass on macOS arm64.
+
+#400 is a separate receive/resume semantics change, including public error and
+link-detach behavior. It is not a replacement for the local materialization
+budget or partial-transfer reconciliation, and is not included in this scoped
+settlement repair. Evaluate its full receive-side contract before importing it.

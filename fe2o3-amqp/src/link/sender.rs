@@ -310,7 +310,18 @@ impl Sender {
     ///
     /// This will set the `closed` field in the Detach performative to true
     pub async fn close(mut self) -> Result<(), DetachError> {
+        self.close_in_place().await
+    }
+
+    /// Drive a closing Detach without surrendering endpoint ownership on interruption.
+    pub async fn close_in_place(&mut self) -> Result<(), DetachError> {
         self.inner.close_with_error(None).await
+    }
+
+    /// Whether the closing Detach exchange completed and released its output handle.
+    pub fn is_closed(&self) -> bool {
+        matches!(self.inner.link.local_state, super::state::LinkState::Closed)
+            && self.inner.link.output_handle.is_none()
     }
 
     /// Detach the link with an error

@@ -94,3 +94,35 @@ tracked dispatch and receive/materialization budgets. 93 library tests and the
 link-detach behavior. It is not a replacement for the local materialization
 budget or partial-transfer reconciliation, and is not included in this scoped
 settlement repair. Evaluate its full receive-side contract before importing it.
+
+
+## Receive/resume semantics and error scope (2026-10-03)
+
+Semantically adapt upstream #400 (28c9d180fd08fced6a929cde2ee214013f369d63)
+and #403 (682af8e2a5b9a8dddf5c0441e226cb7701c47fd2) onto this fork. Keep
+strict encoded-section admission, the flat partial buffer and shared ReceiveBudget,
+local/remote settlement separation, and explicit endpoint ownership/recovery.
+The earlier #400 deferral above is superseded by this separately reviewed port.
+
+Negotiated max-message-size and malformed continuation identities drive a closing
+Detach on the affected link. Release partial storage on abort and size failure;
+attribute tagless state continuations to their buffered delivery. Apply Received
+prefix truncation before admitting replacement payload against message/storage
+bounds. Ignore unknown resumed deliveries throughout their fragment sequence.
+Sender aborts are implicitly settled and do not register a new outcome. Reallocate
+the output handle between the mandatory detach/reattach cycles of resumption.
+
+Shared materialization exhaustion remains a connection resource failure; it is
+not mapped to message-size-exceeded or claimed to have completed a local Detach.
+Preserve conservative handling of invalid native encoding/recovery positions.
+ErrorRecovery is caller guidance, not proof of a completed handshake: is_closed
+requires Closed plus a released output handle. close_in_place permits the owner
+to retain a sender/receiver while a caller stops waiting. Neither API reconnects,
+resumes or replays business data automatically.
+
+120 transaction-enabled library tests and 18 in-memory lifecycle/splitting
+tests pass on macOS arm64. Consumer wire tests
+exercise oversize isolation on a shared session, delayed closing replies,
+explicit detach completion after timeout and Execution-owned retirement. A peer
+that continues using a detached handle can still incur a session protocol error;
+this patch does not promise isolation from arbitrary later errant frames.

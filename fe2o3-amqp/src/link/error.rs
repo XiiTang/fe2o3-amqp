@@ -788,7 +788,9 @@ impl RecvError {
     pub fn recovery(&self) -> ErrorRecovery {
         match self {
             Self::LinkStateError(error) => error.recovery(),
-            Self::MaterializationBoundExceeded | Self::InvalidMessageEncoding(_) => ErrorRecovery::ReconnectConnection,
+            Self::MaterializationBoundExceeded | Self::InvalidMessageEncoding(_) => {
+                ErrorRecovery::ReconnectConnection
+            }
             Self::TransferLimitExceeded
             | Self::MessageDecode(_)
             | Self::IllegalRcvSettleModeInTransfer => ErrorRecovery::UseLink,
@@ -1209,5 +1211,16 @@ mod tests {
 
         assert!(ErrorRecovery::NewLink.requires_new_link());
         assert!(!ErrorRecovery::NewLink.link_is_usable());
+    }
+    #[test]
+    fn shared_materialization_failures_do_not_claim_a_completed_local_link_close() {
+        assert_eq!(
+            RecvError::MaterializationBoundExceeded.recovery(),
+            ErrorRecovery::ReconnectConnection
+        );
+        assert_eq!(
+            RecvError::InvalidMessageEncoding(serde_amqp::Error::InvalidValue).recovery(),
+            ErrorRecovery::ReconnectConnection
+        );
     }
 }

@@ -1239,15 +1239,22 @@ where
         state: DeliveryState,
     ) -> Result<(), RecvError> {
         let effective_tag = delivery_tag.clone().or_else(|| {
-            self.incomplete_transfer.as_ref().and_then(|partial| partial.performative.delivery_tag.clone())
+            self.incomplete_transfer
+                .as_ref()
+                .and_then(|partial| partial.performative.delivery_tag.clone())
         });
         if effective_tag.is_none() {
-            return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone).await;
+            return self
+                .close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone)
+                .await;
         }
         if let Some(partial) = &mut self.incomplete_transfer {
             if partial.performative.delivery_tag == effective_tag {
                 if let DeliveryState::Received(received) = &state {
-                    partial.keep_buffer_till_section_number_and_offset(received.section_number, received.section_offset)?;
+                    partial.keep_buffer_till_section_number_and_offset(
+                        received.section_number,
+                        received.section_offset,
+                    )?;
                 }
             }
         }
@@ -1279,11 +1286,15 @@ where
                 }
             }
             None => {
-                let incomplete = match IncompleteTransfer::new(transfer, payload, &self.receive_budget) {
-                    Ok(partial) => partial,
-                    Err(error @ (ReceiverTransferError::DeliveryIdIsNone | ReceiverTransferError::DeliveryTagIsNone)) => return self.close_on_malformed_delivery(error).await,
-                    Err(error) => return Err(error.into()),
-                };
+                let incomplete =
+                    match IncompleteTransfer::new(transfer, payload, &self.receive_budget) {
+                        Ok(partial) => partial,
+                        Err(
+                            error @ (ReceiverTransferError::DeliveryIdIsNone
+                            | ReceiverTransferError::DeliveryTagIsNone),
+                        ) => return self.close_on_malformed_delivery(error).await,
+                        Err(error) => return Err(error.into()),
+                    };
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
                     self.link.on_incomplete_transfer(
@@ -1419,17 +1430,40 @@ where
         use super::incoming_recovery::Kind;
         let continuation = match self.incoming_recovery.continuation(&mut transfer) {
             Ok(kind) => kind,
-            Err(RecvError::InconsistentFieldInMultiFrameDelivery) => return self.close_on_malformed_delivery(ReceiverTransferError::InconsistentFieldInMultiFrameDelivery).await.map(|()| None),
+            Err(RecvError::InconsistentFieldInMultiFrameDelivery) => {
+                return self
+                    .close_on_malformed_delivery(
+                        ReceiverTransferError::InconsistentFieldInMultiFrameDelivery,
+                    )
+                    .await
+                    .map(|()| None)
+            }
             Err(error) => return Err(error),
         };
         if transfer.aborted {
             if let Some(partial) = &self.incomplete_transfer {
-                if transfer.delivery_tag.as_ref().is_some_and(|tag| partial.performative.delivery_tag.as_ref() != Some(tag))
-                    || transfer.delivery_id.zip(partial.performative.delivery_id).is_some_and(|(a,b)| a != b) {
-                    return self.close_on_malformed_delivery(ReceiverTransferError::InconsistentFieldInMultiFrameDelivery).await.map(|()| None);
+                if transfer
+                    .delivery_tag
+                    .as_ref()
+                    .is_some_and(|tag| partial.performative.delivery_tag.as_ref() != Some(tag))
+                    || transfer
+                        .delivery_id
+                        .zip(partial.performative.delivery_id)
+                        .is_some_and(|(a, b)| a != b)
+                {
+                    return self
+                        .close_on_malformed_delivery(
+                            ReceiverTransferError::InconsistentFieldInMultiFrameDelivery,
+                        )
+                        .await
+                        .map(|()| None);
                 }
             }
-            let tag = transfer.delivery_tag.clone().or_else(|| self.incomplete_transfer.as_ref().and_then(|partial| partial.performative.delivery_tag.clone()));
+            let tag = transfer.delivery_tag.clone().or_else(|| {
+                self.incomplete_transfer
+                    .as_ref()
+                    .and_then(|partial| partial.performative.delivery_tag.clone())
+            });
             self.incomplete_transfer.take();
             if let Some(tag) = tag {
                 if let Some(map) = self.link.unsettled().write().as_mut() {
@@ -1441,10 +1475,16 @@ where
         let mut kind = continuation;
         if continuation.is_none() && transfer.resume {
             if transfer.delivery_tag.is_none() {
-                return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone).await.map(|()| None);
+                return self
+                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone)
+                    .await
+                    .map(|()| None);
             }
             if transfer.delivery_id.is_none() {
-                return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone).await.map(|()| None);
+                return self
+                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone)
+                    .await
+                    .map(|()| None);
             }
             let tag = transfer.delivery_tag.as_ref().unwrap();
             let known = self
@@ -1466,7 +1506,12 @@ where
                 };
                 if let Some(partial) = self.incomplete_transfer.as_mut() {
                     if partial.performative.delivery_tag.as_ref() != Some(tag) {
-                        return self.close_on_malformed_delivery(ReceiverTransferError::InconsistentFieldInMultiFrameDelivery).await.map(|()| None);
+                        return self
+                            .close_on_malformed_delivery(
+                                ReceiverTransferError::InconsistentFieldInMultiFrameDelivery,
+                            )
+                            .await
+                            .map(|()| None);
                     }
                     partial.keep_buffer_till_section_number_and_offset(number, offset)?;
                     partial.performative.delivery_id = transfer.delivery_id;
@@ -1510,16 +1555,23 @@ where
                     }
                 }
             } else if let Some(state) = transfer.state {
-                self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state).await?;
+                self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state)
+                    .await?;
             }
             return Ok(None);
         }
         if self.incomplete_transfer.is_none() {
             if transfer.delivery_id.is_none() {
-                return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone).await.map(|()| None);
+                return self
+                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone)
+                    .await
+                    .map(|()| None);
             }
             if transfer.delivery_tag.is_none() {
-                return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone).await.map(|()| None);
+                return self
+                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone)
+                    .await
+                    .map(|()| None);
             }
             if transfer.message_format.is_none() {
                 return Err(RecvError::InvalidMessageEncoding(
@@ -1532,6 +1584,20 @@ where
                 .as_ref()
                 .and_then(|p| p.performative.delivery_tag.clone());
         }
+        if let Some(partial) = self.incomplete_transfer.as_mut() {
+            if let Err(error) = partial.or_assign(transfer.clone()) {
+                return self.close_on_malformed_delivery(error).await.map(|()| None);
+            }
+        }
+        if let Some(state) = transfer.state.clone() {
+            // Setting the state
+            // on the transfer can be thought of as being equivalent to sending a disposition immediately before
+            // the transfer performative, i.e., it is the state of the delivery (not the transfer) that existed at the
+            // point the frame was sent.
+            self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state)
+                .await?;
+        }
+
         if let Some(max_size) = self.link.max_message_size() {
             let total = self.accumulated_message_size(&transfer) + payload.len() as u64;
             if total > max_size {
@@ -1557,27 +1623,8 @@ where
                 serde_amqp::Error::InvalidValue,
             ));
         }
-        if let Some(state) = transfer.state.clone() {
-            // Setting the state
-            // on the transfer can be thought of as being equivalent to sending a disposition immediately before
-            // the transfer performative, i.e., it is the state of the delivery (not the transfer) that existed at the
-            // point the frame was sent.
-            self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state).await?;
-        }
 
         if transfer.more {
-            // Enforce the negotiated max-message-size of the link: reject the
-            // delivery with the `amqp:link:message-size-exceeded` error
-            // condition once the accumulated message size would exceed it,
-            // discarding the buffered chunks instead of buffering the
-            // oversized message.
-            if let Some(max_size) = self.link.max_message_size() {
-                let total = self.accumulated_message_size(&transfer) + payload.len() as u64;
-                if total > max_size {
-                    return Err(self.close_on_message_size_exceeded(total, max_size).await);
-                }
-            }
-
             // Partial transfer of the delivery
             // There is only ONE incomplet transfer locally, so the partial transfer must belong to the
             // same delivery
@@ -3290,10 +3337,7 @@ mod tests {
         let mut different_format = make_incoming_transfer(1, Some(vec![0x01]), false, false);
         different_format.message_format = Some(1);
         incoming_tx
-            .send(make_link_frame(
-                different_format,
-                encoded_binary_prefix(8),
-            ))
+            .send(make_link_frame(different_format, encoded_binary_prefix(8)))
             .await
             .unwrap();
 
@@ -3526,6 +3570,8 @@ mod tests {
         let mut inner = make_receiver_inner(4096);
         let tag = DeliveryTag::from(vec![0x01]);
 
+        seed_unsettled(inner.link.unsettled(), &[tag.to_vec()]);
+
         let payload = encoded_sectioned_payload();
         let full_len = payload.len() as u64;
         inner
@@ -3698,5 +3744,36 @@ mod tests {
         );
         assert!(matches!(result, Err(DetachError::ClosedByRemote)));
         assert!(matches!(&inner.link.local_state, LinkState::Closed));
+    }
+    #[tokio::test]
+    async fn received_prefix_is_trimmed_before_admitting_new_payload_against_both_bounds() {
+        let mut inner = make_receiver_inner(4096);
+        inner.link.max_message_size = 100;
+        inner.receive_budget = crate::link::receive_budget::ReceiveBudget::new(100);
+        let budget = inner.receive_budget.clone();
+        inner
+            .on_incoming_transfer::<String>(
+                make_incoming_transfer(1, Some(vec![1]), true, false),
+                encoded_binary_prefix(100),
+            )
+            .await
+            .unwrap();
+        assert_eq!(budget.retained_bytes(), 100);
+        let mut continuation = make_incoming_transfer(1, None, true, false);
+        continuation.state = Some(DeliveryState::Received(Received {
+            section_number: 0,
+            section_offset: 10,
+        }));
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            inner.on_incoming_transfer::<String>(continuation, Payload::from(vec![0; 10])),
+        )
+        .await
+        .expect("a valid reduced prefix must not enter a closing exchange")
+        .unwrap();
+        assert_eq!(inner.incomplete_transfer.as_ref().unwrap().buffer.len(), 20);
+        assert_eq!(budget.retained_bytes(), 20);
+        drop(inner);
+        assert_eq!(budget.retained_bytes(), 0);
     }
 }

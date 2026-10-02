@@ -1652,12 +1652,8 @@ mod tests {
             .generate_non_resuming_transfer_performative(tag.clone(), 0, None, None, false)
             .expect("the link is attached");
 
-        let send = link.send_payload_with_transfer(
-            &writer.into(),
-            0,
-            transfer,
-            Payload::from_static(b"m"),
-        );
+        let send =
+            link.send_payload_with_transfer(&writer, 0, transfer, Payload::from_static(b"m"));
         tokio::pin!(send);
         assert!(futures_util::poll!(&mut send).is_pending());
         assert!(
@@ -1688,12 +1684,8 @@ mod tests {
             .expect("the link is attached");
 
         {
-            let send = link.send_payload_with_transfer(
-                &writer.into(),
-                0,
-                transfer,
-                Payload::from_static(b"m"),
-            );
+            let send =
+                link.send_payload_with_transfer(&writer, 0, transfer, Payload::from_static(b"m"));
             tokio::pin!(send);
             assert!(futures_util::poll!(&mut send).is_pending());
             assert!(is_registered(link, &tag));
@@ -1708,6 +1700,7 @@ mod tests {
         let inner = sendable_sender();
         let link = &inner.link;
         let (writer, session) = mpsc::channel::<LinkFrame>(1);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
         drop(session);
         let tag = DeliveryTag::from(b"tag0".to_vec());
         let transfer = link
@@ -1715,7 +1708,7 @@ mod tests {
             .expect("the link is attached");
 
         let result = link
-            .send_payload_with_transfer(&writer.into(), 0, transfer, Payload::from_static(b"m"))
+            .send_payload_with_transfer(&writer, 0, transfer, Payload::from_static(b"m"))
             .await;
 
         assert!(result.is_err());

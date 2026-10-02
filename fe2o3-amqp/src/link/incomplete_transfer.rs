@@ -41,6 +41,12 @@ impl IncompleteTransfer {
         partial_payload: Payload,
         budget: &std::sync::Arc<super::receive_budget::ReceiveBudget>,
     ) -> Result<Self, ReceiverTransferError> {
+        if transfer.delivery_id.is_none() {
+            return Err(ReceiverTransferError::DeliveryIdIsNone);
+        }
+        if transfer.delivery_tag.is_none() {
+            return Err(ReceiverTransferError::DeliveryTagIsNone);
+        }
         let storage = budget.reserve(partial_payload.len())?;
         let (number, offset) = prefix_position(&partial_payload)
             .map_err(ReceiverTransferError::InvalidMessageEncoding)?;

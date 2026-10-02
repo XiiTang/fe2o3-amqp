@@ -11,7 +11,6 @@ use fe2o3_amqp_types::{
         Accepted, Address, DeliveryState, FromBody, Modified, Rejected, Released, Source, Target,
     },
     performatives::{Attach, Detach, Disposition, Transfer},
-    primitives::OrderedMap,
 };
 use tokio::sync::mpsc;
 
@@ -24,7 +23,6 @@ use crate::{
     control::SessionControl,
     endpoint::{self, LinkAttach, LinkDetach, LinkExt, LinkFlow, OutputHandle},
     session::SessionHandle,
-    util::Sealed,
     Payload,
 };
 
@@ -135,6 +133,12 @@ impl Receiver {
         self.inner.link.name()
     }
 
+    /// Whether the closing Detach exchange completed and released this link's handle.
+    pub fn is_closed(&self) -> bool {
+        matches!(self.inner.link.local_state, super::state::LinkState::Closed)
+            && self.inner.link.output_handle.is_none()
+    }
+
     /// Observe the engine's unsettled map without a second disposition ledger.
     pub fn settlement_view(&self) -> ReceiverSettlementView {
         ReceiverSettlementView {
@@ -161,8 +165,7 @@ impl Receiver {
     ///
     /// When this value is set, deliveries larger than it are rejected on
     /// receive with `amqp:link:message-size-exceeded` and [`recv`](#method.recv)
-    /// returns [`RecvError::MessageSizeExceeded`]; the link itself is not
-    /// detached.
+    /// returns [`RecvError::MessageSizeExceeded`]; the link is closed with an error.
     pub fn max_message_size(&self) -> Option<u64> {
         self.inner.link.max_message_size()
     }
@@ -340,10 +343,8 @@ impl Receiver {
     /// [`max_message_size`](#method.max_message_size)) and the peer sends a
     /// delivery larger than it, the receiver rejects the delivery with a
     /// `Rejected` disposition carrying `amqp:link:message-size-exceeded` and
-    /// this method returns [`RecvError::MessageSizeExceeded`]. The rejection
-    /// is delivery-scoped: **the link is not detached** — only the oversized
-    /// delivery is discarded, and subsequent calls to this method continue to
-    /// receive normally.
+    /// this method returns [`RecvError::MessageSizeExceeded`] after closing the link
+    /// with the corresponding error. Other links on the session remain usable.
     ///
     /// # Cancel safety
     ///
@@ -496,6 +497,12 @@ impl Receiver {
     ///
     /// This will send a Detach performative with the `closed` field set to true.
     pub async fn close(mut self) -> Result<(), DetachError> {
+        self.close_in_place().await
+    }
+
+    /// Complete closing without consuming the receiver, so its owner can keep
+    /// driving the same exchange after a caller's wait expires.
+    pub async fn close_in_place(&mut self) -> Result<(), DetachError> {
         self.inner.close_with_error(None).await
     }
 
@@ -1209,18 +1216,47 @@ where
         }
     }
 
-    fn on_transfer_state(
+    /// Close the link because a transfer violated the multi-frame delivery
+    /// rules. AMQP 1.0 §2.6.5 requires the endpoint to be detached with error
+    /// information and then destroyed.
+    async fn close_on_malformed_delivery(
+        &mut self,
+        error: ReceiverTransferError,
+    ) -> Result<(), RecvError> {
+        let detach_error = definitions::Error::new(
+            definitions::AmqpError::NotAllowed,
+            Some(error.to_string()),
+            None,
+        );
+        self.close_with_error(Some(detach_error)).await?;
+        Err(error.into())
+    }
+
+    async fn on_transfer_state(
         &mut self,
         delivery_tag: &Option<DeliveryTag>,
         settled: Option<bool>,
         state: DeliveryState,
     ) -> Result<(), RecvError> {
+        let effective_tag = delivery_tag.clone().or_else(|| {
+            self.incomplete_transfer.as_ref().and_then(|partial| partial.performative.delivery_tag.clone())
+        });
+        if effective_tag.is_none() {
+            return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone).await;
+        }
+        if let Some(partial) = &mut self.incomplete_transfer {
+            if partial.performative.delivery_tag == effective_tag {
+                if let DeliveryState::Received(received) = &state {
+                    partial.keep_buffer_till_section_number_and_offset(received.section_number, received.section_offset)?;
+                }
+            }
+        }
         self.link
-            .on_transfer_state(delivery_tag, settled, state)
+            .on_transfer_state(&effective_tag, settled, state)
             .map_err(Into::into)
     }
 
-    fn on_incomplete_transfer(
+    async fn on_incomplete_transfer(
         &mut self,
         transfer: Transfer,
         payload: Payload,
@@ -1228,7 +1264,9 @@ where
         // Partial transfer of the delivery
         match &mut self.incomplete_transfer {
             Some(incomplete) => {
-                incomplete.or_assign(transfer)?;
+                if let Err(error) = incomplete.or_assign(transfer) {
+                    return self.close_on_malformed_delivery(error).await;
+                }
                 incomplete.append(payload)?;
 
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
@@ -1241,7 +1279,11 @@ where
                 }
             }
             None => {
-                let incomplete = IncompleteTransfer::new(transfer, payload, &self.receive_budget)?;
+                let incomplete = match IncompleteTransfer::new(transfer, payload, &self.receive_budget) {
+                    Ok(partial) => partial,
+                    Err(error @ (ReceiverTransferError::DeliveryIdIsNone | ReceiverTransferError::DeliveryTagIsNone)) => return self.close_on_malformed_delivery(error).await,
+                    Err(error) => return Err(error.into()),
+                };
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
                     self.link.on_incomplete_transfer(
@@ -1272,93 +1314,40 @@ where
         }
     }
 
-    /// Reject a delivery that exceeds the negotiated max-message-size of the
-    /// link with the `amqp:link:message-size-exceeded` error condition and
-    /// discard the buffered chunks, so the oversized message is neither
-    /// buffered further nor surfaced to the application.
-    ///
-    /// If the sender pre-settled the delivery there is nothing to reply with;
-    /// otherwise a terminal `Rejected` disposition is sent. The
-    /// [`RecvError::MessageSizeExceeded`] error is returned in both cases so
-    /// `recv()` observes the rejected delivery; the link itself is not
-    /// detached and remains usable.
-    async fn reject_oversized_message<T>(
+    /// Detach the link because a delivery exceeds the negotiated
+    /// max-message-size, as required for a `message-size-exceeded` link error
+    /// (AMQP 1.0 §2.6.5). The buffered chunks are discarded and the link can
+    /// only be restored by resuming it.
+    async fn close_on_message_size_exceeded(
         &mut self,
-        transfer: Transfer,
         total_size: u64,
         max_size: u64,
-    ) -> Result<Option<Delivery<T>>, RecvError>
-    where
-        for<'de> T: FromBody<'de> + Send,
-    {
+    ) -> RecvError {
         #[cfg(feature = "tracing")]
         tracing::warn!(
-            "Rejected delivery of {total_size} bytes: exceeds the link's max message size of {max_size}"
+            "Detaching link: received message of {total_size} bytes exceeds the max message size of {max_size}"
         );
         #[cfg(feature = "log")]
         log::warn!(
-            "Rejected delivery of {total_size} bytes: exceeds the link's max message size of {max_size}"
+            "Detaching link: received message of {total_size} bytes exceeds the max message size of {max_size}"
         );
 
-        let delivery_id = transfer.delivery_id.or_else(|| {
-            self.incomplete_transfer
-                .as_ref()
-                .and_then(|i| i.performative.delivery_id)
-        });
-        let delivery_tag = transfer.delivery_tag.clone().or_else(|| {
-            self.incomplete_transfer
-                .as_ref()
-                .and_then(|i| i.performative.delivery_tag.clone())
-        });
-
-        // Discard the buffered chunks of the oversized delivery
         self.incomplete_transfer.take();
 
-        // If the sender pre-settled the delivery, there is nothing to reply with
-        if !transfer.settled.unwrap_or(false) {
-            if let (Some(delivery_id), Some(delivery_tag)) = (delivery_id, delivery_tag) {
-                let error = definitions::Error::new(LinkError::MessageSizeExceeded, None, None);
-                let state = DeliveryState::Rejected(Rejected { error: Some(error) });
-                let info = DeliveryInfo {
-                    identity: std::sync::Arc::new(()),
-                    delivery_id,
-                    delivery_tag,
-                    rcv_settle_mode: None,
-                    _sealed: Sealed {},
-                };
-                // Track the delivery: `link.dispose` only sends the disposition when
-                // the delivery is in the unsettled map. First/single frames aren't
-                // tracked yet: the entry is only inserted by
-                // `ReceiverLink::on_incomplete_transfer` (first partial frame of a
-                // multi-frame delivery) or `ReceiverLink::on_complete_transfer` (final
-                // assembly), and this size check runs before either of those.
-                {
-                    let mut lock = self.link.unsettled().write();
-                    let map = lock.get_or_insert_with(OrderedMap::new);
-                    let mut entry = map.get(&info.delivery_tag).cloned().unwrap_or_default();
-                    entry.info = Some(info.clone());
-                    map.insert(info.delivery_tag.clone(), entry);
-                }
-                self.dispose(info, Some(true), state).await?;
-            } else {
-                // The frame could not be identified (missing delivery-id and
-                // delivery-tag), so no disposition can be sent. This should not
-                // happen with a well-behaved peer.
-                #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    "Cannot send rejection disposition: missing delivery-id or delivery-tag"
-                );
-                #[cfg(feature = "log")]
-                log::warn!(
-                    "Cannot send rejection disposition: missing delivery-id or delivery-tag"
-                );
-            }
+        let error = definitions::Error::new(
+            LinkError::MessageSizeExceeded,
+            Some(format!(
+                "received message larger than max size of {max_size}"
+            )),
+            None,
+        );
+        match self.close_with_error(Some(error)).await {
+            Ok(()) => RecvError::MessageSizeExceeded(MessageSizeExceeded {
+                size: total_size,
+                max_size,
+            }),
+            Err(detach_error) => detach_error.into(),
         }
-
-        Err(RecvError::MessageSizeExceeded(MessageSizeExceeded {
-            size: total_size,
-            max_size,
-        }))
     }
 
     /// # Cancel safety
@@ -1377,15 +1366,15 @@ where
         if let Some(max_size) = self.link.max_message_size() {
             let total = self.accumulated_message_size(&transfer) + payload.len() as u64;
             if total > max_size {
-                return self
-                    .reject_oversized_message(transfer, total, max_size)
-                    .await;
+                return Err(self.close_on_message_size_exceeded(total, max_size).await);
             }
         }
 
         let delivery = match self.incomplete_transfer.take() {
             Some(mut incomplete) => {
-                incomplete.or_assign(transfer)?;
+                if let Err(error) = incomplete.or_assign(transfer) {
+                    return self.close_on_malformed_delivery(error).await.map(|()| None);
+                }
                 incomplete.append(payload)?; // This also computes the section number and offset incrementally
 
                 self.link.on_complete_transfer(
@@ -1428,16 +1417,36 @@ where
         for<'de> T: FromBody<'de> + Send,
     {
         use super::incoming_recovery::Kind;
-        let continuation = self.incoming_recovery.continuation(&mut transfer)?;
+        let continuation = match self.incoming_recovery.continuation(&mut transfer) {
+            Ok(kind) => kind,
+            Err(RecvError::InconsistentFieldInMultiFrameDelivery) => return self.close_on_malformed_delivery(ReceiverTransferError::InconsistentFieldInMultiFrameDelivery).await.map(|()| None),
+            Err(error) => return Err(error),
+        };
+        if transfer.aborted {
+            if let Some(partial) = &self.incomplete_transfer {
+                if transfer.delivery_tag.as_ref().is_some_and(|tag| partial.performative.delivery_tag.as_ref() != Some(tag))
+                    || transfer.delivery_id.zip(partial.performative.delivery_id).is_some_and(|(a,b)| a != b) {
+                    return self.close_on_malformed_delivery(ReceiverTransferError::InconsistentFieldInMultiFrameDelivery).await.map(|()| None);
+                }
+            }
+            let tag = transfer.delivery_tag.clone().or_else(|| self.incomplete_transfer.as_ref().and_then(|partial| partial.performative.delivery_tag.clone()));
+            self.incomplete_transfer.take();
+            if let Some(tag) = tag {
+                if let Some(map) = self.link.unsettled().write().as_mut() {
+                    map.swap_remove(&tag);
+                }
+            }
+            return Ok(None);
+        }
         let mut kind = continuation;
         if continuation.is_none() && transfer.resume {
-            let tag = transfer
-                .delivery_tag
-                .as_ref()
-                .ok_or(RecvError::DeliveryTagIsNone)?;
-            if transfer.delivery_id.is_none() {
-                return Err(RecvError::DeliveryIdIsNone);
+            if transfer.delivery_tag.is_none() {
+                return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone).await.map(|()| None);
             }
+            if transfer.delivery_id.is_none() {
+                return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone).await.map(|()| None);
+            }
+            let tag = transfer.delivery_tag.as_ref().unwrap();
             let known = self
                 .link
                 .unsettled()
@@ -1457,7 +1466,7 @@ where
                 };
                 if let Some(partial) = self.incomplete_transfer.as_mut() {
                     if partial.performative.delivery_tag.as_ref() != Some(tag) {
-                        return Err(RecvError::InconsistentFieldInMultiFrameDelivery);
+                        return self.close_on_malformed_delivery(ReceiverTransferError::InconsistentFieldInMultiFrameDelivery).await.map(|()| None);
                     }
                     partial.keep_buffer_till_section_number_and_offset(number, offset)?;
                     partial.performative.delivery_id = transfer.delivery_id;
@@ -1501,28 +1510,16 @@ where
                     }
                 }
             } else if let Some(state) = transfer.state {
-                self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state)?;
+                self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state).await?;
             }
             return Ok(None);
-        }
-        if transfer.aborted {
-            self.incomplete_transfer = None;
-            return Ok(None);
-        }
-        if matches!(transfer.state, Some(DeliveryState::Received(_)))
-            && !transfer.resume
-            && continuation.is_none()
-        {
-            return Err(RecvError::InvalidMessageEncoding(
-                serde_amqp::Error::InvalidValue,
-            ));
         }
         if self.incomplete_transfer.is_none() {
             if transfer.delivery_id.is_none() {
-                return Err(RecvError::DeliveryIdIsNone);
+                return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone).await.map(|()| None);
             }
             if transfer.delivery_tag.is_none() {
-                return Err(RecvError::DeliveryTagIsNone);
+                return self.close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone).await.map(|()| None);
             }
             if transfer.message_format.is_none() {
                 return Err(RecvError::InvalidMessageEncoding(
@@ -1534,6 +1531,12 @@ where
                 .incomplete_transfer
                 .as_ref()
                 .and_then(|p| p.performative.delivery_tag.clone());
+        }
+        if let Some(max_size) = self.link.max_message_size() {
+            let total = self.accumulated_message_size(&transfer) + payload.len() as u64;
+            if total > max_size {
+                return Err(self.close_on_message_size_exceeded(total, max_size).await);
+            }
         }
         let retained = self
             .incomplete_transfer
@@ -1559,7 +1562,7 @@ where
             // on the transfer can be thought of as being equivalent to sending a disposition immediately before
             // the transfer performative, i.e., it is the state of the delivery (not the transfer) that existed at the
             // point the frame was sent.
-            self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state)?;
+            self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state).await?;
         }
 
         if transfer.more {
@@ -1571,16 +1574,14 @@ where
             if let Some(max_size) = self.link.max_message_size() {
                 let total = self.accumulated_message_size(&transfer) + payload.len() as u64;
                 if total > max_size {
-                    return self
-                        .reject_oversized_message(transfer, total, max_size)
-                        .await;
+                    return Err(self.close_on_message_size_exceeded(total, max_size).await);
                 }
             }
 
             // Partial transfer of the delivery
             // There is only ONE incomplet transfer locally, so the partial transfer must belong to the
             // same delivery
-            self.on_incomplete_transfer(transfer, payload)?;
+            self.on_incomplete_transfer(transfer, payload).await?;
             // Partial delivery doesn't yield a complete message
             Ok(None)
         } else {
@@ -2181,7 +2182,7 @@ mod tests {
     use crate::endpoint::OutputHandle;
     use crate::link::state::{LinkFlowState, LinkFlowStateInner, LinkState};
     use crate::util::Sealed;
-    use fe2o3_amqp_types::definitions::SenderSettleMode;
+    use fe2o3_amqp_types::{definitions::SenderSettleMode, messaging::Received};
     use tokio::sync::oneshot;
 
     fn make_flow_state(link_credit: u32) -> ReceiverFlowState {
@@ -2410,8 +2411,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn settled_partial_is_released_without_discarding_a_retained_delivery() {
+    #[tokio::test]
+    async fn settled_partial_is_released_without_discarding_a_retained_delivery() {
         use super::super::{state::LinkState, unsettled_store::Store};
         let map = Arc::new(Store::new(None));
         seed_unsettled(&map, &[vec![0x42]]);
@@ -2452,6 +2453,7 @@ mod tests {
         let prefix = vec![0, 0x53, 0x75, 0xa0, 2, 0];
         receiver
             .on_incomplete_transfer(transfer, prefix.clone().into())
+            .await
             .unwrap();
         receiver.discard_settled_partial();
         assert_eq!(
@@ -2860,6 +2862,712 @@ mod tests {
 
     fn make_receiver_inner(max_frame_size: usize) -> ReceiverInner<ReceiverLink<Target>> {
         make_receiver_inner_with_channels(max_frame_size).0
+    }
+
+    fn make_incoming_transfer(
+        delivery_id: u32,
+        delivery_tag: Option<Vec<u8>>,
+        more: bool,
+        settled: bool,
+    ) -> Transfer {
+        Transfer {
+            handle: Handle(0),
+            delivery_id: Some(delivery_id),
+            delivery_tag: delivery_tag.map(DeliveryTag::from),
+            message_format: Some(0),
+            settled: Some(settled),
+            more,
+            rcv_settle_mode: None,
+            state: None,
+            resume: false,
+            aborted: false,
+            batchable: false,
+        }
+    }
+
+    fn make_link_frame(transfer: Transfer, payload: Payload) -> LinkFrame {
+        LinkFrame::Transfer {
+            input_handle: crate::endpoint::InputHandle(0),
+            performative: transfer,
+            payload,
+            window_slot: None,
+            queue_slot: None,
+        }
+    }
+
+    fn encoded_message_payload(body: &str) -> Payload {
+        use fe2o3_amqp_types::messaging::{message::__private::Serializable, Message};
+        let message = Message::from(body.to_string());
+        Payload::from(serde_amqp::to_vec(&Serializable(message)).unwrap())
+    }
+
+    /// An encoded message with a header and a body section, so that section
+    /// numbering can locate the body (`section_number == 1`).
+    fn encoded_sectioned_payload() -> Payload {
+        use fe2o3_amqp_types::{
+            messaging::{message::__private::Serializable, AmqpValue, Body, Header, Message},
+            primitives::Value,
+        };
+        let message = Message {
+            header: Some(Header {
+                durable: true,
+                ..Default::default()
+            }),
+            delivery_annotations: None,
+            message_annotations: None,
+            properties: None,
+            application_properties: None,
+            body: Body::Value(AmqpValue(Value::Bool(true))),
+            footer: None,
+        };
+        Payload::from(serde_amqp::to_vec(&Serializable(message)).unwrap())
+    }
+
+    fn assert_message_size_exceeded(error: RecvError, expected_size: u64, expected_max: u64) {
+        match error {
+            RecvError::MessageSizeExceeded(e) => {
+                assert_eq!(e.size, expected_size);
+                assert_eq!(e.max_size, expected_max);
+            }
+            other => panic!("expected MessageSizeExceeded, got {other:?}"),
+        }
+    }
+
+    /// Drive the closing-detach handshake while `recv()` processes a malformed
+    /// or oversized transfer: assert that the detach closes the link with the
+    /// expected condition, answer it, and return the error `recv()` produced.
+    async fn recv_expecting_fatal_close(
+        inner: &mut ReceiverInner<ReceiverLink<Target>>,
+        outgoing_rx: &mut mpsc::Receiver<LinkFrame>,
+        incoming_tx: &mpsc::Sender<LinkFrame>,
+        expected_condition: definitions::ErrorCondition,
+    ) -> RecvError {
+        let (result, ()) = tokio::join!(inner.recv::<String>(), async {
+            match outgoing_rx.recv().await.expect("expected a closing detach") {
+                LinkFrame::Detach(detach) => {
+                    assert!(detach.closed, "the error detach must close the link");
+                    let error = detach
+                        .error
+                        .as_ref()
+                        .expect("the detach must carry the error");
+                    assert_eq!(error.condition, expected_condition);
+                }
+                other => panic!("expected Detach, got {other:?}"),
+            }
+
+            // Answer the closing detach to complete the handshake.
+            incoming_tx
+                .send(LinkFrame::Detach(Detach {
+                    handle: Handle(0),
+                    closed: true,
+                    error: None,
+                }))
+                .await
+                .unwrap();
+        });
+
+        result.expect_err("a malformed delivery must fail")
+    }
+
+    fn encoded_binary_prefix(size: usize) -> Payload {
+        let mut bytes = vec![0; size];
+        if size >= 5 {
+            bytes[..5].copy_from_slice(&[0, 0x53, 0x75, 0xa0, 200]);
+        }
+        Payload::from(bytes)
+    }
+
+    #[tokio::test]
+    async fn accumulated_size_counts_tagless_continuation_but_not_other_delivery() {
+        let mut inner = make_receiver_inner(4096);
+        inner
+            .on_incoming_transfer::<String>(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                encoded_binary_prefix(60),
+            )
+            .await
+            .unwrap();
+
+        let continuation = make_incoming_transfer(1, None, true, false);
+        assert_eq!(inner.accumulated_message_size(&continuation), 60);
+
+        let other_delivery = make_incoming_transfer(2, Some(vec![0x02]), true, false);
+        assert_eq!(inner.accumulated_message_size(&other_delivery), 0);
+    }
+
+    /// A delivery spanning exactly two frames whose total size exceeds the
+    /// link's max-message-size must detach the link on the tagless final frame
+    /// (AMQP 1.0 §2.6.5, `amqp:link:message-size-exceeded`).
+    #[tokio::test]
+    async fn two_frame_delivery_exceeding_max_message_size_is_rejected_on_final_frame() {
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        inner.link.max_message_size = 100;
+
+        // The first frame carries the delivery tag, the final continuation
+        // omits it.
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                encoded_binary_prefix(60),
+            ))
+            .await
+            .unwrap();
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, None, false, false),
+                encoded_binary_prefix(60),
+            ))
+            .await
+            .unwrap();
+
+        // An oversized message is a link error: the link is detached with
+        // `amqp:link:message-size-exceeded` and destroyed.
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(LinkError::MessageSizeExceeded),
+        )
+        .await;
+        assert_message_size_exceeded(error, 120, 100);
+        assert!(inner.incomplete_transfer.is_none());
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// A delivery spanning three or more frames must detach the link as soon
+    /// as an intermediate `more=true` frame pushes the accumulated size over
+    /// the limit, before the final frame arrives.
+    #[tokio::test]
+    async fn multi_frame_delivery_exceeding_max_message_size_is_rejected_on_intermediate_frame() {
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        inner.link.max_message_size = 100;
+
+        // 50 + 50 reaches the limit but does not exceed it.
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                encoded_binary_prefix(50),
+            ))
+            .await
+            .unwrap();
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, None, true, false),
+                encoded_binary_prefix(50),
+            ))
+            .await
+            .unwrap();
+        // The next intermediate frame exceeds the limit.
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, None, true, false),
+                encoded_binary_prefix(1),
+            ))
+            .await
+            .unwrap();
+
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(LinkError::MessageSizeExceeded),
+        )
+        .await;
+        assert_message_size_exceeded(error, 101, 100);
+        assert!(inner.incomplete_transfer.is_none());
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// A tagless-continuation delivery whose total size is exactly the limit
+    /// is accepted and decoded.
+    #[tokio::test]
+    async fn in_limit_multi_frame_delivery_is_delivered() {
+        let (mut inner, _session_rx, _outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+
+        let body = "in-limit multi-frame message";
+        let payload = encoded_message_payload(body);
+        let total = payload.len() as u64;
+        // Exactly at the limit: the enforcement uses `>` and must not reject.
+        inner.link.max_message_size = total;
+
+        let split = payload.len() / 2;
+        let first = payload.slice(..split);
+        let second = payload.slice(split..);
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                first,
+            ))
+            .await
+            .unwrap();
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, None, false, false),
+                second,
+            ))
+            .await
+            .unwrap();
+
+        let delivery = inner
+            .recv::<String>()
+            .await
+            .expect("in-limit delivery must be accepted");
+        assert_eq!(delivery.body(), body);
+    }
+
+    /// The first transfer of a multi-transfer delivery must carry the
+    /// delivery-id and delivery-tag (AMQP 1.0 §2.7.5); a violation closes the
+    /// link with `amqp:not-allowed` (AMQP 1.0 §2.6.5).
+    #[tokio::test]
+    async fn first_multi_frame_transfer_missing_mandatory_fields_closes_link() {
+        // Missing delivery-tag
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, None, true, false),
+                encoded_binary_prefix(8),
+            ))
+            .await
+            .unwrap();
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(definitions::AmqpError::NotAllowed),
+        )
+        .await;
+        assert!(matches!(error, RecvError::DeliveryTagIsNone));
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+
+        // Missing delivery-id
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        let mut missing_id = make_incoming_transfer(1, Some(vec![0x01]), true, false);
+        missing_id.delivery_id = None;
+        incoming_tx
+            .send(make_link_frame(missing_id, encoded_binary_prefix(8)))
+            .await
+            .unwrap();
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(definitions::AmqpError::NotAllowed),
+        )
+        .await;
+        assert!(matches!(error, RecvError::DeliveryIdIsNone));
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// The mandatory delivery-id and delivery-tag are required on the first
+    /// transfer of any delivery, including a single-frame one (stricter than
+    /// the transfer field text, matching go-amqp and Qpid Proton).
+    #[tokio::test]
+    async fn single_frame_transfer_missing_mandatory_fields_closes_link() {
+        // Missing delivery-tag
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, None, false, false),
+                encoded_binary_prefix(8),
+            ))
+            .await
+            .unwrap();
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(definitions::AmqpError::NotAllowed),
+        )
+        .await;
+        assert!(matches!(error, RecvError::DeliveryTagIsNone));
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+
+        // Missing delivery-id
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        let mut missing_id = make_incoming_transfer(1, Some(vec![0x01]), false, false);
+        missing_id.delivery_id = None;
+        incoming_tx
+            .send(make_link_frame(missing_id, encoded_binary_prefix(8)))
+            .await
+            .unwrap();
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(definitions::AmqpError::NotAllowed),
+        )
+        .await;
+        assert!(matches!(error, RecvError::DeliveryIdIsNone));
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// A state-carrying transfer with no buffered delivery and no delivery-tag
+    /// cannot be attributed to a delivery and closes the link.
+    #[tokio::test]
+    async fn tagless_state_transfer_without_buffer_closes_link() {
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+
+        let mut state_transfer = make_incoming_transfer(1, None, false, false);
+        state_transfer.state = Some(DeliveryState::Received(Received {
+            section_number: 0,
+            section_offset: 0,
+        }));
+        incoming_tx
+            .send(make_link_frame(state_transfer, Payload::new()))
+            .await
+            .unwrap();
+
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(definitions::AmqpError::NotAllowed),
+        )
+        .await;
+        assert!(matches!(error, RecvError::DeliveryTagIsNone));
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// A continuation that explicitly names a different delivery while one is
+    /// being assembled violates AMQP 1.0 §2.6.14 and closes the link.
+    #[tokio::test]
+    async fn continuation_with_different_delivery_tag_closes_link() {
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                encoded_binary_prefix(8),
+            ))
+            .await
+            .unwrap();
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x02]), false, false),
+                encoded_binary_prefix(8),
+            ))
+            .await
+            .unwrap();
+
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(definitions::AmqpError::NotAllowed),
+        )
+        .await;
+        assert!(matches!(
+            error,
+            RecvError::InconsistentFieldInMultiFrameDelivery
+        ));
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// A continuation whose present message-format differs from the first
+    /// transfer is rejected (AMQP 1.0 §2.7.5) and closes the link.
+    #[tokio::test]
+    async fn continuation_with_different_message_format_closes_link() {
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                encoded_binary_prefix(8),
+            ))
+            .await
+            .unwrap();
+
+        let mut different_format = make_incoming_transfer(1, Some(vec![0x01]), false, false);
+        different_format.message_format = Some(1);
+        incoming_tx
+            .send(make_link_frame(
+                different_format,
+                encoded_binary_prefix(8),
+            ))
+            .await
+            .unwrap();
+
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(definitions::AmqpError::NotAllowed),
+        )
+        .await;
+        assert!(matches!(
+            error,
+            RecvError::InconsistentFieldInMultiFrameDelivery
+        ));
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// An aborted transfer matching the buffered delivery discards its chunks
+    /// and its entry in the unsettled map; the link stays usable.
+    #[tokio::test]
+    async fn aborted_transfer_discards_the_buffered_delivery() {
+        let (mut inner, _session_rx, _outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        let aborted_tag = DeliveryTag::from(vec![0x01]);
+
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                encoded_binary_prefix(8),
+            ))
+            .await
+            .unwrap();
+
+        // The sender aborts the delivery (`resume` mirrors `Sender::abort`).
+        let mut abort = make_incoming_transfer(1, Some(vec![0x01]), false, false);
+        abort.resume = true;
+        abort.aborted = true;
+        incoming_tx
+            .send(make_link_frame(abort, Payload::new()))
+            .await
+            .unwrap();
+
+        // The link remains usable: a following ordinary message is delivered.
+        let body = "after abort";
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(2, Some(vec![0x02]), false, false),
+                encoded_message_payload(body),
+            ))
+            .await
+            .unwrap();
+
+        let delivery = inner.recv::<String>().await.expect("ordinary delivery");
+        assert_eq!(delivery.body(), body);
+        assert!(inner.incomplete_transfer.is_none());
+
+        let guard = inner.link.unsettled().read();
+        assert!(guard
+            .as_ref()
+            .is_none_or(|map| !map.contains_key(&aborted_tag)));
+    }
+
+    /// The same as above when the aborting transfer omits the delivery tag:
+    /// the buffered delivery's tag identifies the entry to discard.
+    #[tokio::test]
+    async fn aborted_transfer_with_omitted_tag_discards_the_buffered_delivery() {
+        let (mut inner, _session_rx, _outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        let aborted_tag = DeliveryTag::from(vec![0x01]);
+
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                encoded_binary_prefix(8),
+            ))
+            .await
+            .unwrap();
+
+        let mut abort = make_incoming_transfer(1, None, false, false);
+        abort.resume = true;
+        abort.aborted = true;
+        incoming_tx
+            .send(make_link_frame(abort, Payload::new()))
+            .await
+            .unwrap();
+
+        let body = "after abort";
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(2, Some(vec![0x02]), false, false),
+                encoded_message_payload(body),
+            ))
+            .await
+            .unwrap();
+
+        let delivery = inner.recv::<String>().await.expect("ordinary delivery");
+        assert_eq!(delivery.body(), body);
+        assert!(inner.incomplete_transfer.is_none());
+
+        let guard = inner.link.unsettled().read();
+        assert!(guard
+            .as_ref()
+            .is_none_or(|map| !map.contains_key(&aborted_tag)));
+    }
+
+    /// An aborted transfer with no buffered delivery is ignored.
+    #[tokio::test]
+    async fn aborted_transfer_without_buffer_is_ignored() {
+        let (mut inner, _session_rx, _outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+
+        let mut abort = make_incoming_transfer(1, Some(vec![0x09]), false, false);
+        abort.resume = true;
+        abort.aborted = true;
+        incoming_tx
+            .send(make_link_frame(abort, encoded_binary_prefix(4)))
+            .await
+            .unwrap();
+
+        let body = "after ignored abort";
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(2, Some(vec![0x0A]), false, false),
+                encoded_message_payload(body),
+            ))
+            .await
+            .unwrap();
+
+        let delivery = inner.recv::<String>().await.expect("ordinary delivery");
+        assert_eq!(delivery.body(), body);
+        assert!(inner.incomplete_transfer.is_none());
+    }
+
+    /// An aborted transfer that explicitly names another delivery while one
+    /// is being assembled violates AMQP 1.0 §2.6.14 and closes the link.
+    #[tokio::test]
+    async fn aborted_transfer_with_different_delivery_tag_closes_link() {
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                encoded_binary_prefix(8),
+            ))
+            .await
+            .unwrap();
+
+        let mut abort = make_incoming_transfer(1, Some(vec![0x02]), false, false);
+        abort.resume = true;
+        abort.aborted = true;
+        incoming_tx
+            .send(make_link_frame(abort, Payload::new()))
+            .await
+            .unwrap();
+
+        let error = recv_expecting_fatal_close(
+            &mut inner,
+            &mut outgoing_rx,
+            &incoming_tx,
+            definitions::ErrorCondition::from(definitions::AmqpError::NotAllowed),
+        )
+        .await;
+        assert!(matches!(
+            error,
+            RecvError::InconsistentFieldInMultiFrameDelivery
+        ));
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// AMQP 1.0 §2.6.13: a resumed delivery that is not in the local
+    /// unsettled map is ignored; the link stays usable.
+    #[tokio::test]
+    async fn resumed_delivery_unknown_to_unsettled_map_is_ignored() {
+        let (mut inner, _session_rx, _outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+
+        let ignored_tag = DeliveryTag::from(vec![0x0A]);
+        let mut resumed = make_incoming_transfer(1, Some(vec![0x0A]), false, false);
+        resumed.resume = true;
+        incoming_tx
+            .send(make_link_frame(resumed, encoded_message_payload("ignored")))
+            .await
+            .unwrap();
+
+        // A following ordinary message is delivered; the ignored one is not.
+        let body = "ordinary";
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(2, Some(vec![0x0B]), false, false),
+                encoded_message_payload(body),
+            ))
+            .await
+            .unwrap();
+
+        let delivery = inner.recv::<String>().await.expect("ordinary delivery");
+        assert_eq!(delivery.body(), body);
+
+        let guard = inner.link.unsettled().read();
+        assert!(guard
+            .as_ref()
+            .is_none_or(|map| !map.contains_key(&ignored_tag)));
+    }
+
+    /// A resumed delivery present in the local unsettled map is delivered.
+    #[tokio::test]
+    async fn resumed_delivery_known_to_unsettled_map_is_delivered() {
+        let (mut inner, _session_rx, _outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+
+        seed_unsettled(&inner.link.unsettled, &[vec![0x0A]]);
+
+        let body = "resumed";
+        let mut resumed = make_incoming_transfer(1, Some(vec![0x0A]), false, false);
+        resumed.resume = true;
+        incoming_tx
+            .send(make_link_frame(resumed, encoded_message_payload(body)))
+            .await
+            .unwrap();
+
+        let delivery = inner.recv::<String>().await.expect("resumed delivery");
+        assert_eq!(delivery.body(), body);
+    }
+
+    /// A tagless continuation carrying a `Received` state is attributed to the
+    /// buffered delivery instead of failing with `DeliveryTagIsNone`, and it
+    /// trims the buffer to the reported section and offset.
+    #[tokio::test]
+    async fn tagless_received_state_transfer_trims_the_buffer() {
+        let mut inner = make_receiver_inner(4096);
+        let tag = DeliveryTag::from(vec![0x01]);
+
+        let payload = encoded_sectioned_payload();
+        let full_len = payload.len() as u64;
+        inner
+            .on_incoming_transfer::<String>(
+                make_incoming_transfer(1, Some(vec![0x01]), true, false),
+                payload,
+            )
+            .await
+            .unwrap();
+
+        let mut state_transfer = make_incoming_transfer(1, None, true, false);
+        state_transfer.state = Some(DeliveryState::Received(Received {
+            section_number: 1,
+            section_offset: 0,
+        }));
+        inner
+            .on_incoming_transfer::<String>(state_transfer, Payload::new())
+            .await
+            .expect("a tagless state transfer must be attributed to the buffer");
+
+        // The buffer was trimmed to the reported section.
+        let incomplete = inner
+            .incomplete_transfer
+            .as_ref()
+            .expect("the delivery is still being assembled");
+        assert!(
+            (incomplete.buffer.len() as u64) < full_len,
+            "the Received state must trim the buffer"
+        );
+
+        let guard = inner.link.unsettled().read();
+        let state = guard
+            .as_ref()
+            .and_then(|map| map.get(&tag))
+            .and_then(|entry| entry.remote.clone());
+        assert!(matches!(
+            state,
+            Some(DeliveryState::Received(Received {
+                section_number: 1,
+                ..
+            }))
+        ));
     }
 
     /// The minimal `Attach` a sender peer sends for this receiver link: it

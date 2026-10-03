@@ -102,7 +102,7 @@ impl IncompleteTransfer {
         Ok(())
     }
 
-    /// Append payload after the receiver has checked its materialization bound.
+    /// Append payload once the receive budget has admitted its storage.
     pub fn append(&mut self, other: Payload) -> Result<(), ReceiverTransferError> {
         self.storage.resize(
             self.buffer

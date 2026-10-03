@@ -1604,16 +1604,6 @@ where
                 return Err(self.close_on_message_size_exceeded(total, max_size).await);
             }
         }
-        let retained = self
-            .incomplete_transfer
-            .as_ref()
-            .map_or(0, |p| p.buffer.len());
-        let size = retained
-            .checked_add(payload.len())
-            .ok_or(RecvError::MaterializationBoundExceeded)?;
-        if size > 16 * 1024 * 1024 {
-            return Err(RecvError::MaterializationBoundExceeded);
-        }
         if transfer
             .delivery_tag
             .as_ref()
@@ -3163,6 +3153,39 @@ mod tests {
             .await
             .expect("in-limit delivery must be accepted");
         assert_eq!(delivery.body(), body);
+    }
+
+    /// The negotiated max-message-size and the receive budget bound a message;
+    /// there is no further fixed ceiling, so one larger than 16 MiB arrives.
+    #[tokio::test]
+    async fn a_delivery_within_its_negotiated_size_and_budget_has_no_fixed_ceiling() {
+        let (mut inner, _session_rx, _outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        let body = "x".repeat(17 * 1024 * 1024);
+        let payload = encoded_message_payload(&body);
+        inner.link.max_message_size = payload.len() as u64;
+        inner.receive_budget = super::super::receive_budget::ReceiveBudget::new(payload.len());
+        let third = payload.len() / 3;
+        let parts = [
+            payload.slice(..third),
+            payload.slice(third..2 * third),
+            payload.slice(2 * third..),
+        ];
+        for (index, part) in parts.into_iter().enumerate() {
+            let first = index == 0;
+            incoming_tx
+                .send(make_link_frame(
+                    make_incoming_transfer(1, first.then(|| vec![0x01]), index < 2, false),
+                    part,
+                ))
+                .await
+                .unwrap();
+        }
+        let delivery = inner
+            .recv::<String>()
+            .await
+            .expect("a delivery within its negotiated size is accepted");
+        assert_eq!(delivery.body().len(), body.len());
     }
 
     /// The first transfer of a multi-transfer delivery must carry the

@@ -659,7 +659,7 @@ pub(crate) enum ReceiverTransferError {
     #[error("Illegal local state")]
     IllegalState,
 
-    /// Incoming message data exceeded the native or negotiated materialization bound.
+    /// Incoming message data exceeded the receive budget.
     #[error("Incoming message exceeds its materialization bound")]
     MessageSizeExceeded,
     /// The encoded sections or explicit recovery point are invalid.
@@ -716,7 +716,7 @@ pub enum RecvError {
     #[error("Local error: {:?}", .0)]
     LinkStateError(LinkStateError),
 
-    /// Incoming message data exceeded the native or negotiated materialization bound.
+    /// Incoming message data exceeded the receive budget.
     #[error("Incoming message exceeds its materialization bound")]
     MaterializationBoundExceeded,
     /// The encoded sections or explicit recovery point are invalid.

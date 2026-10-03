@@ -38,7 +38,7 @@ drop. Physical suspension retains only nonclosed endpoints whose parent
 session stopped; queued peer-closing detach remains terminal.
 
 Keep upstream's delivery-scoped negotiated message-size rejection distinct
-from the native materialization budget (`MaterializationBoundExceeded`).
+from the shared receive budget (`MaterializationBoundExceeded`).
 Adapt the upstream test peers to the Runtime receive-window control request
 instead of removing their simultaneous-detach or frame-size assertions.
 
@@ -126,3 +126,13 @@ exercise oversize isolation on a shared session, delayed closing replies,
 explicit detach completion after timeout and Execution-owned retirement. A peer
 that continues using a detached handle can still incur a session protocol error;
 this patch does not promise isolation from arbitrary later errant frames.
+
+## No fixed message ceiling (2026-10-03)
+
+A delivery is bounded by the link's negotiated max-message-size, whose excess
+detaches only that link, and its retained fragments by the shared
+`ReceiveBudget`; the former fixed 16 MiB materialization ceiling is removed, as
+upstream has none. It turned a message between that ceiling and the negotiated
+size into a connection resource failure. `a_delivery_within_its_negotiated_size_and_budget_has_no_fixed_ceiling`
+receives a 17 MiB delivery in three transfers and fails with the ceiling
+restored; 124 transaction-enabled library tests pass on macOS arm64.

@@ -956,6 +956,19 @@ pub(crate) struct ReceiverInner<L: endpoint::ReceiverLink> {
     pub(crate) incomplete_transfer: Option<Box<IncompleteTransfer>>,
     pub(crate) incoming_recovery: super::incoming_recovery::IncomingRecovery,
     pub(crate) receive_budget: Arc<super::receive_budget::ReceiveBudget>,
+
+    /// A close this receiver started itself, recorded before its Detach is
+    /// sent, so a `recv` dropped mid-close resumes it and the peer's answer
+    /// returns its cause.
+    pub(crate) self_close: Option<SelfClose>,
+}
+
+/// A close the receiver started itself: the error its closing Detach
+/// carries, and the error `recv` returns once the peer answers it.
+#[derive(Debug)]
+pub(crate) struct SelfClose {
+    error: definitions::Error,
+    cause: RecvError,
 }
 
 impl<L: endpoint::ReceiverLink> Drop for ReceiverInner<L> {
@@ -1154,38 +1167,22 @@ where
     where
         for<'de> T: FromBody<'de> + Send,
     {
+        // A close this receiver started goes on before anything else is read:
+        // a `recv` dropped mid-close resumes it here.
+        if self.self_close.is_some() {
+            return Err(self.finish_self_close().await);
+        }
         // When the session or the connection stops, the channel closes and this
         // returns `RecvError::LinkStateError(SessionStopped(reason))` with the
         // stop reason observed by the link.
         let frame = match self.incoming.recv().await {
             // cancel safe
             Some(frame) => frame,
-            None => {
-                return Err(match self.link().session_stop_reason().get() {
-                    Some(reason) => {
-                        RecvError::LinkStateError(LinkStateError::SessionStopped(reason.clone()))
-                    }
-                    // defensive: no stop reason recorded; failure is link-local
-                    None => RecvError::LinkStateError(LinkStateError::IllegalState),
-                });
-            }
+            None => return Err(self.stopped()),
         };
 
         match frame {
-            // The relay already sent the reply to this peer detach; the link
-            // records the outcome here. Reported as-is even when the session
-            // is stopping: a stop without a detach shows up as the channel
-            // closing (`None` above).
-            LinkFrame::Detach(detach) => {
-                let closed = detach.closed;
-                self.link
-                    .apply_remote_detach_outcome(detach)
-                    .map_err(Into::into)
-                    .and_then(|_| match closed {
-                        true => Err(LinkStateError::RemoteClosed.into()),
-                        false => Err(LinkStateError::RemoteDetached.into()),
-                    })
-            }
+            LinkFrame::Detach(detach) => Err(self.on_incoming_detach(detach).await),
             LinkFrame::Transfer {
                 input_handle: _,
                 performative,
@@ -1210,9 +1207,103 @@ where
                     "Transactional acquisition is not implemented".to_string(),
                     None,
                 );
-                self.close_with_error(Some(error)).await?; // FIXME: cancel safe? if oneshot chanenl is cancel safe
-                Err(RecvError::TransactionalAcquisitionIsNotImeplemented)
+                Err(self
+                    .close_itself(error, RecvError::TransactionalAcquisitionIsNotImeplemented)
+                    .await)
             }
+        }
+    }
+
+    /// The one place a Detach the link receives is told apart. One that
+    /// arrives while this receiver's own closing Detach is out answers it:
+    /// the close completes and the recorded cause is returned. Any other is
+    /// a Detach the peer sent on its own, which the relay already answered;
+    /// the link records the outcome here. Reported as-is even when the
+    /// session is stopping: a stop without a detach shows up as the channel
+    /// closing.
+    async fn on_incoming_detach(&mut self, detach: Detach) -> RecvError {
+        use super::state::LinkState;
+        if let Some(close) = self.self_close.take() {
+            if matches!(self.link.local_state(), LinkState::CloseSent) {
+                let completed = if detach.closed {
+                    self.link.on_detach_reply(detach)
+                } else {
+                    // The peer suspended while we closed: reattach and close
+                    // (AMQP 1.0 §2.6.6). The close completes.
+                    let _ = self.link.apply_remote_detach_outcome(detach);
+                    super::shared_inner::reattach_then_close(self).await
+                };
+                return match completed {
+                    Err(DetachError::SessionStopped(reason)) => {
+                        LinkStateError::SessionStopped(reason).into()
+                    }
+                    _ => close.cause,
+                };
+            }
+            // Its Detach never went out: the peer ended the link first.
+        }
+        let closed = detach.closed;
+        match self.link.apply_remote_detach_outcome(detach) {
+            Err(error) => error.into(),
+            Ok(()) if closed => LinkStateError::RemoteClosed.into(),
+            Ok(()) => LinkStateError::RemoteDetached.into(),
+        }
+    }
+
+    /// Closes the link because of `cause`, sending `error` in its closing
+    /// Detach. The cause is recorded before the Detach is sent, so a `recv`
+    /// dropped at any point resumes the close and returns the cause.
+    async fn close_itself(&mut self, error: definitions::Error, cause: RecvError) -> RecvError {
+        self.self_close = Some(SelfClose { error, cause });
+        self.finish_self_close().await
+    }
+
+    /// Sends the closing Detach if it is not out yet, then reads the link's
+    /// frames until the one Detach that ends the close. Frames of the closing
+    /// link are superseded by it.
+    ///
+    /// # Cancel safety
+    ///
+    /// Cancel safe: the close is recorded in `self_close` and the link state,
+    /// and every `.await` is on a `tokio::sync::mpsc` channel.
+    async fn finish_self_close(&mut self) -> RecvError {
+        use super::state::LinkState;
+        loop {
+            let Some(close) = &self.self_close else {
+                return LinkStateError::IllegalState.into();
+            };
+            if matches!(
+                self.link.local_state(),
+                LinkState::Unattached
+                    | LinkState::AttachSent
+                    | LinkState::IncompleteAttachSent
+                    | LinkState::IncompleteAttachReceived
+                    | LinkState::IncompleteAttachExchanged
+                    | LinkState::AttachReceived
+                    | LinkState::Attached
+            ) {
+                let error = close.error.clone();
+                if let Err(error) = self.send_detach(true, Some(error)).await {
+                    self.self_close = None;
+                    return error.into();
+                }
+            }
+            match self.incoming.recv().await {
+                Some(LinkFrame::Detach(detach)) => return self.on_incoming_detach(detach).await,
+                Some(_) => continue,
+                None => return self.stopped(),
+            }
+        }
+    }
+
+    /// Why the link's channel closed: its session or connection stopped.
+    fn stopped(&self) -> RecvError {
+        match self.link().session_stop_reason().get() {
+            Some(reason) => {
+                RecvError::LinkStateError(LinkStateError::SessionStopped(reason.clone()))
+            }
+            // defensive: no stop reason recorded; failure is link-local
+            None => RecvError::LinkStateError(LinkStateError::IllegalState),
         }
     }
 
@@ -1228,8 +1319,7 @@ where
             Some(error.to_string()),
             None,
         );
-        self.close_with_error(Some(detach_error)).await?;
-        Err(error.into())
+        Err(self.close_itself(detach_error, error.into()).await)
     }
 
     async fn on_transfer_state(
@@ -1352,13 +1442,11 @@ where
             )),
             None,
         );
-        match self.close_with_error(Some(error)).await {
-            Ok(()) => RecvError::MessageSizeExceeded(MessageSizeExceeded {
-                size: total_size,
-                max_size,
-            }),
-            Err(detach_error) => detach_error.into(),
-        }
+        let cause = RecvError::MessageSizeExceeded(MessageSizeExceeded {
+            size: total_size,
+            max_size,
+        });
+        self.close_itself(error, cause).await
     }
 
     /// # Cancel safety
@@ -2326,6 +2414,7 @@ mod tests {
                 outgoing: outgoing.into(),
                 incoming: frames,
                 incomplete_transfer: None,
+                self_close: None,
                 incoming_recovery: Default::default(),
                 receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
             },
@@ -2480,6 +2569,7 @@ mod tests {
             outgoing: outgoing.into(),
             incoming,
             incomplete_transfer: None,
+            self_close: None,
             incoming_recovery: Default::default(),
             receive_budget: budget.clone(),
         };
@@ -2557,6 +2647,7 @@ mod tests {
                 outgoing: outgoing.into(),
                 incoming,
                 incomplete_transfer: None,
+                self_close: None,
                 incoming_recovery: Default::default(),
                 receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
             },
@@ -2891,6 +2982,7 @@ mod tests {
             outgoing: outgoing_tx.into(),
             incoming: incoming_rx,
             incomplete_transfer: None,
+            self_close: None,
             incoming_recovery: Default::default(),
             receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
         };
@@ -3070,6 +3162,159 @@ mod tests {
         assert_message_size_exceeded(error, 120, 100);
         assert!(inner.incomplete_transfer.is_none());
         assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// Drop `recv()` once it has sent its own closing Detach, as a
+    /// `tokio::select!` that another branch wins does, and check what it sent.
+    async fn drop_recv_after_closing_detach(
+        inner: &mut ReceiverInner<ReceiverLink<Target>>,
+        outgoing_rx: &mut mpsc::Receiver<LinkFrame>,
+        expected_condition: definitions::ErrorCondition,
+    ) {
+        tokio::select! {
+            biased;
+            result = inner.recv::<String>() => panic!("recv ended before the answer: {result:?}"),
+            frame = outgoing_rx.recv() => match frame {
+                Some(LinkFrame::Detach(detach)) => {
+                    assert!(detach.closed);
+                    assert_eq!(detach.error.unwrap().condition, expected_condition);
+                }
+                other => panic!("expected the closing Detach, got {other:?}"),
+            },
+        }
+        assert!(matches!(inner.link.local_state, LinkState::CloseSent));
+        assert!(inner.self_close.is_some());
+    }
+
+    /// The peer's answer to a closing Detach.
+    async fn answer_close(incoming_tx: &mpsc::Sender<LinkFrame>) {
+        incoming_tx
+            .send(LinkFrame::Detach(Detach {
+                handle: Handle(0),
+                closed: true,
+                error: None,
+            }))
+            .await
+            .unwrap();
+    }
+
+    /// `recv()` is cancel-safe through the close it starts itself: dropped
+    /// once its closing Detach is out, the next `recv()` takes the peer's
+    /// answer as the answer, completes the close and returns the cause, not
+    /// a Detach the peer sent on its own.
+    #[tokio::test]
+    async fn oversized_delivery_close_resumes_after_recv_is_dropped_mid_close() {
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        inner.link.max_message_size = 100;
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), false, false),
+                Payload::from(vec![0u8; 120]),
+            ))
+            .await
+            .unwrap();
+        drop_recv_after_closing_detach(
+            &mut inner,
+            &mut outgoing_rx,
+            definitions::ErrorCondition::from(LinkError::MessageSizeExceeded),
+        )
+        .await;
+        answer_close(&incoming_tx).await;
+        let error = inner.recv::<String>().await.unwrap_err();
+        assert_message_size_exceeded(error, 120, 100);
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+        assert!(inner.self_close.is_none());
+        assert!(outgoing_rx.try_recv().is_err(), "the close is not repeated");
+    }
+
+    /// Dropped before its closing Detach could be queued, `recv()` resumes
+    /// by sending it, then completes the close with the recorded cause.
+    #[tokio::test]
+    async fn oversized_delivery_close_resumes_after_recv_is_dropped_before_its_detach_is_sent() {
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        inner.link.max_message_size = 100;
+        // Fill the outgoing queue so the closing Detach cannot be queued yet.
+        let mut queued = 0;
+        while inner
+            .outgoing
+            .try_send(LinkFrame::Detach(Detach {
+                handle: Handle(9),
+                closed: false,
+                error: None,
+            }))
+            .is_ok()
+        {
+            queued += 1;
+        }
+        incoming_tx
+            .send(make_link_frame(
+                make_incoming_transfer(1, Some(vec![0x01]), false, false),
+                Payload::from(vec![0u8; 120]),
+            ))
+            .await
+            .unwrap();
+        tokio::select! {
+            biased;
+            result = inner.recv::<String>() => panic!("recv ended before its Detach was queued: {result:?}"),
+            () = std::future::ready(()) => {}
+        }
+        assert!(matches!(inner.link.local_state, LinkState::Attached));
+        assert!(inner.self_close.is_some());
+        for _ in 0..queued {
+            outgoing_rx.recv().await.unwrap();
+        }
+        drop_recv_after_closing_detach(
+            &mut inner,
+            &mut outgoing_rx,
+            definitions::ErrorCondition::from(LinkError::MessageSizeExceeded),
+        )
+        .await;
+        answer_close(&incoming_tx).await;
+        assert_message_size_exceeded(inner.recv::<String>().await.unwrap_err(), 120, 100);
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// The close a malformed delivery starts resumes the same way and
+    /// returns the malformation.
+    #[tokio::test]
+    async fn malformed_delivery_close_resumes_after_recv_is_dropped_mid_close() {
+        let (mut inner, _session_rx, mut outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        let mut missing_id = make_incoming_transfer(1, Some(vec![0x01]), true, false);
+        missing_id.delivery_id = None;
+        incoming_tx
+            .send(make_link_frame(missing_id, encoded_binary_prefix(8)))
+            .await
+            .unwrap();
+        drop_recv_after_closing_detach(
+            &mut inner,
+            &mut outgoing_rx,
+            definitions::ErrorCondition::from(definitions::AmqpError::NotAllowed),
+        )
+        .await;
+        answer_close(&incoming_tx).await;
+        let error = inner.recv::<String>().await.unwrap_err();
+        assert!(matches!(error, RecvError::DeliveryIdIsNone), "{error:?}");
+        assert!(matches!(inner.link.local_state, LinkState::Closed));
+    }
+
+    /// A Detach the peer sends on its own while no close of the link's own
+    /// is out stays the peer's.
+    #[tokio::test]
+    async fn a_detach_the_peer_sends_on_its_own_is_reported_as_the_peers() {
+        let (mut inner, _session_rx, _outgoing_rx, incoming_tx) =
+            make_receiver_inner_with_channels(4096);
+        answer_close(&incoming_tx).await;
+        let error = inner.recv::<String>().await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RecvError::LinkStateError(LinkStateError::RemoteClosed)
+            ),
+            "{error:?}"
+        );
     }
 
     /// A delivery spanning three or more frames must detach the link as soon

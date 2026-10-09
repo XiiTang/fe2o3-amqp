@@ -726,6 +726,7 @@ where
             outgoing,
             incoming: incoming_rx,
             incomplete_transfer: None,
+            self_close: None,
             incoming_recovery: Default::default(),
             receive_budget: crate::link::receive_budget::ReceiveBudget::new(32 * 1024 * 1024),
         };

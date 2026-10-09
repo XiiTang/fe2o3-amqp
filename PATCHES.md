@@ -136,3 +136,35 @@ upstream has none. It turned a message between that ceiling and the negotiated
 size into a connection resource failure. `a_delivery_within_its_negotiated_size_and_budget_has_no_fixed_ceiling`
 receives a 17 MiB delivery in three transfers and fails with the ceiling
 restored; 124 transaction-enabled library tests pass on macOS arm64.
+
+## A receiver's own close survives a dropped `recv` (2026-10-10)
+
+`Receiver::recv` documents itself as cancel-safe (#22), but the closes it starts
+itself — an oversized delivery (#400), a malformed delivery, the transactional
+acquisition refusal, which carried a `FIXME: cancel safe?` — awaited the peer's
+answering Detach inside `recv`. A caller whose `tokio::select!` dropped `recv`
+after the closing Detach went out lost the cause: the next `recv` read the
+peer's answer in `recv_inner` as a Detach the peer sent on its own and returned
+`LinkStateError::RemoteClosed`. Against upstream `main` 682af8e2 a test that
+drops the first `recv` after its closing Detach and answers it gets
+`RemoteClosed` from the second `recv` instead of `MessageSizeExceeded`.
+Boundless's AMQP 1.0 receiver actor selects over `recv` this way and so
+reported an oversized delivery as the peer closing the link.
+
+The receiver now records the close — the error its Detach carries and the
+error `recv` returns — in `self_close` before sending the Detach, and every
+self-close goes through `close_itself`. `on_incoming_detach` is the one place
+a Detach the link receives is told apart: one arriving while its own close is
+CloseSent completes the close (a non-closing answer reattaches and closes, AMQP
+1.0 §2.6.6) and returns the recorded cause; any other stays the peer's.
+`recv_inner` resumes a recorded close before reading anything else, sending
+the Detach first if a dropped `recv` never queued it.
+
+`oversized_delivery_close_resumes_after_recv_is_dropped_mid_close`,
+`..._before_its_detach_is_sent`, `malformed_delivery_close_resumes_after_recv_is_dropped_mid_close`
+and `a_detach_the_peer_sends_on_its_own_is_reported_as_the_peers` cover it;
+the first is the upstream reproduction's scenario. 125 transaction-enabled,
+121 default and 128 transaction+acceptor library tests and the
+`large_message_split`, `relay_remote_detach`, `clean_teardown` and
+`link_stop_reason` integration tests pass on macOS arm64. Upstream issue: to be
+filed against minghuaw/fe2o3-amqp with the reproduction above.

@@ -288,7 +288,7 @@ where
 /// # Cancel safety
 ///
 /// This is cancel safe if oneshot channel is cancel safe
-async fn reattach_then_close<T>(link_inner: &mut T) -> Result<(), DetachError>
+pub(super) async fn reattach_then_close<T>(link_inner: &mut T) -> Result<(), DetachError>
 where
     T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
     T::Link: LinkDetach<DetachError = DetachError>,

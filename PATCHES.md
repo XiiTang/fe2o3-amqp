@@ -2,9 +2,9 @@
 
 ## Maintenance
 
-This fork's `main` is the maintained Runtime integration line. Track the
-original project through the read-only `upstream` remote, integrate selected
-upstream changes here, and pin consumers to a tested full commit SHA.
+This fork's `boundless` branch carries the Runtime integration patches; `main`
+mirrors upstream. Work on a short-lived branch from `boundless`, validate it,
+then fast-forward `boundless` and pin consumers to a tested full commit SHA.
 Do not replace upstream history or float production dependencies on a branch.
 
 The integration consolidates the 12 Runtime commits ending at
@@ -168,3 +168,21 @@ the first is the upstream reproduction's scenario. 125 transaction-enabled,
 `large_message_split`, `relay_remote_detach`, `clean_teardown` and
 `link_stop_reason` integration tests pass on macOS arm64. Upstream issue: to be
 filed against minghuaw/fe2o3-amqp with the reproduction above.
+
+
+## Detach state follows session queue admission (2026-10-15)
+
+`Link::send_detach` is the shared check point for sender/receiver detach and
+close. Return its enqueue error before advancing link state, publishing dispatch
+or consuming the output handle, as `send_attach_inner` already does. Preserve
+the recorded session-stop cause. A queued non-closing Detach retains its handle;
+a queued closing Detach consumes it. Neither can be committed a second time.
+
+`rejected_detach_preserves_state_handle_and_session_stop_reason` fails at the
+preceding pin and passes here. It covers both closing modes, with and without a
+recorded session-stop cause. `accepted_detach_commits_one_frame_and_one_state_transition`
+checks the accepted frame, dispatch flag, handle ownership and repeated-send
+refusal. `cargo +1.97.0 test -p fe2o3-amqp --lib --locked --features
+transaction,acceptor link::` passes all 97 matching tests on macOS arm64. The
+ignored local test lock resolves tokio-util 0.7.19, matching Boundless's lock;
+unconstrained 0.7.20 has an unrelated transport Sink inference failure.

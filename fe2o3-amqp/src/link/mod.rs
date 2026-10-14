@@ -449,7 +449,7 @@ where
         closed: bool,
         error: Option<definitions::Error>,
     ) -> Result<(), Self::DetachError> {
-        // Preserve the attached state if queuing is cancelled before dispatch.
+        // Preserve the attached state if queuing is cancelled or refused before dispatch.
         let next_state = match (&self.local_state, closed) {
             (LinkState::Attached, false) => LinkState::DetachSent,
             (LinkState::Attached, true) => LinkState::CloseSent,
@@ -470,26 +470,24 @@ where
                 log::debug!("Sending detach: {:?}", detach);
 
                 // An error here means the session is already closed, so we can't send a detach
-                let result = writer
+                writer
                     .send(LinkFrame::Detach(detach))
                     .await // cancel safe
                     .map_err(|_| match self.session_stop_reason.get() {
                         Some(reason) => DetachError::SessionStopped(reason.clone()),
                         None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                    });
+                    })?;
 
                 self.local_state = next_state;
-                if result.is_ok() {
-                    if let Some(flag) = &self.operation_dispatch {
-                        flag.store(true, std::sync::atomic::Ordering::Release);
-                    }
+                if let Some(flag) = &self.operation_dispatch {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
                 }
                 // Retain the identity while a non-closing Detach is in flight:
                 // preceding Transfer frames still belong to this endpoint.
                 if !matches!(self.local_state, LinkState::DetachSent) {
                     self.output_handle.take();
                 }
-                result
+                Ok(())
             }
             None => Err(DetachError::IllegalState),
         }
@@ -1255,6 +1253,104 @@ mod incoming_identity_tests {
                 map.read().as_ref().is_some_and(|m| m.contains_key(&tag)),
                 !settled
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod detach_admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn attached_link() -> ReceiverLink<fe2o3_amqp_types::messaging::Target> {
+        let flow = Arc::new(LinkFlowState::receiver(state::LinkFlowStateInner {
+            initial_delivery_count: 0,
+            delivery_count: 0,
+            link_credit: 1,
+            available: 0,
+            drain: false,
+            properties: None,
+        }));
+        let mut link = Receiver::builder()
+            .name("detach-admission")
+            .source("source")
+            .target("target")
+            .create_link(
+                Arc::new(unsettled_store::Store::new(None)),
+                OutputHandle(7),
+                flow,
+                Arc::new(OnceLock::new()),
+                65532,
+            );
+        link.local_state = LinkState::Attached;
+        link.operation_dispatch = Some(Arc::new(AtomicBool::new(false)));
+        link
+    }
+
+    #[tokio::test]
+    async fn rejected_detach_preserves_state_handle_and_session_stop_reason() {
+        for closed in [false, true] {
+            for stopped in [false, true] {
+                let mut link = attached_link();
+                if stopped {
+                    link.session_stop_reason
+                        .set(SessionStopReason::RemoteEnded)
+                        .unwrap();
+                }
+                let (writer, receiver) = crate::session::transfer_queue::channel(1);
+                drop(receiver);
+                let error = link.send_detach(&writer, closed, None).await.unwrap_err();
+                if stopped {
+                    assert!(matches!(
+                        error,
+                        DetachError::SessionStopped(SessionStopReason::RemoteEnded)
+                    ));
+                } else {
+                    assert!(matches!(error, DetachError::IllegalState));
+                }
+                assert!(matches!(link.local_state, LinkState::Attached));
+                assert_eq!(link.output_handle.as_ref().unwrap().0, 7);
+                assert!(!link
+                    .operation_dispatch
+                    .as_ref()
+                    .unwrap()
+                    .load(Ordering::Acquire));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn accepted_detach_commits_one_frame_and_one_state_transition() {
+        for closed in [false, true] {
+            let mut link = attached_link();
+            let (writer, mut receiver) = crate::session::transfer_queue::channel(2);
+            link.send_detach(&writer, closed, None).await.unwrap();
+            if closed {
+                assert!(matches!(link.local_state, LinkState::CloseSent));
+                assert!(link.output_handle.is_none());
+            } else {
+                assert!(matches!(link.local_state, LinkState::DetachSent));
+                assert_eq!(link.output_handle.as_ref().unwrap().0, 7);
+            }
+            assert!(link
+                .operation_dispatch
+                .as_ref()
+                .unwrap()
+                .load(Ordering::Acquire));
+            let LinkFrame::Detach(detach) = receiver.try_recv().unwrap() else {
+                panic!("expected Detach");
+            };
+            assert_eq!(detach.handle, 7u32.into());
+            assert_eq!(detach.closed, closed);
+            assert!(matches!(
+                link.send_detach(&writer, closed, None).await,
+                Err(DetachError::IllegalState)
+            ));
+            assert!(matches!(
+                receiver.try_recv(),
+                Err(mpsc::error::TryRecvError::Empty)
+            ));
+            assert_eq!(link.output_handle.is_none(), closed);
         }
     }
 }

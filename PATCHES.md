@@ -170,7 +170,7 @@ the first is the upstream reproduction's scenario. 125 transaction-enabled,
 filed against minghuaw/fe2o3-amqp with the reproduction above.
 
 
-## Detach state follows session queue admission (2026-10-15)
+## Detach and End state follow queue admission (2026-10-15)
 
 `Link::send_detach` is the shared check point for sender/receiver detach and
 close. Return its enqueue error before advancing link state, publishing dispatch
@@ -186,3 +186,12 @@ refusal. `cargo +1.97.0 test -p fe2o3-amqp --lib --locked --features
 transaction,acceptor link::` passes all 97 matching tests on macOS arm64. The
 ignored local test lock resolves tokio-util 0.7.19, matching Boundless's lock;
 unconstrained 0.7.20 has an unrelated transport Sink inference failure.
+
+`Session::send_end` broke the same rule: it set EndSent, Discarding or Unmapped
+before sending End, so a refused End left the session claiming it had sent one.
+It now computes the next state, returns the connection-stop error if the End is
+not queued, and only then advances. Every session, acceptor and transaction End
+delegates to it. `rejected_end_keeps_its_state_and_accepted_end_commits_once`
+fails without the change and passes here, for Mapped with and without an error
+and for EndReceived. `cargo +1.97.0 test -p fe2o3-amqp --lib --locked --features
+transaction,acceptor` passes on macOS arm64.

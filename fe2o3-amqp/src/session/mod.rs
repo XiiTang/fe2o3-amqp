@@ -1101,14 +1101,15 @@ impl endpoint::Session for Session {
         writer: &mpsc::Sender<SessionFrame>,
         error: Option<definitions::Error>,
     ) -> Result<(), Self::EndError> {
-        match self.local_state {
+        // The state advances only once the connection has accepted the End.
+        let next_state = match self.local_state {
             SessionState::Mapped => match error.is_some() {
-                true => self.local_state = SessionState::Discarding,
-                false => self.local_state = SessionState::EndSent,
+                true => SessionState::Discarding,
+                false => SessionState::EndSent,
             },
-            SessionState::EndReceived => self.local_state = SessionState::Unmapped,
+            SessionState::EndReceived => SessionState::Unmapped,
             _ => return Err(SessionStateError::IllegalState),
-        }
+        };
 
         let frame = SessionFrame::new(self.outgoing_channel, SessionFrameBody::End(End { error }));
         writer
@@ -1121,6 +1122,7 @@ impl endpoint::Session for Session {
                     &self.connection_stop_reason,
                 ))
             })?;
+        self.local_state = next_state;
         Ok(())
     }
 
@@ -1570,6 +1572,45 @@ mod tests {
         // due immediately after.
         assert_eq!(session.need_flow_count, 0);
         assert!(session.maybe_outgoing_session_flow().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejected_end_keeps_its_state_and_accepted_end_commits_once() {
+        use crate::endpoint::Session as _;
+        use std::mem::discriminant;
+        use tokio::sync::mpsc;
+        for (state, error, accepted) in [
+            (SessionState::Mapped, false, SessionState::EndSent),
+            (SessionState::Mapped, true, SessionState::Discarding),
+            (SessionState::EndReceived, false, SessionState::Unmapped),
+        ] {
+            let error = error.then(|| {
+                fe2o3_amqp_types::definitions::Error::new(
+                    fe2o3_amqp_types::definitions::AmqpError::InternalError,
+                    None,
+                    None,
+                )
+            });
+            let mut session = mapped_session();
+            session.local_state = state.clone();
+            let (writer, receiver) = mpsc::channel(1);
+            drop(receiver);
+            assert!(matches!(
+                session.send_end(&writer, error.clone()).await,
+                Err(super::SessionStateError::ConnectionStopped(_))
+            ));
+            assert_eq!(discriminant(&session.local_state), discriminant(&state));
+
+            let (writer, mut receiver) = mpsc::channel(2);
+            session.send_end(&writer, error).await.unwrap();
+            assert_eq!(discriminant(&session.local_state), discriminant(&accepted));
+            assert!(matches!(
+                receiver.try_recv().unwrap().body,
+                SessionFrameBody::End(_)
+            ));
+            assert!(session.send_end(&writer, None).await.is_err());
+            assert!(receiver.try_recv().is_err());
+        }
     }
 
     #[test]

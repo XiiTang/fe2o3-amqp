@@ -149,6 +149,10 @@ impl From<LinkRelayError> for SessionInnerError {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The session engine task failed before publishing its natural end.
+    #[error(transparent)]
+    JoinError(#[from] tokio::task::JoinError),
+
     /// The peer sent invalid or duplicate transfer identity fields.
     #[error("Invalid or duplicate transfer identity")]
     InvalidTransfer,

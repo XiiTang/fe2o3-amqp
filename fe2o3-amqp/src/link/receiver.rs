@@ -2292,7 +2292,6 @@ mod tests {
     use crate::link::state::{LinkFlowState, LinkFlowStateInner, LinkState};
     use crate::util::Sealed;
     use fe2o3_amqp_types::{definitions::SenderSettleMode, messaging::Received};
-    use tokio::sync::oneshot;
 
     fn make_flow_state(link_credit: u32) -> ReceiverFlowState {
         Arc::new(LinkFlowState::receiver(LinkFlowStateInner {
@@ -2478,7 +2477,7 @@ mod tests {
         );
         let (control, _controls) = mpsc::channel(8);
         let (outgoing, mut next_sent) = mpsc::channel(8);
-        let (_outcome, outcome) = tokio::sync::oneshot::channel();
+        let (_outcome, outcome) = crate::util::engine_outcome::EngineOutcome::channel();
         let mut next_session = SessionHandle {
             is_ended: true,
             engine_joined: false,
@@ -3893,7 +3892,7 @@ mod tests {
     fn make_session_handle(max_frame_size: usize) -> SessionHandle<()> {
         let (control, _control_rx) = mpsc::channel::<SessionControl>(16);
         let (outgoing_tx, _outgoing_rx) = mpsc::channel::<LinkFrame>(16);
-        let (outcome_tx, outcome) = oneshot::channel::<Result<(), crate::session::error::Error>>();
+        let (outcome_tx, outcome) = crate::util::engine_outcome::EngineOutcome::channel();
         drop(outcome_tx);
         SessionHandle {
             is_ended: false,

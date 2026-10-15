@@ -249,7 +249,7 @@ mod tests {
     use std::sync::{Arc, OnceLock};
 
     use fe2o3_amqp_types::performatives::Attach;
-    use tokio::sync::{mpsc, oneshot};
+    use tokio::sync::mpsc;
 
     use super::{
         AcceptorAttachError, LinkAcceptor, ListenerSessionHandle, SessionHandle, SessionStopReason,
@@ -265,7 +265,7 @@ mod tests {
         let (_, link_listener) = mpsc::channel::<Attach>(16);
         let (control, _) = mpsc::channel::<SessionControl>(16);
         let (outgoing, _) = crate::session::transfer_queue::channel(16);
-        let (outcome_tx, outcome) = oneshot::channel::<Result<(), Error>>();
+        let (outcome_tx, outcome) = crate::util::engine_outcome::EngineOutcome::<Error>::channel();
         drop(outcome_tx);
         let stop_reason_cell = Arc::new(OnceLock::new());
         if let Some(reason) = session_stop_reason {

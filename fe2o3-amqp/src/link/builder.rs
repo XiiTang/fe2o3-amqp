@@ -805,7 +805,7 @@ mod suspension_tests {
                     .await
                     .unwrap();
             }
-            let (_outcome, outcome) = tokio::sync::oneshot::channel();
+            let (_outcome, outcome) = crate::util::engine_outcome::EngineOutcome::channel();
             let mut next_session = SessionHandle {
                 is_ended: true,
                 engine_joined: false,

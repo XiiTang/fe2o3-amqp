@@ -1,13 +1,13 @@
+use crate::util::engine_outcome::{EngineOutcome, EngineOutcomeSender};
 use std::sync::{Arc, OnceLock};
+#[cfg(test)]
+use tokio::sync::oneshot;
 
 use fe2o3_amqp_types::{
     definitions::{self, AmqpError, SessionError},
     performatives::End,
 };
-use tokio::{
-    sync::{mpsc, oneshot},
-    task::JoinHandle,
-};
+use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
     connection::{self, ConnectionStopReason},
@@ -128,8 +128,8 @@ cfg_not_wasm32! {
         AllocLinkError: From<S::AllocError>,
         SessionInnerError: From<S::Error> + From<S::BeginError> + From<S::EndError>,
     {
-        pub fn spawn(self) -> (JoinHandle<()>, oneshot::Receiver<Result<(), Error>>) {
-            let (tx, rx) = oneshot::channel();
+        pub fn spawn(self) -> (JoinHandle<()>, EngineOutcome<Error>) {
+            let (tx, rx) = EngineOutcome::channel();
             let handle = tokio::spawn(self.event_loop(tx));
             (handle, rx)
         }
@@ -143,14 +143,14 @@ cfg_wasm32! {
         AllocLinkError: From<S::AllocError>,
         SessionInnerError: From<S::Error> + From<S::BeginError> + From<S::EndError>,
     {
-        pub fn spawn_local(self) -> (JoinHandle<()>, oneshot::Receiver<Result<(), Error>>) {
-            let (tx, rx) = oneshot::channel();
+        pub fn spawn_local(self) -> (JoinHandle<()>, EngineOutcome<Error>) {
+            let (tx, rx) = EngineOutcome::channel();
             let handle = tokio::task::spawn_local(self.event_loop(tx));
             (handle, rx)
         }
 
-        pub fn spawn_on_local_set(self, local_set: &tokio::task::LocalSet) -> (JoinHandle<()>, oneshot::Receiver<Result<(), Error>>) {
-            let (tx, rx) = oneshot::channel();
+        pub fn spawn_on_local_set(self, local_set: &tokio::task::LocalSet) -> (JoinHandle<()>, EngineOutcome<Error>) {
+            let (tx, rx) = EngineOutcome::channel();
             let handle = local_set.spawn_local(self.event_loop(tx));
             (handle, rx)
         }
@@ -615,7 +615,7 @@ where
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "Session::event_loop", skip(self), fields(outgoing_channel = %self.session.outgoing_channel().0)))]
-    async fn event_loop(mut self, tx: oneshot::Sender<Result<(), Error>>) {
+    async fn event_loop(mut self, tx: EngineOutcomeSender<Error>) {
         let mut outcome = Ok(());
         let receive_window = self.session.receive_window().clone();
         loop {
@@ -748,7 +748,6 @@ where
             Err(SessionInnerError::RemoteEnded) => SessionStopReason::RemoteEnded,
             _ => SessionStopReason::Ended,
         };
-        self.session.set_session_stop_reason(session_stop_reason);
         let _ =
             connection::deallocate_session(&mut self.conn_control, self.session.outgoing_channel())
                 .await;
@@ -759,7 +758,9 @@ where
             Err(SessionInnerError::ConnectionStopped(_)) => Ok(()),
             other => other.map_err(Into::into),
         };
-        let _ = tx.send(result);
+        tx.complete(result, || {
+            self.session.set_session_stop_reason(session_stop_reason)
+        });
     }
 }
 

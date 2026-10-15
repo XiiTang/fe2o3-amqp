@@ -93,7 +93,7 @@ pub struct ConnectionHandle<R> {
     pub(crate) engine_joined: bool,
     pub(crate) control: Sender<ConnectionControl>,
     pub(crate) handle: JoinHandle<()>,
-    pub(crate) outcome: oneshot::Receiver<Result<(), Error>>,
+    pub(crate) outcome: crate::util::engine_outcome::EngineOutcome<Error>,
 
     // outgoing channel for session
     pub(crate) outgoing: Sender<SessionFrame>,
@@ -136,22 +136,18 @@ impl<R> Drop for ConnectionHandle<R> {
 
 impl<R> ConnectionHandle<R> {
     /// Stop the local engine and join its task, without sending protocol cleanup.
-    /// The owner must separately stop its transport/children. Repeated calls are safe.
-    pub async fn stop_and_join(&mut self) -> Result<(), tokio::task::JoinError> {
+    /// Returns a natural protocol end that won before the stop, or the task failure.
+    /// An owner-requested stop returns `Ok`. Repeated calls after observation return `Ok`.
+    /// The owner must separately stop its transport/children.
+    pub async fn stop_and_join(&mut self) -> Result<(), Error> {
         self.is_closed = true;
-        let _ = self
-            .connection_stop_reason
-            .set(ConnectionStopReason::Stopped);
-        if self.engine_joined {
-            return Ok(());
-        }
-        self.handle.abort();
-        let result = (&mut self.handle).await;
-        self.engine_joined = true;
-        match result {
-            Err(error) if error.is_cancelled() => Ok(()),
-            other => other,
-        }
+        self.outcome
+            .stop_and_join(&mut self.handle, &mut self.engine_joined, || {
+                let _ = self
+                    .connection_stop_reason
+                    .set(ConnectionStopReason::Stopped);
+            })
+            .await
     }
 
     /// Checks if the underlying event loop has stopped
@@ -252,7 +248,7 @@ impl<R> ConnectionHandle<R> {
         if self.is_closed {
             return Err(Error::IllegalState);
         }
-        match (&mut self.outcome).await {
+        match self.outcome.recv().await {
             Ok(res) => {
                 self.is_closed = true;
                 res
@@ -959,11 +955,104 @@ mod local_stop_tests {
         }
     }
     #[tokio::test]
+    async fn stop_returns_the_published_natural_protocol_result() {
+        let (published, ready) = tokio::sync::oneshot::channel();
+        let (outcome_tx, outcome) = crate::util::engine_outcome::EngineOutcome::channel();
+        let task = tokio::spawn(async move {
+            outcome_tx.complete(Err(Error::RemoteClosed), || {});
+            published.send(()).unwrap();
+        });
+        ready.await.unwrap();
+        let (control, _commands) = tokio::sync::mpsc::channel(1);
+        let (outgoing, _outgoing_rx) = tokio::sync::mpsc::channel(1);
+        let mut owner = ConnectionHandle {
+            is_closed: false,
+            engine_joined: false,
+            handle: task,
+            outcome,
+            control,
+            outgoing,
+            connection_stop_reason: Arc::new(OnceLock::new()),
+            session_listener: (),
+            max_frame_size: 65532,
+        };
+        let end = owner.stop_and_join().await;
+        assert_eq!(
+            end.err().map(|e| e.to_string()),
+            Some(Error::RemoteClosed.to_string())
+        );
+        owner.stop_and_join().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn natural_end_after_the_first_probe_before_abort_is_returned() {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let engine_barrier = barrier.clone();
+        let (outcome_tx, mut outcome) = crate::util::engine_outcome::EngineOutcome::channel();
+        let task = tokio::spawn(async move {
+            engine_barrier.wait();
+            outcome_tx.complete(Err(Error::RemoteClosed), || {});
+            engine_barrier.wait();
+        });
+        outcome.before_stop = Some(Box::new(move || {
+            barrier.wait();
+            barrier.wait();
+        }));
+        let (control, _commands) = tokio::sync::mpsc::channel(1);
+        let (outgoing, _outgoing_rx) = tokio::sync::mpsc::channel(1);
+        let mut owner = ConnectionHandle {
+            is_closed: false,
+            engine_joined: false,
+            handle: task,
+            outcome,
+            control,
+            outgoing,
+            connection_stop_reason: Arc::new(OnceLock::new()),
+            session_listener: (),
+            max_frame_size: 65532,
+        };
+        assert!(matches!(
+            owner.stop_and_join().await,
+            Err(Error::RemoteClosed)
+        ));
+        owner.stop_and_join().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_returns_a_real_task_panic_without_a_natural_result() {
+        let (outcome_tx, outcome) = crate::util::engine_outcome::EngineOutcome::channel();
+        let (panicking, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _sender = outcome_tx;
+            panicking.send(()).unwrap();
+            panic!("engine task panic");
+        });
+        ready.await.unwrap();
+        let (control, _commands) = tokio::sync::mpsc::channel(1);
+        let (outgoing, _outgoing_rx) = tokio::sync::mpsc::channel(1);
+        let mut owner = ConnectionHandle {
+            is_closed: false,
+            engine_joined: false,
+            handle: task,
+            outcome,
+            control,
+            outgoing,
+            connection_stop_reason: Arc::new(OnceLock::new()),
+            session_listener: (),
+            max_frame_size: 65532,
+        };
+        assert!(
+            matches!(owner.stop_and_join().await, Err(Error::JoinError(error)) if error.is_panic())
+        );
+        owner.stop_and_join().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn stop_joins_a_blocked_engine_without_protocol_cleanup_or_detached_work() {
         let released = Arc::new(AtomicBool::new(false));
         let owned = released.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (outcome_tx, outcome) = tokio::sync::oneshot::channel();
+        let (outcome_tx, outcome) = crate::util::engine_outcome::EngineOutcome::channel();
         let task = tokio::spawn(async move {
             let _released = Released(owned);
             let _outcome = outcome_tx;

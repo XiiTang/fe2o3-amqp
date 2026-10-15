@@ -171,7 +171,7 @@ impl SessionAcceptor {
             session_control_rx: mpsc::Receiver<SessionControl>,
             incoming: mpsc::Receiver<SessionFrame>,
             outgoing_link_frames: mpsc::Receiver<LinkFrame>,
-        ) -> Result<(JoinHandle<()>, oneshot::Receiver<Result<(), Error>>), BeginError> {
+        ) -> Result<(JoinHandle<()>, crate::util::engine_outcome::EngineOutcome<Error>), BeginError> {
             let engine = SessionEngine::begin_listener_session(
                 connection.control.clone(),
                 listener_session,
@@ -196,7 +196,7 @@ impl SessionAcceptor {
             session_control_rx: mpsc::Receiver<SessionControl>,
             incoming: mpsc::Receiver<SessionFrame>,
             outgoing_link_frames: mpsc::Receiver<LinkFrame>,
-        ) -> Result<(JoinHandle<()>, oneshot::Receiver<Result<(), Error>>), BeginError> {
+        ) -> Result<(JoinHandle<()>, crate::util::engine_outcome::EngineOutcome<Error>), BeginError> {
             match self.0.control_link_acceptor.clone() {
                 Some(control_link_acceptor) => {
                     let txn_manager =

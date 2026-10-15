@@ -10,7 +10,6 @@ use fe2o3_amqp_types::performatives::Close;
 use futures_util::{SinkExt, StreamExt};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use crate::control::ConnectionControl;
@@ -18,7 +17,10 @@ use crate::endpoint::{IncomingChannel, OutgoingChannel};
 use crate::frames::amqp::{self, Frame, FrameBody};
 use crate::session::frame::{SessionFrame, SessionFrameBody};
 use crate::transport::Transport;
-use crate::util::Running;
+use crate::util::{
+    engine_outcome::{EngineOutcome, EngineOutcomeSender},
+    Running,
+};
 use crate::{endpoint, transport, SendBound};
 
 use super::ConnectionStopReason;
@@ -78,8 +80,8 @@ cfg_not_wasm32! {
         ConnectionStateError: From<C::OpenError> + From<C::CloseError>,
         OpenError: From<C::OpenError>,
     {
-        pub fn spawn(self) -> (JoinHandle<()>, oneshot::Receiver<Result<(), Error>>) {
-            let (tx, rx) = oneshot::channel();
+        pub fn spawn(self) -> (JoinHandle<()>, EngineOutcome<Error>) {
+            let (tx, rx) = EngineOutcome::channel();
             let handle = tokio::spawn(self.event_loop(tx));
             (handle, rx)
         }
@@ -100,8 +102,8 @@ cfg_wasm32! {
     {
         pub fn spawn_local(
             self
-        ) -> (JoinHandle<()>, oneshot::Receiver<Result<(), Error>>) {
-            let (tx, rx) = oneshot::channel();
+        ) -> (JoinHandle<()>, EngineOutcome<Error>) {
+            let (tx, rx) = EngineOutcome::channel();
             let handle = tokio::task::spawn_local(self.event_loop(tx));
             (handle, rx)
         }
@@ -109,8 +111,8 @@ cfg_wasm32! {
         pub fn spawn_on_local_set(
             self,
             local_set: &tokio::task::LocalSet,
-        ) -> (JoinHandle<()>, oneshot::Receiver<Result<(), Error>>) {
-            let (tx, rx) = oneshot::channel();
+        ) -> (JoinHandle<()>, EngineOutcome<Error>) {
+            let (tx, rx) = EngineOutcome::channel();
             let handle = local_set.spawn_local(self.event_loop(tx));
             (handle, rx)
         }
@@ -549,7 +551,7 @@ where
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(name = "Connection::event_loop", skip(self), fields(container_id = %self.connection.local_open().container_id)))]
-    async fn event_loop(mut self, tx: oneshot::Sender<Result<(), Error>>) {
+    async fn event_loop(mut self, tx: EngineOutcomeSender<Error>) {
         let mut outcome = Ok(());
         loop {
             let result = tokio::select! {
@@ -701,16 +703,16 @@ where
             Err(Error::RemoteClosed) => ConnectionStopReason::RemoteClosed,
             _ => ConnectionStopReason::Closed,
         };
-        self.connection
-            .set_connection_stop_reason(connection_stop_reason);
-
-        self.control.close();
-        self.outgoing_session_frames.close();
+        tx.complete(result, || {
+            self.connection
+                .set_connection_stop_reason(connection_stop_reason);
+            self.control.close();
+            self.outgoing_session_frames.close();
+        });
 
         #[cfg(feature = "tracing")]
         tracing::debug!("Stopped");
         #[cfg(feature = "log")]
         log::debug!("Stopped");
-        let _ = tx.send(result);
     }
 }

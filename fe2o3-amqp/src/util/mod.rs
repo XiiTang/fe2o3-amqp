@@ -8,6 +8,7 @@ use std::slice::Iter;
 use std::{pin::Pin, task::Poll, time::Duration};
 
 mod consumer;
+pub(crate) mod engine_outcome;
 mod producer;
 pub use consumer::*;
 pub use producer::*;

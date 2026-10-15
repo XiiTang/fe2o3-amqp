@@ -217,3 +217,35 @@ Regression: `cargo clippy --locked -p fe2o3-amqp --all-targets --features
 transaction,acceptor -- -D warnings` reports nine library errors before this
 prerequisite (exit 101) and passes with it alone (exit 0), on macOS arm64 with
 Rust 1.98.1. No lint allowance or level was added or changed.
+
+
+## One engine end through stop and join (#63, batch 2)
+
+ConnectionHandle and SessionHandle now return their engine's domain result from
+`stop_and_join(&mut self) -> Result<(), Error>`. The private EngineOutcome is the
+one checkpoint for both engines: its atomic winner distinguishes natural end
+from owner stop, keeps a first-probe result across a cancelled waiter, joins the
+task and probes the outcome again before reporting it. Native and local spawn
+paths, client and acceptor engines, all use the same sender/receiver pair. Only
+an owner-stop cancellation becomes Ok; an unpublished task failure keeps its
+JoinError (now also represented in the session error enum). Repeated calls after
+reading an end return Ok. No new public method or protocol cleanup is introduced.
+
+Regression: `cargo test --locked -p fe2o3-amqp --lib --features transaction,acceptor local_stop_tests`.
+The original fork fails both published-natural-result cases (exit 101); the patch
+passes all 8 (exit 0), including connection/session barrier races where a natural
+end arrives after the first probe and before abort, task panic and repeated stop.
+Removing the post-join probe also makes both barrier regressions fail (exit 101).
+`cargo test --locked -p fe2o3-amqp --lib --features transaction,acceptor` passes
+136 tests (the unused reader-only test was removed by the lint prerequisite);
+the clean_teardown, link_stop_reason, relay_remote_detach and
+large_message_split integration targets pass 22 tests (all exit 0), on macOS arm64.
+`cargo check --locked -p fe2o3-amqp --features acceptor` passes (exit 0), covering
+the non-transaction acceptor path as well. Tokio's atomic completion/cancellation
+and oneshot result ownership were inspected before selecting this mechanism.
+The preceding strict-Clippy prerequisite repairs the nine pre-existing library
+diagnostics without suppressions; it is separate from this engine-end change.
+The outcome sender retains Debug support required by the existing tracing spans.
+`cargo check --locked -p fe2o3-amqp --features transaction,acceptor,tracing,log`
+failed without its Debug derive (exit 101); the derive restores that build
+(exit 0).

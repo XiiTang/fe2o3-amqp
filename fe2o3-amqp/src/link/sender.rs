@@ -1454,7 +1454,7 @@ mod tests {
     fn make_session_handle(max_frame_size: usize) -> SessionHandle<()> {
         let (control, _control_rx) = mpsc::channel::<SessionControl>(16);
         let (outgoing_tx, _outgoing_rx) = mpsc::channel::<LinkFrame>(16);
-        let (outcome_tx, outcome) = oneshot::channel::<Result<(), crate::session::error::Error>>();
+        let (outcome_tx, outcome) = crate::util::engine_outcome::EngineOutcome::channel();
         drop(outcome_tx);
         SessionHandle {
             is_ended: false,

@@ -195,3 +195,25 @@ delegates to it. `rejected_end_keeps_its_state_and_accepted_end_commits_once`
 fails without the change and passes here, for Mapped with and without an error
 and for EndReceived. `cargo +1.97.0 test -p fe2o3-amqp --lib --locked --features
 transaction,acceptor` passes on macOS arm64.
+
+
+## Strict Clippy prerequisite for issue #63 (before batch 2)
+
+Repair the nine existing library diagnostics without suppressing a lint or
+changing a public method signature. Sender and receiver keep their private inner
+state in the same Box their detached forms already use; builders and acceptors
+allocate once, and detach/resume move that allocation. This keeps both
+`into_detached` error results and `LinkEndpoint` small. The internal transfer
+queue boxes its send errors, preserving the unsent frame and Full/Closed cause;
+the duplex event boxes only an incoming frame, unboxed at the connection engine.
+
+Remove the unused IntoReader abstraction, its bound, reader implementation and
+reader-only test; receive decoding already uses AsByteIterator, whose test
+remains. Collapse the allocator's nested result match and use an explicit error
+branch for coordinator close logging, including builds without a logging feature.
+The affected generic-argument test no longer borrows its owned payload.
+
+Regression: `cargo clippy --locked -p fe2o3-amqp --all-targets --features
+transaction,acceptor -- -D warnings` reports nine library errors before this
+prerequisite (exit 101) and passes with it alone (exit 0), on macOS arm64 with
+Rust 1.98.1. No lint allowance or level was added or changed.

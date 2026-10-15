@@ -325,11 +325,9 @@ where
                 responder,
             } => {
                 let result = self.session.allocate_link(link_name, Some(link_relay));
-                if let Err(result) = responder.send(result.map_err(Into::into)) {
+                if let Err(Ok(handle)) = responder.send(result.map_err(Into::into)) {
                     // Cancelling a local allocator must not end sibling links.
-                    if let Ok(handle) = result {
-                        self.session.deallocate_link(handle);
-                    }
+                    self.session.deallocate_link(handle);
                 }
             }
             SessionControl::AllocateIncomingLink {

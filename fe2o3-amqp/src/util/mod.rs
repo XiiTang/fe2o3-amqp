@@ -1,11 +1,8 @@
 //! Common utilities
 
-use bytes::Buf;
 use fe2o3_amqp_types::definitions::DeliveryNumber;
 use fe2o3_amqp_types::messaging::DeliveryState;
 use futures_util::Future;
-use serde_amqp::read::{IoReader, SliceReader};
-use std::io;
 use std::ops::Deref;
 use std::slice::Iter;
 use std::{pin::Pin, task::Poll, time::Duration};
@@ -165,20 +162,6 @@ pub(crate) trait AsByteIterator {
     fn as_byte_iterator(&self) -> Self::IterImpl<'_>;
 }
 
-pub(crate) trait IntoReader<'a> {
-    type Reader: serde_amqp::read::Read<'a>;
-
-    fn into_reader(self) -> Self::Reader;
-}
-
-impl<'a> IntoReader<'a> for &'a Payload {
-    type Reader = SliceReader<'a>;
-
-    fn into_reader(self) -> Self::Reader {
-        SliceReader::new(self)
-    }
-}
-
 impl AsByteIterator for Payload {
     type IterImpl<'i>
         = std::slice::Iter<'i, u8>
@@ -223,21 +206,6 @@ impl AsByteIterator for Vec<u8> {
     }
 }
 
-impl IntoReader<'static> for Vec<u8> {
-    type Reader = IoReader<std::io::Cursor<Vec<u8>>>;
-    fn into_reader(self) -> Self::Reader {
-        IoReader::new(std::io::Cursor::new(self))
-    }
-}
-
-impl IntoReader<'static> for Vec<Payload> {
-    type Reader = IoReader<ByteReader<Payload>>;
-
-    fn into_reader(self) -> Self::Reader {
-        IoReader::new(ByteReader { inner: self })
-    }
-}
-
 impl AsByteIterator for Vec<Payload> {
     type IterImpl<'i>
         = ByteReaderIter<'i>
@@ -248,31 +216,6 @@ impl AsByteIterator for Vec<Payload> {
         ByteReaderIter {
             inner: self.iter().map(|p| p.iter()).collect(),
         }
-    }
-}
-
-pub(crate) struct ByteReader<T> {
-    inner: Vec<T>,
-}
-
-impl io::Read for ByteReader<Payload> {
-    fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
-        let mut nbytes_read = 0;
-
-        for payload in self.inner.iter_mut() {
-            if payload.remaining() >= dst.len() - nbytes_read {
-                let mut partial = payload.split_to(dst.len() - nbytes_read);
-                Buf::copy_to_slice(&mut partial, &mut dst[nbytes_read..]);
-                nbytes_read = dst.len();
-                break;
-            } else if payload.remaining() < dst.len() {
-                let remaining = payload.remaining();
-                Buf::copy_to_slice(payload, &mut dst[nbytes_read..nbytes_read + remaining]);
-                nbytes_read += remaining;
-            }
-        }
-
-        Ok(nbytes_read)
     }
 }
 
@@ -325,35 +268,8 @@ pub(crate) fn is_consecutive(left: &DeliveryNumber, right: &DeliveryNumber) -> b
 #[cfg(test)]
 mod tests {
     use bytes::Bytes;
-    use serde_amqp::read::Read;
 
-    use super::{AsByteIterator, IntoReader};
-
-    #[test]
-    fn test_multiple_payload_reader() {
-        let b0 = Bytes::from(vec![1, 2, 3]);
-        let b1 = Bytes::from(vec![4, 5, 6, 7, 8]);
-        let b2 = Bytes::from(vec![9]);
-
-        let v = vec![b0, b1, b2];
-        let mut reader = v.into_reader();
-
-        let mut buf = [0u8; 1];
-        reader.read_exact(&mut buf).unwrap();
-        assert_eq!(buf, [1u8]);
-
-        let mut buf = [0u8; 1];
-        reader.read_exact(&mut buf).unwrap();
-        assert_eq!(buf, [2u8]);
-
-        let mut buf = [0u8; 3];
-        reader.read_exact(&mut buf).unwrap();
-        assert_eq!(buf, [3, 4, 5]);
-
-        let mut buf = [0u8; 10];
-        let res = reader.read_exact(&mut buf);
-        assert!(res.is_err());
-    }
+    use super::AsByteIterator;
 
     #[test]
     fn test_multiple_payload_iter() {

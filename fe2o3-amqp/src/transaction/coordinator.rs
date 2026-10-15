@@ -209,15 +209,12 @@ impl TxnCoordinator {
                 | crate::link::LinkStateError::RemoteClosed
                 | crate::link::LinkStateError::RemoteDetachedWithError(_)
                 | crate::link::LinkStateError::RemoteClosedWithError(_) => {
-                    self.inner
-                        .close_with_error(None)
-                        .await
-                        .unwrap_or_else(|_err| {
-                            #[cfg(feature = "tracing")]
-                            tracing::error!(detach_error = ?_err);
-                            #[cfg(feature = "log")]
-                            log::error!("detach_error = {:?}", _err);
-                        });
+                    if let Err(_err) = self.inner.close_with_error(None).await {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!(detach_error = ?_err);
+                        #[cfg(feature = "log")]
+                        log::error!("detach_error = {:?}", _err);
+                    }
                     Running::Stop
                 }
             },

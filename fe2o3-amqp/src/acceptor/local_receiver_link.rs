@@ -95,7 +95,7 @@ where
             session.max_frame_size(),
         )
         .await
-        .map(|inner| Receiver { inner })
+        .map(|inner| Receiver { inner: Box::new(inner) })
     }
 }
 

@@ -7,7 +7,7 @@ use fe2o3_amqp_types::{
 
 use crate::{
     endpoint::LinkExt,
-    util::{is_consecutive, AsByteIterator, IntoReader, Sealed},
+    util::{is_consecutive, AsByteIterator, Sealed},
 };
 
 use super::{delivery::DeliveryInfo, *};
@@ -99,7 +99,7 @@ where
         }
     }
 
-    fn on_complete_transfer<'a, T, P>(
+    fn on_complete_transfer<T, P>(
         &mut self,
         transfer: Transfer,
         payload: P,
@@ -108,7 +108,7 @@ where
     ) -> Result<Delivery<T>, Self::TransferError>
     where
         for<'de> T: FromBody<'de> + Send,
-        P: IntoReader<'a> + AsByteIterator + Send + 'a,
+        P: AsByteIterator + Send,
     {
         match self.local_state {
             LinkState::Attached | LinkState::IncompleteAttachExchanged | LinkState::DetachSent => {}

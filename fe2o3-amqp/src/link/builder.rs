@@ -497,9 +497,9 @@ impl Builder<role::SenderMarker, Target, WithName, WithSource, WithTarget> {
         self,
         session: &mut SessionHandle<R>,
     ) -> Result<Sender, SenderAttachError> {
-        self.attach_inner(session)
-            .await
-            .map(|inner| Sender { inner })
+        self.attach_inner(session).await.map(|inner| Sender {
+            inner: Box::new(inner),
+        })
     }
 }
 
@@ -627,9 +627,9 @@ impl Builder<role::ReceiverMarker, Target, WithName, WithSource, WithTarget> {
         self,
         session: &mut SessionHandle<R>,
     ) -> Result<Receiver, ReceiverAttachError> {
-        self.attach_inner(session)
-            .await
-            .map(|inner| Receiver { inner })
+        self.attach_inner(session).await.map(|inner| Receiver {
+            inner: Box::new(inner),
+        })
     }
 }
 
@@ -818,13 +818,13 @@ mod suspension_tests {
                 max_frame_size: 65532,
             };
             let sender = Sender {
-                inner: SenderInner {
+                inner: Box::new(SenderInner {
                     link,
                     buffer_size: 8,
                     session,
                     outgoing: outgoing.into(),
                     incoming,
-                },
+                }),
             };
             let retained = sender.into_detached();
             assert_eq!(retained.is_ok(), allowed);

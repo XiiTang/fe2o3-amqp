@@ -565,7 +565,7 @@ where
                     let result = match incoming {
                         Some(incoming) => {
                             match incoming {
-                                Ok(frame) => self.on_incoming(frame).await,
+                                Ok(frame) => self.on_incoming(*frame).await,
                                 Err(err) => Err(err.into()),
                             }
                         },

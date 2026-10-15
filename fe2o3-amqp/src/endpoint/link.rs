@@ -17,7 +17,7 @@ use crate::{
         state::LinkState,
         ApplyRemoteDetachError, LinkFrame, SessionStopReason,
     },
-    util::{AsByteIterator, IntoReader},
+    util::AsByteIterator,
     Payload,
 };
 
@@ -234,7 +234,7 @@ pub(crate) trait ReceiverLink: Link + LinkExt {
 
     // More than one transfer frames should be hanlded by the
     // `Receiver`
-    fn on_complete_transfer<'a, T, P>(
+    fn on_complete_transfer<T, P>(
         &mut self,
         transfer: Transfer,
         payload: P,
@@ -243,7 +243,7 @@ pub(crate) trait ReceiverLink: Link + LinkExt {
     ) -> Result<Delivery<T>, Self::TransferError>
     where
         for<'de> T: FromBody<'de> + Send,
-        P: IntoReader<'a> + AsByteIterator + Send + 'a;
+        P: AsByteIterator + Send;
 
     async fn dispose(
         &self,

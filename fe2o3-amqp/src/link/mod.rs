@@ -1243,7 +1243,7 @@ mod incoming_identity_tests {
             let delivery: Delivery<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>> = link
                 .on_complete_transfer(
                     transfer(),
-                    &Payload::from_static(&[0, 0x53, 0x77, 0x40]),
+                    Payload::from_static(&[0, 0x53, 0x77, 0x40]),
                     1,
                     0,
                 )

@@ -497,9 +497,13 @@ where
 
 /// Progress from the duplex driver. A flush completion wakes the engine to
 /// admit its next outbound frame; it is not exposed as a peer protocol event.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "keep the incoming frame hot path inline, as SessionOutgoingItem does"
+)]
 pub(crate) enum DuplexEvent {
     Flushed,
-    Incoming(Option<Result<Box<amqp::Frame>, Error>>),
+    Incoming(Option<Result<amqp::Frame, Error>>),
 }
 impl<Io> Transport<Io, amqp::Frame>
 where
@@ -517,8 +521,7 @@ where
                     Poll::Pending => {}
                 }
             }
-            this.poll_next(cx)
-                .map(|incoming| DuplexEvent::Incoming(incoming.map(|frame| frame.map(Box::new))))
+            this.poll_next(cx).map(DuplexEvent::Incoming)
         })
         .await
     }
@@ -825,8 +828,10 @@ mod duplex_progress_tests {
             .unwrap();
         assert!(matches!(
             event,
-            DuplexEvent::Incoming(Some(Ok(frame)))
-                if matches!(*frame, amqp::Frame { body: amqp::FrameBody::Empty, .. })
+            DuplexEvent::Incoming(Some(Ok(amqp::Frame {
+                body: amqp::FrameBody::Empty,
+                ..
+            })))
         ));
         assert!(
             !transport.framed_write.write_buffer().is_empty(),

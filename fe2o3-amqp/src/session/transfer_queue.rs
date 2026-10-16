@@ -26,7 +26,7 @@ impl Sender {
     pub async fn send(
         &self,
         mut frame: LinkFrame,
-    ) -> Result<(), Box<mpsc::error::SendError<LinkFrame>>> {
+    ) -> Result<(), mpsc::error::SendError<LinkFrame>> {
         if let LinkFrame::Transfer {
             payload,
             queue_slot,
@@ -36,24 +36,28 @@ impl Sender {
             if queue_slot.is_none() {
                 let size = payload.len().saturating_add(1024);
                 if size > RETAINED_BYTES {
-                    return Err(Box::new(mpsc::error::SendError(frame)));
+                    return Err(mpsc::error::SendError(frame));
                 }
                 let permit = tokio::select! {
-                    _ = self.tx.closed() => return Err(Box::new(mpsc::error::SendError(frame))),
+                    _ = self.tx.closed() => return Err(mpsc::error::SendError(frame)),
                     permit = self.bytes.clone().acquire_many_owned(size as u32) => permit,
                 };
                 match permit {
                     Ok(permit) => *queue_slot = Some(permit),
-                    Err(_) => return Err(Box::new(mpsc::error::SendError(frame))),
+                    Err(_) => return Err(mpsc::error::SendError(frame)),
                 }
             }
         }
-        self.tx.send(frame).await.map_err(Box::new)
+        self.tx.send(frame).await
     }
+    #[allow(
+        clippy::result_large_err,
+        reason = "preserve the unsent inline frame without allocating on queue refusal"
+    )]
     pub fn try_send(
         &self,
         mut frame: LinkFrame,
-    ) -> Result<(), Box<mpsc::error::TrySendError<LinkFrame>>> {
+    ) -> Result<(), mpsc::error::TrySendError<LinkFrame>> {
         if let LinkFrame::Transfer {
             payload,
             queue_slot,
@@ -63,15 +67,15 @@ impl Sender {
             if queue_slot.is_none() {
                 let size = payload.len().saturating_add(1024);
                 if size > RETAINED_BYTES {
-                    return Err(Box::new(mpsc::error::TrySendError::Full(frame)));
+                    return Err(mpsc::error::TrySendError::Full(frame));
                 }
                 match self.bytes.clone().try_acquire_many_owned(size as u32) {
                     Ok(permit) => *queue_slot = Some(permit),
-                    Err(_) => return Err(Box::new(mpsc::error::TrySendError::Full(frame))),
+                    Err(_) => return Err(mpsc::error::TrySendError::Full(frame)),
                 }
             }
         }
-        self.tx.try_send(frame).map_err(Box::new)
+        self.tx.try_send(frame)
     }
 }
 

@@ -117,7 +117,7 @@ impl Default for CreditMode {
 /// ```
 #[derive(Debug)]
 pub struct Receiver {
-    pub(crate) inner: Box<ReceiverInner<ReceiverLink<Target>>>,
+    pub(crate) inner: ReceiverInner<ReceiverLink<Target>>,
 }
 
 impl Receiver {
@@ -385,6 +385,10 @@ impl Receiver {
     /// Preserve the actual endpoint after Detach or a stopped parent session.
     /// A still-active endpoint is returned unchanged as an error; this method
     /// does not perform I/O or manufacture an attached link's suspension.
+    #[allow(
+        clippy::result_large_err,
+        reason = "return the original endpoint without allocating while it remains attached"
+    )]
     pub fn into_detached(mut self) -> Result<DetachedReceiver, Self> {
         if matches!(
             self.inner.link.local_state,
@@ -400,7 +404,9 @@ impl Receiver {
             self.inner.link.local_state = super::state::LinkState::Detached;
             self.inner.link.output_handle.take();
             self.inner.link.input_handle.take();
-            Ok(DetachedReceiver { inner: self.inner })
+            Ok(DetachedReceiver {
+                inner: Box::new(self.inner),
+            })
         } else {
             Err(self)
         }
@@ -413,8 +419,15 @@ impl Receiver {
     /// re-attach and then close by exchanging closing Detach performatives.
     pub async fn detach(mut self) -> Result<DetachedReceiver, (DetachedReceiver, DetachError)> {
         match self.inner.detach_with_error(None).await {
-            Ok(_) => Ok(DetachedReceiver { inner: self.inner }),
-            Err(err) => Err((DetachedReceiver { inner: self.inner }, err)),
+            Ok(_) => Ok(DetachedReceiver {
+                inner: Box::new(self.inner),
+            }),
+            Err(err) => Err((
+                DetachedReceiver {
+                    inner: Box::new(self.inner),
+                },
+                err,
+            )),
         }
     }
 
@@ -428,8 +441,15 @@ impl Receiver {
         error: impl Into<definitions::Error>,
     ) -> Result<DetachedReceiver, (DetachedReceiver, DetachError)> {
         match self.inner.detach_with_error(Some(error.into())).await {
-            Ok(_) => Ok(DetachedReceiver { inner: self.inner }),
-            Err(err) => Err((DetachedReceiver { inner: self.inner }, err)),
+            Ok(_) => Ok(DetachedReceiver {
+                inner: Box::new(self.inner),
+            }),
+            Err(err) => Err((
+                DetachedReceiver {
+                    inner: Box::new(self.inner),
+                },
+                err,
+            )),
         }
     }
 
@@ -994,7 +1014,7 @@ impl<L: endpoint::ReceiverLink> Drop for ReceiverInner<L> {
                 if let Err(_error) = self.outgoing.try_send(LinkFrame::Detach(detach)) {
                     #[cfg(any(feature = "log", feature = "tracing"))]
                     {
-                        let reason = match &*_error {
+                        let reason = match &_error {
                             tokio::sync::mpsc::error::TrySendError::Full(_) => {
                                 "control channel is full"
                             }
@@ -1990,12 +2010,12 @@ impl DetachedReceiver {
         interrupt: impl std::future::Future<Output = ()>,
     ) -> Result<ResumingReceiver, ReceiverResumeError> {
         if self.inner.link.session_stop_reason.get().is_some() {
-            self = match (Receiver { inner: self.inner }).into_detached() {
+            self = match (Receiver { inner: *self.inner }).into_detached() {
                 Ok(endpoint) => endpoint,
                 Err(endpoint) => {
                     return Err(ReceiverResumeError {
                         detached_recver: DetachedReceiver {
-                            inner: endpoint.inner,
+                            inner: Box::new(endpoint.inner),
                         },
                         kind: ReceiverAttachError::IllegalState.into(),
                     });
@@ -2009,7 +2029,7 @@ impl DetachedReceiver {
         };
         match result {
             Ok(exchange) => {
-                let receiver = Receiver { inner: self.inner };
+                let receiver = Receiver { inner: *self.inner };
                 Ok(match exchange {
                     ReceiverAttachExchange::Complete => ResumingReceiver::Complete(receiver),
                     ReceiverAttachExchange::IncompleteUnsettled => {
@@ -2054,7 +2074,7 @@ impl DetachedReceiver {
                 .resume_incoming_attach(None, is_reattaching)
                 .await
         );
-        let receiver = Receiver { inner: self.inner };
+        let receiver = Receiver { inner: *self.inner };
         let resuming_receiver = match exchange {
             ReceiverAttachExchange::Complete => ResumingReceiver::Complete(receiver),
             ReceiverAttachExchange::IncompleteUnsettled => {
@@ -2084,7 +2104,7 @@ impl DetachedReceiver {
 
             match tokio::time::timeout(duration, fut).await {
                 Ok(Ok(exchange)) => {
-                    let receiver = Receiver { inner: self.inner };
+                    let receiver = Receiver { inner: *self.inner };
                     let resuming_receiver = match exchange {
                         ReceiverAttachExchange::Complete => ResumingReceiver::Complete(receiver),
                         ReceiverAttachExchange::IncompleteUnsettled => {
@@ -2151,7 +2171,7 @@ impl DetachedReceiver {
                 .resume_incoming_attach(Some(remote_attach), false)
                 .await
         );
-        let receiver = Receiver { inner: self.inner };
+        let receiver = Receiver { inner: *self.inner };
         let resuming_receiver = match exchange {
             ReceiverAttachExchange::Complete => ResumingReceiver::Complete(receiver),
             ReceiverAttachExchange::IncompleteUnsettled => {
@@ -2179,7 +2199,7 @@ impl DetachedReceiver {
                 .resume_incoming_attach(Some(remote_attach), is_reattaching)
                 .await
         );
-        let receiver = Receiver { inner: self.inner };
+        let receiver = Receiver { inner: *self.inner };
         let resuming_receiver = match exchange {
             ReceiverAttachExchange::Complete => ResumingReceiver::Complete(receiver),
             ReceiverAttachExchange::IncompleteUnsettled => {
@@ -2217,7 +2237,7 @@ impl DetachedReceiver {
 
             match tokio::time::timeout(duration, fut).await {
                 Ok(Ok(exchange)) => {
-                    let receiver = Receiver { inner: self.inner };
+                    let receiver = Receiver { inner: *self.inner };
                     let resuming_receiver = match exchange {
                         ReceiverAttachExchange::Complete => ResumingReceiver::Complete(receiver),
                         ReceiverAttachExchange::IncompleteUnsettled => {
@@ -2258,7 +2278,7 @@ impl DetachedReceiver {
 
             match tokio::time::timeout(duration, fut).await {
                 Ok(Ok(exchange)) => {
-                    let receiver = Receiver { inner: self.inner };
+                    let receiver = Receiver { inner: *self.inner };
                     let resuming_receiver = match exchange {
                         ReceiverAttachExchange::Complete => ResumingReceiver::Complete(receiver),
                         ReceiverAttachExchange::IncompleteUnsettled => {
@@ -2387,7 +2407,7 @@ mod tests {
         let (outgoing, mut sent) = mpsc::channel(8);
         let (incoming, frames) = mpsc::channel(8);
         let mut receiver = Receiver {
-            inner: Box::new(ReceiverInner {
+            inner: ReceiverInner {
                 link,
                 buffer_size: 8,
                 credit_mode: CreditMode::Manual,
@@ -2400,7 +2420,7 @@ mod tests {
                 self_close: None,
                 incoming_recovery: Default::default(),
                 receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
-            }),
+            },
         };
         receiver.request_detach().await.unwrap();
         assert!(matches!(
@@ -2620,7 +2640,7 @@ mod tests {
         let (outgoing, _outgoing) = mpsc::channel(8);
         let (_incoming, incoming) = mpsc::channel(8);
         let mut receiver = Receiver {
-            inner: Box::new(ReceiverInner {
+            inner: ReceiverInner {
                 link,
                 buffer_size: 8,
                 credit_mode: CreditMode::Manual,
@@ -2633,7 +2653,7 @@ mod tests {
                 self_close: None,
                 incoming_recovery: Default::default(),
                 receive_budget: super::super::receive_budget::ReceiveBudget::new(65536),
-            }),
+            },
         };
         let view = receiver.settlement_view();
         assert!(view.contains(&tag));

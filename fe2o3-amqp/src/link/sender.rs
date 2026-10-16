@@ -97,7 +97,7 @@ use fe2o3_amqp_types::messaging::{
 ///     .unwrap();
 /// ```
 pub struct Sender {
-    pub(crate) inner: Box<SenderInner<SenderLink<Target>>>,
+    pub(crate) inner: SenderInner<SenderLink<Target>>,
 }
 
 impl std::fmt::Debug for Sender {
@@ -204,6 +204,10 @@ impl Sender {
 
     /// Preserve an endpoint after its session stopped, without sending frames.
     /// Already closed links and queued peer-closing Detach frames cannot resume.
+    #[allow(
+        clippy::result_large_err,
+        reason = "return the original endpoint without allocating while it remains attached"
+    )]
     pub fn into_detached(mut self) -> Result<DetachedSender, Self> {
         use super::state::LinkState;
         if matches!(
@@ -523,7 +527,7 @@ impl Sender {
     /// and a later `close()` finishes without sending another detach.
     #[allow(deprecated)]
     pub async fn on_detach(&mut self) -> DetachError {
-        match recv_remote_detach(&mut *self.inner).await {
+        match recv_remote_detach(&mut self.inner).await {
             Ok(detach) => {
                 let closed = detach.closed;
                 match self.inner.link.apply_remote_detach_outcome(detach) {
@@ -616,7 +620,7 @@ where
                     Err(_error) => {
                         #[cfg(any(feature = "log", feature = "tracing"))]
                         {
-                            let reason = match &*_error {
+                            let reason = match &_error {
                                 tokio::sync::mpsc::error::TrySendError::Full(_) => {
                                     "control channel is full"
                                 }
@@ -1153,12 +1157,12 @@ impl DetachedSender {
         interrupt: impl std::future::Future<Output = ()>,
     ) -> Result<Sender, SenderResumeError> {
         if self.inner.link.session_stop_reason.get().is_some() {
-            self = match (Sender { inner: self.inner }).into_detached() {
+            self = match (Sender { inner: *self.inner }).into_detached() {
                 Ok(endpoint) => endpoint,
                 Err(endpoint) => {
                     return Err(SenderResumeError {
                         detached_sender: DetachedSender {
-                            inner: endpoint.inner,
+                            inner: Box::new(endpoint.inner),
                         },
                         kind: SenderAttachError::IllegalState.into(),
                     });
@@ -1171,15 +1175,17 @@ impl DetachedSender {
             result = self.inner.resume_incoming_attach(None, false) => result,
         };
         match result {
-            Ok(()) => Ok(Sender { inner: self.inner }),
+            Ok(()) => Ok(Sender { inner: *self.inner }),
             Err(kind) => Err(SenderResumeError {
                 detached_sender: self,
                 kind,
             }),
         }
     }
-    fn new(inner: Box<SenderInner<SenderLink<Target>>>) -> Self {
-        Self { inner }
+    fn new(inner: SenderInner<SenderLink<Target>>) -> Self {
+        Self {
+            inner: Box::new(inner),
+        }
     }
 
     /// Get a reference to the link's source field
@@ -1209,7 +1215,7 @@ impl DetachedSender {
                 .resume_incoming_attach(None, is_reattaching)
                 .await
         );
-        Ok(Sender { inner: self.inner })
+        Ok(Sender { inner: *self.inner })
     }
 
     /// Resume the sender link on the original session
@@ -1229,7 +1235,7 @@ impl DetachedSender {
                 .resume_incoming_attach(Some(remote_attach), false)
                 .await
         );
-        Ok(Sender { inner: self.inner })
+        Ok(Sender { inner: *self.inner })
     }
 
     cfg_not_wasm32! {
@@ -1241,7 +1247,7 @@ impl DetachedSender {
             let fut = self.inner.resume_incoming_attach(None, is_reattaching);
 
             match tokio::time::timeout(duration, fut).await {
-                Ok(Ok(_)) => Ok(Sender { inner: self.inner }),
+                Ok(Ok(_)) => Ok(Sender { inner: *self.inner }),
                 Ok(Err(kind)) => Err(SenderResumeError {
                     detached_sender: self,
                     kind,
@@ -1275,7 +1281,7 @@ impl DetachedSender {
             let fut = self.inner.resume_incoming_attach(Some(remote_attach), is_reattaching);
 
             match tokio::time::timeout(duration, fut).await {
-                Ok(Ok(_)) => Ok(Sender { inner: self.inner }),
+                Ok(Ok(_)) => Ok(Sender { inner: *self.inner }),
                 Ok(Err(kind)) => Err(SenderResumeError {
                     detached_sender: self,
                     kind,
@@ -1324,7 +1330,7 @@ impl DetachedSender {
                 .resume_incoming_attach(Some(remote_attach), is_reattaching)
                 .await
         );
-        Ok(Sender { inner: self.inner })
+        Ok(Sender { inner: *self.inner })
     }
 
     cfg_not_wasm32! {
@@ -1488,9 +1494,7 @@ mod tests {
     #[tokio::test]
     async fn borrowed_detach_survives_timeout_without_replaying_detach() {
         let (inner, _session, mut outgoing, incoming) = make_sender_inner_with_channels(4096);
-        let mut sender = Sender {
-            inner: Box::new(inner),
-        };
+        let mut sender = Sender { inner };
         assert!(
             tokio::time::timeout(Duration::from_millis(10), sender.detach_borrowed())
                 .await

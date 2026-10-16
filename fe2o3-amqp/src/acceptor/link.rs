@@ -26,6 +26,7 @@ use super::{
 
 /// Listener side link endpoint
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant, reason = "retain the inline sender and receiver representations without allocation")]
 pub enum LinkEndpoint {
     /// Sender
     Sender(crate::link::Sender),

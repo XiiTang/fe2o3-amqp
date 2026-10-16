@@ -197,26 +197,35 @@ and for EndReceived. `cargo +1.97.0 test -p fe2o3-amqp --lib --locked --features
 transaction,acceptor` passes on macOS arm64.
 
 
-## Strict Clippy prerequisite for issue #63 (before batch 2)
+## Retained Clippy cleanup and inline transport shapes (#63)
 
-Repair the nine existing library diagnostics without suppressing a lint or
-changing a public method signature. Sender and receiver keep their private inner
-state in the same Box their detached forms already use; builders and acceptors
-allocate once, and detach/resume move that allocation. This keeps both
-`into_detached` error results and `LinkEndpoint` small. The internal transfer
-queue boxes its send errors, preserving the unsent frame and Full/Closed cause;
-the duplex event boxes only an incoming frame, unboxed at the connection engine.
+The non-boxing cleanup from `47d6c83f` remains: remove the unused IntoReader
+abstraction, bound, implementation and reader-only test (receive decoding uses
+AsByteIterator); simplify the allocator result match and coordinator close
+logging, and pass the owned test payload without a needless borrow.
 
-Remove the unused IntoReader abstraction, its bound, reader implementation and
-reader-only test; receive decoding already uses AsByteIterator, whose test
-remains. Collapse the allocator's nested result match and use an explicit error
-branch for coordinator close logging, including builds without a logging feature.
-The affected generic-argument test no longer borrows its owned payload.
+The boxing parts of that commit are retired. Sender and Receiver again own
+inline private inner state; only their existing detached forms allocate.
+Builders, acceptors and detach/resume callers use that representation. Transfer
+queue errors again carry the unsent LinkFrame inline, preserving Full/Closed,
+and DuplexEvent carries the incoming frame without a per-frame Box allocation;
+the connection engine consumes it directly.
 
-Regression: `cargo clippy --locked -p fe2o3-amqp --all-targets --features
-transaction,acceptor -- -D warnings` reports nine library errors before this
-prerequisite (exit 101) and passes with it alone (exit 0), on macOS arm64 with
-Rust 1.98.1. No lint allowance or level was added or changed.
+Strict Clippy keeps five narrow, reasoned allowances: `result_large_err` on
+Sender::into_detached and Receiver::into_detached (return the original endpoint
+when it cannot detach) and transfer_queue::Sender::try_send (return the unsent
+frame), and `large_enum_variant` on DuplexEvent and acceptor::LinkEndpoint.
+This follows upstream 0.18.1's existing SessionOutgoingItem allowance and its
+stated policy of keeping the common frame path inline rather than allocating
+only to even out variant sizes. No crate-wide lint level changes.
+
+Validation on macOS arm64 / Rust 1.97.0: the unboxed shapes without these
+allowances produce exactly those five diagnostics (strict Clippy exit 101);
+with them `cargo clippy --locked -p fe2o3-amqp --all-targets --features
+transaction,acceptor -- -D warnings` passes (exit 0). Full workspace tests use
+`cargo test --workspace --locked --features transaction,acceptor`, including
+existing link detach/resume, queue, duplex-progress and engine-end regressions.
+These are representation changes; no test maintains a removed boxed shape.
 
 
 ## One engine end through stop and join (#63, batch 2)
@@ -243,8 +252,8 @@ large_message_split integration targets pass 22 tests (all exit 0), on macOS arm
 `cargo check --locked -p fe2o3-amqp --features acceptor` passes (exit 0), covering
 the non-transaction acceptor path as well. Tokio's atomic completion/cancellation
 and oneshot result ownership were inspected before selecting this mechanism.
-The preceding strict-Clippy prerequisite repairs the nine pre-existing library
-diagnostics without suppressions; it is separate from this engine-end change.
+The original strict-Clippy prerequisite was separate from this engine-end
+change; its boxing is now retired under the inline-shape policy above.
 The outcome sender retains Debug support required by the existing tracing spans.
 `cargo check --locked -p fe2o3-amqp --features transaction,acceptor,tracing,log`
 failed without its Debug derive (exit 101); the derive restores that build

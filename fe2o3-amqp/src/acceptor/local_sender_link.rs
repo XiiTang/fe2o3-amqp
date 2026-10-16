@@ -206,6 +206,6 @@ where
             outgoing,
             incoming: incoming_rx,
         };
-        Ok(Sender { inner: Box::new(inner) })
+        Ok(Sender { inner })
     }
 }

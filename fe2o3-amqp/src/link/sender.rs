@@ -1030,19 +1030,33 @@ impl SenderInner<SenderLink<Target>> {
     }
 
     async fn resend(&mut self, unsettled_message: UnsettledMessage) -> Result<(), SendError> {
-        let detached_fut = self.incoming.recv();
-        let tag = self.link.get_delivery_tag_or_detached(detached_fut).await?;
-        let new_delivery_tag = DeliveryTag::from(tag);
         let transfer = self.link.generate_non_resuming_transfer_performative(
-            new_delivery_tag.clone(),
+            DeliveryTag::from([0; 4]),
             unsettled_message.message_format,
             None,
             None,
             false,
         )?;
-
-        self.send_transfer_with_outcome(transfer, new_delivery_tag, unsettled_message)
-            .await
+        let payload = unsettled_message.payload.clone();
+        let detached_fut = self.incoming.recv();
+        if self.link.is_settled_on_send(&transfer) {
+            self.link
+                .send_delivery(&self.outgoing, detached_fut, transfer, payload, None, None)
+                .await?;
+            let _ = unsettled_message.settle();
+        } else {
+            self.link
+                .send_delivery(
+                    &self.outgoing,
+                    detached_fut,
+                    transfer,
+                    payload,
+                    Some(unsettled_message),
+                    None,
+                )
+                .await?;
+        }
+        Ok(())
     }
 
     /// Sends a transfer and resolves `unsettled` with its outcome: at once when the transfer goes
@@ -1594,18 +1608,25 @@ mod tests {
         assert!(matches!(&inner.link.local_state, LinkState::Closed));
     }
 
-    /// A sender ready to send: attached, with a peer handle.
-    fn sendable_sender() -> SenderInner<SenderLink<Target>> {
-        let mut inner = make_sender_inner(4096);
-        inner.link.input_handle = Some(endpoint::InputHandle(0));
-        inner
-    }
-
     fn is_registered(link: &SenderLink<Target>, tag: &DeliveryTag) -> bool {
         link.unsettled
             .read()
             .as_ref()
             .is_some_and(|map| map.contains_key(tag))
+    }
+
+    /// The link's credit and delivery-count.
+    fn credit(link: &SenderLink<Target>) -> (u32, u32) {
+        let state = link.flow_state.state().lock.read();
+        (state.link_credit, state.delivery_count)
+    }
+
+    /// A sender with one link credit.
+    fn credited_sender(max_frame_size: usize) -> SenderInner<SenderLink<Target>> {
+        let mut inner = make_sender_inner(max_frame_size);
+        inner.link.input_handle = Some(endpoint::InputHandle(0));
+        inner.link.flow_state.state().lock.write().link_credit = 1;
+        inner
     }
 
     /// A channel to the session with no room left, so a hand-over stays pending until the
@@ -1630,81 +1651,158 @@ mod tests {
     /// The session engine is a task of its own: it can write a transfer, receive the peer's
     /// settled disposition and look the delivery up in the unsettled map before the sending task
     /// resumes. A disposition that finds no entry is dropped and the outcome never resolves, so
-    /// the delivery has to be registered before its transfer can reach the session.
+    /// the delivery is registered by the time its first frame reaches the session.
     ///
-    /// The session's channel is full, so the hand-over is pending when the first poll returns:
-    /// that is the point where the session could otherwise overtake the registration.
+    /// The delivery spans frames and the session's channel holds one, so the send is pending on
+    /// its second frame with the first in the session's hands.
     #[tokio::test]
-    async fn delivery_is_registered_before_its_transfer_reaches_the_session() {
-        let inner = sendable_sender();
-        let link = &inner.link;
-        let (writer, mut session) = full_session_channel().await;
-        let tag = DeliveryTag::from(b"tag0".to_vec());
-        let transfer = link
-            .generate_non_resuming_transfer_performative(tag.clone(), 0, None, None, false)
-            .expect("the link is attached");
+    async fn a_delivery_is_registered_when_its_first_frame_reaches_the_session() {
+        let mut inner = credited_sender(512);
+        let (writer, mut session) = mpsc::channel::<LinkFrame>(1);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
+        let unsettled = inner.link.unsettled.clone();
+        let registered = |tag: &DeliveryTag| {
+            unsettled
+                .read()
+                .as_ref()
+                .is_some_and(|map| map.contains_key(tag))
+        };
+        let tag = DeliveryTag::from([0; 4]);
 
-        let send =
-            link.send_payload_with_transfer(&writer, 0, transfer, Payload::from_static(b"m"));
+        let send = inner.link.send_payload(
+            &writer,
+            std::future::pending(),
+            Payload::from(vec![7; 2048]),
+            0,
+            Some(false),
+            None,
+            false,
+        );
         tokio::pin!(send);
         assert!(futures_util::poll!(&mut send).is_pending());
-        assert!(
-            is_registered(link, &tag),
-            "the transfer can reach the session before the delivery is registered"
-        );
+        assert!(matches!(
+            session.try_recv(),
+            Ok(LinkFrame::Transfer { performative, .. }) if performative.more
+        ));
+        assert!(registered(&tag));
+
+        while !matches!(futures_util::poll!(&mut send), std::task::Poll::Ready(_)) {
+            session.recv().await.expect("the send is still running");
+        }
+        assert!(registered(&tag));
+    }
+
+    /// A send cut short while the session queue has no room takes nothing: the link keeps its
+    /// credit and delivery-count, nothing is registered, and the next send uses the credit.
+    #[tokio::test]
+    async fn a_send_cut_short_before_the_queue_takes_it_keeps_its_credit() {
+        let mut inner = credited_sender(4096);
+        let (writer, mut session) = full_session_channel().await;
+
+        {
+            let send = inner.link.send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from_static(b"m"),
+                0,
+                Some(false),
+                None,
+                false,
+            );
+            tokio::pin!(send);
+            assert!(futures_util::poll!(&mut send).is_pending());
+        }
+        assert_eq!(credit(&inner.link), (1, 0));
+        assert!(!is_registered(&inner.link, &DeliveryTag::from([0; 4])));
 
         assert!(matches!(session.recv().await, Some(LinkFrame::Detach(_))));
-        let settlement = send.await.expect("the transfer is handed over");
-        assert!(matches!(settlement, Settlement::Unsettled { .. }));
+        let settlement = inner
+            .link
+            .send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from_static(b"m"),
+                0,
+                Some(false),
+                None,
+                false,
+            )
+            .await
+            .expect("the transfer is handed over");
+        assert!(
+            matches!(settlement, Settlement::Unsettled { delivery_tag, .. } if delivery_tag == DeliveryTag::from([0; 4]))
+        );
+        assert_eq!(credit(&inner.link), (0, 1));
+    }
+
+    /// A frame the session queue refuses, being larger than it retains, takes nothing either,
+    /// and the link can still send.
+    #[tokio::test]
+    async fn a_frame_the_queue_refuses_keeps_its_credit() {
+        let mut inner = credited_sender(u32::MAX as usize);
+        let (writer, mut session) = mpsc::channel::<LinkFrame>(1);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
+
+        let refused = inner
+            .link
+            .send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from(vec![7; 32 * 1024 * 1024]),
+                0,
+                Some(false),
+                None,
+                false,
+            )
+            .await;
+        assert!(refused.is_err());
+        assert_eq!(credit(&inner.link), (1, 0));
+        assert!(!is_registered(&inner.link, &DeliveryTag::from([0; 4])));
+
+        inner
+            .link
+            .send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from_static(b"m"),
+                0,
+                Some(false),
+                None,
+                false,
+            )
+            .await
+            .expect("the transfer is handed over");
         assert!(matches!(
             session.recv().await,
             Some(LinkFrame::Transfer { .. })
         ));
-        assert!(is_registered(link, &tag));
+        assert_eq!(credit(&inner.link), (0, 1));
     }
 
-    /// A send dropped before its transfer was handed over leaves nothing behind: the peer never
-    /// saw the delivery, so no outcome will come for it.
+    /// A send whose session ended takes nothing.
     #[tokio::test]
-    async fn a_send_dropped_before_the_hand_over_withdraws_its_delivery() {
-        let inner = sendable_sender();
-        let link = &inner.link;
-        let (writer, _session) = full_session_channel().await;
-        let tag = DeliveryTag::from(b"tag0".to_vec());
-        let transfer = link
-            .generate_non_resuming_transfer_performative(tag.clone(), 0, None, None, false)
-            .expect("the link is attached");
-
-        {
-            let send =
-                link.send_payload_with_transfer(&writer, 0, transfer, Payload::from_static(b"m"));
-            tokio::pin!(send);
-            assert!(futures_util::poll!(&mut send).is_pending());
-            assert!(is_registered(link, &tag));
-        }
-
-        assert!(!is_registered(link, &tag));
-    }
-
-    /// A send that fails to reach the session withdraws its delivery the same way.
-    #[tokio::test]
-    async fn a_send_that_fails_withdraws_its_delivery() {
-        let inner = sendable_sender();
-        let link = &inner.link;
+    async fn a_send_to_an_ended_session_keeps_its_credit() {
+        let mut inner = credited_sender(4096);
         let (writer, session) = mpsc::channel::<LinkFrame>(1);
         let writer = crate::session::transfer_queue::Sender::from(writer);
         drop(session);
-        let tag = DeliveryTag::from(b"tag0".to_vec());
-        let transfer = link
-            .generate_non_resuming_transfer_performative(tag.clone(), 0, None, None, false)
-            .expect("the link is attached");
 
-        let result = link
-            .send_payload_with_transfer(&writer, 0, transfer, Payload::from_static(b"m"))
+        let result = inner
+            .link
+            .send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from_static(b"m"),
+                0,
+                Some(false),
+                None,
+                false,
+            )
             .await;
 
         assert!(result.is_err());
-        assert!(!is_registered(link, &tag));
+        assert_eq!(credit(&inner.link), (1, 0));
+        assert!(!is_registered(&inner.link, &DeliveryTag::from([0; 4])));
     }
 
     /// Aborting a delivery sends a resuming, aborted transfer; the delivery is

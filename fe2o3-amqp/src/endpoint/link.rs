@@ -161,15 +161,6 @@ pub(crate) trait SenderLink: Link + LinkExt {
     where
         Fut: Future<Output = Option<LinkFrame>> + Send;
 
-    /// Send message with delivery tag that is obtained by consuming a link credit
-    async fn send_payload_with_transfer(
-        &self,
-        writer: &crate::session::transfer_queue::Sender,
-        message_format: MessageFormat,
-        transfer: Transfer,
-        payload: Payload,
-    ) -> Result<Settlement, Self::TransferError>;
-
     /// Note that it is possible for a disposition sent from sender to receiver
     /// to refer to a delivery which has not yet completed (i.e., a delivery
     /// which is spread over multiple frames and not all frames have yet been

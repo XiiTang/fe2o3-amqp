@@ -87,40 +87,6 @@ where
         Ok(())
     }
 
-    pub(crate) async fn send_payload_with_transfer_tracked(
-        &self,
-        writer: &crate::session::transfer_queue::Sender,
-        message_format: MessageFormat,
-        transfer: Transfer,
-        payload: Payload,
-        dispatched: Option<&AtomicBool>,
-    ) -> Result<Settlement, LinkStateError> {
-        let delivery_tag = transfer
-            .delivery_tag
-            .clone()
-            .ok_or(LinkStateError::IllegalState)?;
-        if self.is_settled_on_send(&transfer) {
-            self.send_transfer_tracked(writer, transfer, payload, dispatched)
-                .await?;
-            return Ok(Settlement::Settled(delivery_tag));
-        }
-        let (tx, rx) = oneshot::channel();
-        let unsettled = UnsettledMessage::new(payload.clone(), None, message_format, tx);
-        self.send_unsettled_transfer_tracked(
-            writer,
-            transfer,
-            payload,
-            delivery_tag.clone(),
-            unsettled,
-            dispatched,
-        )
-        .await?;
-        Ok(Settlement::Unsettled {
-            delivery_tag,
-            outcome: rx,
-        })
-    }
-
     /// # Cancel safety
     ///
     /// This is cancel safe because all internal `.await` are cancel safe
@@ -136,8 +102,8 @@ where
     pub(crate) async fn send_transfer_tracked(
         &self,
         writer: &crate::session::transfer_queue::Sender,
-        mut transfer: Transfer,
-        mut payload: Payload,
+        transfer: Transfer,
+        payload: Payload,
         dispatched: Option<&AtomicBool>,
     ) -> Result<bool, LinkStateError> {
         let settled = self.is_settled_on_send(&transfer);
@@ -145,6 +111,27 @@ where
             .input_handle
             .clone()
             .ok_or(LinkStateError::IllegalState)?;
+        for (transfer, payload) in self.split_transfer(transfer, payload)? {
+            send_transfer(
+                writer,
+                input_handle.clone(),
+                transfer,
+                payload,
+                &self.session_stop_reason,
+                dispatched,
+            )
+            .await?; // cancel safe
+        }
+        Ok(settled)
+    }
+
+    /// The frames a delivery's transfer and payload go out in, in order.
+    fn split_transfer(
+        &self,
+        mut transfer: Transfer,
+        mut payload: Payload,
+    ) -> Result<Vec<(Transfer, Payload)>, LinkStateError> {
+        let mut frames = Vec::new();
 
         // The connection engine publishes the negotiated encoder max frame
         // length before the connection handle is created; links are only
@@ -182,29 +169,12 @@ where
         let more = payload.len() > max_payload;
         if !more {
             transfer.more = false;
-            send_transfer(
-                writer,
-                input_handle,
-                transfer,
-                payload.clone(),
-                &self.session_stop_reason,
-                dispatched,
-            )
-            .await?;
-        // cancel safe
+            frames.push((transfer, payload));
         } else {
-            // Send the first frame
+            // The first frame
             let partial = payload.split_to(max_payload);
             transfer.more = true;
-            send_transfer(
-                writer,
-                input_handle.clone(),
-                transfer.clone(),
-                partial,
-                &self.session_stop_reason,
-                dispatched,
-            )
-            .await?; // cancel safe
+            frames.push((transfer.clone(), partial));
 
             // AMQP 1.0 §2.7.5: on continuation transfers the delivery-id may be
             // omitted and the delivery-tag / message-format can only be omitted.
@@ -216,58 +186,165 @@ where
             transfer.settled = None;
             transfer.rcv_settle_mode = None;
 
-            // Send the transfers in the middle
+            // The transfers in the middle
             while payload.len() > max_payload {
                 let partial = payload.split_to(max_payload);
-                send_transfer(
-                    writer,
-                    input_handle.clone(),
-                    transfer.clone(),
-                    partial,
-                    &self.session_stop_reason,
-                    dispatched,
-                )
-                .await?;
-                // cancel safe
+                frames.push((transfer.clone(), partial));
             }
 
-            // Send the last transfer
+            // The last transfer
             // For messages that are too large to fit within the maximum frame size, additional
             // data MAY be trans- ferred in additional transfer frames by setting the more flag on
             // all but the last transfer frame
             transfer.more = false;
+            frames.push((transfer, payload));
+        }
+
+        Ok(frames)
+    }
+
+    /// Sends a new delivery. This is the one place a delivery takes link
+    /// credit: it waits for credit, then for the session queue's room for its
+    /// first frame, holding neither while it waits for the other; then, in one
+    /// synchronous step, takes the credit, gives the first frame the delivery
+    /// tag the credit gives, registers `unsettled` under it and hands the
+    /// frame over. A send cut short, or refused by the queue, before that step
+    /// keeps the link's credit and delivery-count, which the receiver's next
+    /// flow would never give back. qpid-proton (`pni_advance_sender`) and
+    /// azure-amqp (`TrySendDelivery`) likewise take credit as a delivery
+    /// enters the session.
+    ///
+    /// `transfer`'s own delivery tag only sizes the frames: every tag the
+    /// credit gives is four bytes.
+    pub(crate) async fn send_delivery<Fut>(
+        &mut self,
+        writer: &crate::session::transfer_queue::Sender,
+        detached: Fut,
+        transfer: Transfer,
+        payload: Payload,
+        unsettled: Option<UnsettledMessage>,
+        dispatched: Option<&AtomicBool>,
+    ) -> Result<DeliveryTag, LinkStateError>
+    where
+        Fut: Future<Output = Option<LinkFrame>> + Send,
+    {
+        let input_handle = self
+            .input_handle
+            .clone()
+            .ok_or(LinkStateError::IllegalState)?;
+        let mut frames = self.split_transfer(transfer, payload)?.into_iter();
+        let (mut first, first_payload) = frames.next().ok_or(LinkStateError::IllegalState)?;
+        tokio::pin!(detached);
+        let mut unsettled = unsettled;
+        let registered = unsettled.is_some();
+        let delivery_tag = loop {
+            self.credit_or_detached(&mut detached).await?;
+            let room = writer
+                .reserve(first_payload.len())
+                .await
+                .map_err(|_| stopped(&self.session_stop_reason))?; // cancel safe
+            let Some(tag) = self.flow_state.try_consume(1) else {
+                // A drain took the credit while the frame waited for room.
+                continue;
+            };
+            let delivery_tag = DeliveryTag::from(tag);
+            first.delivery_tag = Some(delivery_tag.clone());
+            if let Some(unsettled) = unsettled.take() {
+                // Registered before the hand-over: the session may settle the
+                // delivery before this task resumes.
+                self.unsettled
+                    .write()
+                    .get_or_insert(OrderedMap::new())
+                    .insert(delivery_tag.clone(), unsettled);
+            }
+            room.send(LinkFrame::Transfer {
+                window_slot: None,
+                queue_slot: None,
+                input_handle: input_handle.clone(),
+                performative: first,
+                payload: first_payload,
+            });
+            break delivery_tag;
+        };
+        if let Some(dispatched) = dispatched {
+            dispatched.store(true, Ordering::Release);
+        }
+        let registration = registered.then(|| UnsettledRegistration {
+            unsettled: &self.unsettled,
+            delivery_tag: Some(&delivery_tag),
+        });
+        for (transfer, payload) in frames {
             send_transfer(
                 writer,
-                input_handle,
+                input_handle.clone(),
                 transfer,
                 payload,
                 &self.session_stop_reason,
                 dispatched,
             )
-            .await?;
-            // cancel safe
+            .await?; // cancel safe
         }
-
-        Ok(settled)
+        let sent = delivery_tag.clone();
+        if let Some(registration) = registration {
+            registration.keep();
+        }
+        Ok(sent)
     }
 
-    pub(crate) async fn get_delivery_tag_or_detached<Fut>(
+    /// Sends a new delivery of `payload`, settled or with an outcome to wait
+    /// for, as the link's settle mode and `transfer` say.
+    pub(crate) async fn send_new_payload<Fut>(
         &mut self,
+        writer: &crate::session::transfer_queue::Sender,
         detached: Fut,
-    ) -> Result<[u8; 4], LinkStateError>
+        message_format: MessageFormat,
+        transfer: Transfer,
+        payload: Payload,
+        dispatched: Option<&AtomicBool>,
+    ) -> Result<Settlement, LinkStateError>
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
     {
-        use crate::util::Consume;
+        if self.is_settled_on_send(&transfer) {
+            let delivery_tag = self
+                .send_delivery(writer, detached, transfer, payload, None, dispatched)
+                .await?;
+            return Ok(Settlement::Settled(delivery_tag));
+        }
+        let (tx, rx) = oneshot::channel();
+        let unsettled = UnsettledMessage::new(payload.clone(), None, message_format, tx);
+        let delivery_tag = self
+            .send_delivery(
+                writer,
+                detached,
+                transfer,
+                payload,
+                Some(unsettled),
+                dispatched,
+            )
+            .await?;
+        Ok(Settlement::Unsettled {
+            delivery_tag,
+            outcome: rx,
+        })
+    }
 
+    /// Waits for link credit, or for the peer's detach.
+    async fn credit_or_detached<Fut>(
+        &mut self,
+        detached: &mut std::pin::Pin<&mut Fut>,
+    ) -> Result<(), LinkStateError>
+    where
+        Fut: Future<Output = Option<LinkFrame>> + Send,
+    {
         // The detach branch is polled first so that a remote detach that has
         // already arrived is observed before a concurrently granted link-credit
-        // is consumed. Otherwise a send could race the remote closing the link,
+        // is used. Otherwise a send could race the remote closing the link,
         // consuming credit and writing a transfer the relay can no longer
         // forward.
         tokio::select! {
             biased;
-            frame = detached => { // cancel safe
+            frame = detached.as_mut() => { // cancel safe
                 match frame {
                     // The relay already sent the reply to this peer detach;
                     // the link records the outcome here. Reported as-is even
@@ -302,14 +379,14 @@ where
                     }
                 }
             },
-            tag = self.flow_state.consume(1) => {
+            () = self.flow_state.credit_ready(1) => {
                 // link-credit is defined as
                 // "The current maximum number of messages that can be handled
                 // at the receiver endpoint of the link"
 
                 // Draining should already set the link credit to 0, causing
                 // sender to wait for new link credit
-                Ok(tag)
+                Ok(())
             }
         }
     }
@@ -386,33 +463,15 @@ where
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
     {
-        let tag = self.get_delivery_tag_or_detached(detached).await?;
-        // Delivery count is incremented when consuming credit
-        let delivery_tag = DeliveryTag::from(tag);
-
         let transfer = self.generate_non_resuming_transfer_performative(
-            delivery_tag,
+            DeliveryTag::from([0; 4]),
             message_format,
             settled,
             state,
             batchable,
         )?;
 
-        self.send_payload_with_transfer(writer, message_format, transfer, payload)
-            .await
-    }
-
-    /// # Cancel safety
-    ///
-    /// This is cancel safe because all internal `.await` are cancel safe
-    async fn send_payload_with_transfer(
-        &self,
-        writer: &crate::session::transfer_queue::Sender,
-        message_format: MessageFormat,
-        transfer: Transfer,
-        payload: Payload,
-    ) -> Result<Settlement, Self::TransferError> {
-        self.send_payload_with_transfer_tracked(writer, message_format, transfer, payload, None)
+        self.send_new_payload(writer, detached, message_format, transfer, payload, None)
             .await
     }
 
@@ -544,6 +603,14 @@ where
 ///
 /// This is cancel safe because it only involves `.await` on sending over `tokio::mpsc::Sender`
 #[inline]
+/// The error a refused hand-over to the session reports.
+fn stopped(session_stop_reason: &OnceLock<SessionStopReason>) -> LinkStateError {
+    match session_stop_reason.get() {
+        Some(reason) => LinkStateError::SessionStopped(reason.clone()),
+        None => LinkStateError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+    }
+}
+
 async fn send_transfer(
     writer: &crate::session::transfer_queue::Sender,
     input_handle: InputHandle,
@@ -562,10 +629,7 @@ async fn send_transfer(
     writer
         .send(frame)
         .await // cancel safe
-        .map_err(|_| match session_stop_reason.get() {
-            Some(reason) => LinkStateError::SessionStopped(reason.clone()),
-            None => LinkStateError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-        })?;
+        .map_err(|_| stopped(session_stop_reason))?;
     if let Some(dispatched) = dispatched {
         dispatched.store(true, Ordering::Release);
     }

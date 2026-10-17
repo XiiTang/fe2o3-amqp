@@ -10,6 +10,25 @@ pub(crate) struct Sender {
     tx: mpsc::Sender<LinkFrame>,
     bytes: Arc<Semaphore>,
 }
+/// The queue refused a transfer frame: it is closed, or the frame is larger
+/// than it retains.
+#[derive(Debug)]
+pub(crate) struct Refused;
+/// Room the queue holds for one transfer frame.
+#[derive(Debug)]
+pub(crate) struct Room {
+    bytes: tokio::sync::OwnedSemaphorePermit,
+    slot: mpsc::OwnedPermit<LinkFrame>,
+}
+impl Room {
+    /// Hands `frame`, a transfer, to the queue.
+    pub(crate) fn send(self, mut frame: LinkFrame) {
+        if let LinkFrame::Transfer { queue_slot, .. } = &mut frame {
+            *queue_slot = Some(self.bytes);
+        }
+        self.slot.send(frame);
+    }
+}
 pub(crate) fn channel(capacity: usize) -> (Sender, mpsc::Receiver<LinkFrame>) {
     let (tx, rx) = mpsc::channel(capacity);
     (Sender::from(tx), rx)
@@ -23,32 +42,37 @@ impl From<mpsc::Sender<LinkFrame>> for Sender {
     }
 }
 impl Sender {
-    pub async fn send(
-        &self,
-        mut frame: LinkFrame,
-    ) -> Result<(), mpsc::error::SendError<LinkFrame>> {
+    pub async fn send(&self, frame: LinkFrame) -> Result<(), mpsc::error::SendError<LinkFrame>> {
         if let LinkFrame::Transfer {
             payload,
-            queue_slot,
+            queue_slot: None,
             ..
-        } = &mut frame
+        } = &frame
         {
-            if queue_slot.is_none() {
-                let size = payload.len().saturating_add(1024);
-                if size > RETAINED_BYTES {
-                    return Err(mpsc::error::SendError(frame));
+            return match self.reserve(payload.len()).await {
+                Ok(room) => {
+                    room.send(frame);
+                    Ok(())
                 }
-                let permit = tokio::select! {
-                    _ = self.tx.closed() => return Err(mpsc::error::SendError(frame)),
-                    permit = self.bytes.clone().acquire_many_owned(size as u32) => permit,
-                };
-                match permit {
-                    Ok(permit) => *queue_slot = Some(permit),
-                    Err(_) => return Err(mpsc::error::SendError(frame)),
-                }
-            }
+                Err(Refused) => Err(mpsc::error::SendError(frame)),
+            };
         }
         self.tx.send(frame).await
+    }
+    /// Room for one transfer frame of `payload_len` bytes: its share of the
+    /// retained bytes, then a queue slot. Holding it takes nothing else; it
+    /// is given back when dropped unsent.
+    pub(crate) async fn reserve(&self, payload_len: usize) -> Result<Room, Refused> {
+        let size = payload_len.saturating_add(1024);
+        if size > RETAINED_BYTES {
+            return Err(Refused);
+        }
+        let bytes = tokio::select! {
+            _ = self.tx.closed() => return Err(Refused),
+            permit = self.bytes.clone().acquire_many_owned(size as u32) => permit.map_err(|_| Refused)?,
+        };
+        let slot = self.tx.clone().reserve_owned().await.map_err(|_| Refused)?;
+        Ok(Room { bytes, slot })
     }
     #[allow(
         clippy::result_large_err,

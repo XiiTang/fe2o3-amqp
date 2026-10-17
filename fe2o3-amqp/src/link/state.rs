@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 
 use crate::{
     endpoint::{LinkFlow, OutputHandle},
-    util::{Consume, ProducerState},
+    util::ProducerState,
 };
 
 use super::{role, ReceiverTransferError, SenderFlowState};
@@ -294,25 +294,25 @@ impl ProducerState for Arc<LinkFlowState<role::SenderMarker>> {
 
 struct InsufficientCredit {}
 
-impl Consume for SenderFlowState {
-    type Item = u32;
-    type Outcome = [u8; 4];
-
-    /// Increment delivery count and decrement link_credit. Wait asynchronously
-    /// if there is not enough credit
-    ///
-    /// # Cancel safety
-    ///
-    /// `Notify` itself is not cancel safe in the way that it would lose its place in the queue.
-    /// However, since there can be only one consumer for a producer, losing the place in the queue
-    /// does not have any effect. Thus, this IS cancel safe.
-    async fn consume(&self, item: Self::Item) -> Self::Outcome {
+impl SenderFlowState {
+    /// Waits until the link has `count` credit, taking none.
+    pub(crate) async fn credit_ready(&self, count: u32) {
         loop {
-            match consume_link_credit(&self.state().lock, item) {
-                Ok(outcome) => return outcome,
-                Err(_) => self.notifier.notified().await, // **NOT** cancel safe
+            let notified = self.notifier.notified();
+            tokio::pin!(notified);
+            // Registered before the check, so a flow between the two wakes it.
+            notified.as_mut().enable();
+            if self.state().lock.read().link_credit >= count {
+                return;
             }
+            notified.await;
         }
+    }
+
+    /// Takes `count` credit if the link has it: advances the delivery-count
+    /// and returns the delivery tag the credit gives.
+    pub(crate) fn try_consume(&self, count: u32) -> Option<[u8; 4]> {
+        consume_link_credit(&self.state().lock, count).ok()
     }
 }
 
@@ -346,7 +346,7 @@ mod tests {
             state::{LinkFlowState, LinkFlowStateInner},
             SenderFlowState,
         },
-        util::{Consume, Consumer, Produce, Producer},
+        util::{Consumer, Produce, Producer},
     };
 
     macro_rules! assert_pending {
@@ -363,6 +363,16 @@ mod tests {
             let poll = poll!(fut);
             assert!(poll.is_ready());
         };
+    }
+
+    /// Waits for one credit and takes it.
+    async fn consume(consumer: &SenderFlowState) -> [u8; 4] {
+        loop {
+            consumer.credit_ready(1).await;
+            if let Some(tag) = consumer.try_consume(1) {
+                return tag;
+            }
+        }
     }
 
     fn create_sender_flow_state_producer_and_consumer() -> (
@@ -389,12 +399,12 @@ mod tests {
         let (mut producer, consumer) = create_sender_flow_state_producer_and_consumer();
 
         // .await on notify
-        assert_pending!(consumer.consume(1));
+        assert_pending!(consume(&consumer));
 
         // .await after notify with zero credit
         let item = (LinkFlow::default(), OutputHandle(0));
         producer.produce(item).await;
-        assert_pending!(consumer.consume(1));
+        assert_pending!(consume(&consumer));
 
         // .await after notify with non-zero credit
         let link_flow = LinkFlow {
@@ -403,18 +413,18 @@ mod tests {
         };
         let item = (link_flow, OutputHandle(0));
         producer.produce(item).await;
-        assert_ready!(consumer.consume(1));
-        assert_ready!(consumer.consume(1));
+        assert_ready!(consume(&consumer));
+        assert_ready!(consume(&consumer));
 
         // All credits have been consumed already
-        assert_pending!(consumer.consume(1));
+        assert_pending!(consume(&consumer));
     }
 
     #[tokio::test]
     async fn test_spawned_flow_state_producer_and_consumer() {
         let (mut producer, consumer) = create_sender_flow_state_producer_and_consumer();
 
-        let handle = tokio::spawn(async move { consumer.consume(1).await });
+        let handle = tokio::spawn(async move { consume(&consumer).await });
         let mut fut = Box::pin(handle);
         assert_pending!(&mut fut);
 
@@ -435,7 +445,7 @@ mod tests {
         let (mut producer, consumer) = create_sender_flow_state_producer_and_consumer();
 
         // Drop before notify
-        let fut = consumer.consume(1);
+        let fut = consume(&consumer);
         let mut pinned = Box::pin(fut);
         assert!(poll!(&mut pinned).is_pending());
         drop(pinned);
@@ -449,11 +459,11 @@ mod tests {
         producer.produce(item).await;
 
         // If it is not cancel safe, we cannot consume all 2 credits
-        assert_ready!(consumer.consume(1));
-        assert_ready!(consumer.consume(1));
+        assert_ready!(consume(&consumer));
+        assert_ready!(consume(&consumer));
 
         // All credits have been consumed already
-        assert_pending!(consumer.consume(1));
+        assert_pending!(consume(&consumer));
     }
 
     #[tokio::test]
@@ -461,7 +471,7 @@ mod tests {
         let (mut producer, consumer) = create_sender_flow_state_producer_and_consumer();
 
         // Drop before notify
-        let fut = consumer.consume(1);
+        let fut = consume(&consumer);
         let mut pinned = Box::pin(fut);
         assert!(poll!(&mut pinned).is_pending());
 
@@ -476,10 +486,10 @@ mod tests {
         drop(pinned);
 
         // If it is not cancel safe, we cannot consume all 2 credits
-        assert_ready!(consumer.consume(1));
-        assert_ready!(consumer.consume(1));
+        assert_ready!(consume(&consumer));
+        assert_ready!(consume(&consumer));
 
         // All credits have been consumed already
-        assert_pending!(consumer.consume(1));
+        assert_pending!(consume(&consumer));
     }
 }

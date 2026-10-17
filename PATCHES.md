@@ -258,3 +258,38 @@ The outcome sender retains Debug support required by the existing tracing spans.
 `cargo check --locked -p fe2o3-amqp --features transaction,acceptor,tracing,log`
 failed without its Debug derive (exit 101); the derive restores that build
 (exit 0).
+
+## A delivery takes link credit as its first frame enters the session (#72)
+
+A sender took one link credit (advancing `delivery_count`) before waiting for
+the session's transfer queue, whose retained-bytes bound and slots are both
+cancellation points and which refuses a frame larger than it retains. A send
+cut short or refused there kept the credit, and the receiver's next flow never
+gives it back: the sender computes `delivery-count_rcv + link-credit_rcv -
+delivery-count_snd`, and the receiver never counted a delivery it did not get.
+A receiver granting one credit at a time then stalls the link for good. The
+transaction controller alone refunded it, through a drop guard.
+
+`SenderLink::send_delivery` is now the one place a delivery takes credit. It
+waits for credit (`SenderFlowState::credit_ready`, which registers its waiter
+before it checks, so a flow between the two wakes it), then reserves the first
+frame's room (`transfer_queue::Sender::reserve`, retained bytes then a slot),
+holding neither while it waits for the other; then, in one synchronous step,
+it takes the credit (`try_consume`), gives the frame the delivery tag the
+credit gives, registers the unsettled delivery and hands the frame over. A
+drain that took the credit meanwhile sends it back to waiting. `send_payload`,
+`resend` and the transaction controller send through it; the controller's
+`ControlCredit` refund, the async `Consume` trait and the unused
+`send_payload_with_transfer` paths are gone. qpid-proton (`pni_advance_sender`)
+and azure-amqp (`TrySendDelivery`) take credit as a delivery enters the
+session in the same way.
+
+`cargo +1.97.0 test -p fe2o3-amqp --lib --locked --features
+transaction,acceptor link::sender::tests`:
+`a_send_cut_short_before_the_queue_takes_it_keeps_its_credit`,
+`a_frame_the_queue_refuses_keeps_its_credit` and
+`a_send_to_an_ended_session_keeps_its_credit` leave `(link_credit,
+delivery_count)` at `(0, 1)` instead of `(1, 0)` on the previous commit;
+`a_delivery_is_registered_when_its_first_frame_reaches_the_session` keeps the
+settlement registration rule. The library (135) and the four in-memory
+integration suites under Validation pass on macOS arm64.

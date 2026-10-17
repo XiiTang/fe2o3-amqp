@@ -31,10 +31,3 @@ impl<State: Clone> Consumer<State> {
         Producer::new(self.notifier.clone(), self.state.clone())
     }
 }
-
-pub trait Consume {
-    type Item: Send;
-    type Outcome: Send;
-
-    async fn consume(&self, item: Self::Item) -> Self::Outcome;
-}

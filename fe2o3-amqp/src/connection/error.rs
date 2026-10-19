@@ -174,6 +174,10 @@ pub(crate) enum ConnectionInnerError {
     /// Remote peer closed connection with error
     #[error("Remote peer closed connection with error {}", .0)]
     RemoteClosedWithError(definitions::Error),
+
+    /// The incoming stream ended while the connection was open
+    #[error("Incoming stream closed")]
+    IncomingClosed,
 }
 
 impl<T> From<mpsc::error::SendError<T>> for ConnectionInnerError
@@ -241,6 +245,10 @@ impl From<ConnectionInnerError> for Error {
             ConnectionInnerError::NotFound(val) => Self::NotFound(val),
             ConnectionInnerError::RemoteClosed => Self::RemoteClosed,
             ConnectionInnerError::RemoteClosedWithError(val) => Self::RemoteClosedWithError(val),
+            // The stream's end, as a transport reports it.
+            ConnectionInnerError::IncomingClosed => Self::TransportError(transport::Error::Io(
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Incoming stream closed"),
+            )),
         }
     }
 }

@@ -50,7 +50,8 @@ Run from a configured Rust toolchain:
 cargo test -p fe2o3-amqp --lib --features transaction,acceptor
 cargo test -p fe2o3-amqp --features transaction,acceptor \
   --test large_message_split --test relay_remote_detach \
-  --test clean_teardown --test link_stop_reason --test detached_link_frames
+  --test clean_teardown --test link_stop_reason --test detached_link_frames \
+  --test engine_first_failure
 ```
 
 The consolidated integration passes 83 library and 22 in-memory integration
@@ -393,3 +394,33 @@ took no credit. With the routes kept, the sender's disposition removes the
 next receiver's retained delivery. The library (140) and the in-memory
 integration suites under Validation with `detached_link_frames` pass, and
 strict Clippy passes, on macOS arm64 / Rust 1.97.0.
+
+## An engine's first failure is how it ended (Boundless, AMQP 1.0 stop reasons)
+
+A connection engine that met a protocol violation, a frame illegal in its
+state, a session the peer opens or a frame for no session, answered it with
+a Close and waited for the peer's; when the peer ended its stream instead,
+the end the wait met replaced the violation as the engine's result, so the
+owner saw only the end of a stream, which Boundless reports as the peer's
+normal end. An opening that failed lost its failure the same way to its
+Close. Upstream 0.18.1 has both.
+
+`event_loop` keeps its first failure where it meets what `on_error`'s
+cleanup returns, for every failure that cleanup handles, and the opening
+keeps its failure over its Close's. An incoming stream that ends while the
+connection is open is now its own first failure, `IncomingClosed`: it gets
+the Close an illegal state gets, as before, and reports as the stream's end
+(`Error::TransportError(Io(UnexpectedEof))`), so an owner can still tell a
+stream that ended on its own from a violation before it, as qpid-proton
+keeps a transport's first error condition.
+
+`tests/engine_first_failure.rs` scripts the peer over an in-memory stream: a
+second Open, a Begin that opens a session and an End for no session, each
+followed by the end of the stream, end the engine with that failure after
+the client sent the matching Close; an Open answered by a Begin fails the
+opening with `IllegalState`; a stream that ends on its own still ends with
+`UnexpectedEof` after the client's Close (amqp:illegal-state). On the
+preceding pin the four failure cases fail, ending with the "Expecting remote
+close" end of the stream instead. The library and the in-memory integration
+suites under Validation pass, and strict Clippy passes, on macOS arm64 /
+Rust 1.97.0.

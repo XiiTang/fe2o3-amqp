@@ -264,29 +264,10 @@ where
         match engine.open_inner().await {
             Ok(_) => Ok(engine),
             Err(error) => {
-                match engine.close_connection(None).await {
-                    Ok(_) => Err(error),
-                    Err(error) => match error {
-                        ConnectionInnerError::TransportError(e) => {
-                            Err(OpenError::TransportError(e))
-                        }
-                        ConnectionInnerError::IllegalState => Err(OpenError::IllegalState),
-                        ConnectionInnerError::NotImplemented(e) => {
-                            Err(OpenError::NotImplemented(e))
-                        }
-                        ConnectionInnerError::RemoteClosed => Err(OpenError::RemoteClosed),
-                        ConnectionInnerError::RemoteClosedWithError(e) => {
-                            Err(OpenError::RemoteClosedWithError(e))
-                        }
-                        ConnectionInnerError::NotFound(_) => {
-                            // This will only occur when the remote is trying to send to a session
-                            // which is not supported currently
-                            Err(OpenError::NotImplemented(Some(String::from(
-                                "Pipelined open is not implemented",
-                            ))))
-                        }
-                    },
-                }
+                // The opening's failure is how it ended: what closing the
+                // connection after it meets does not replace it.
+                let _ = engine.close_connection(None).await;
+                Err(error)
             }
         }
     }
@@ -528,7 +509,9 @@ where
     ) -> Result<Running, ConnectionInnerError> {
         match error {
             ConnectionInnerError::TransportError(_) => Ok(Running::Stop),
-            ConnectionInnerError::IllegalState => {
+            // The stream that ended while the connection was open gets the
+            // Close an illegal state does.
+            ConnectionInnerError::IllegalState | ConnectionInnerError::IncomingClosed => {
                 let error = definitions::Error::new(AmqpError::IllegalState, None, None);
                 self.close_connection(Some(error)).await?;
                 Ok(Running::Stop)
@@ -585,7 +568,7 @@ where
                                 | ConnectionState::OpenSent
                                 | ConnectionState::Opened
                                 | ConnectionState::CloseReceived
-                                | ConnectionState::CloseSent => Err(ConnectionInnerError::IllegalState),
+                                | ConnectionState::CloseSent => Err(ConnectionInnerError::IncomingClosed),
                                 ConnectionState::ClosePipe
                                 | ConnectionState::Discarding
                                 | ConnectionState::End => Ok(Running::Stop),
@@ -660,22 +643,23 @@ where
                     tracing::error!("{:?}", error);
                     #[cfg(feature = "log")]
                     log::error!("{:?}", error);
-                    // let running = self.on_error(&error).await;
-                    match self.on_error(&error).await {
-                        Ok(running) => {
-                            outcome = Err(error);
-                            running
-                        }
-                        Err(error) => {
+                    // The first failure is how the engine ended: what its
+                    // cleanup meets after it, a Close that cannot be sent or a
+                    // stream that ends before the peer's Close, does not
+                    // replace it.
+                    let running = match self.on_error(&error).await {
+                        Ok(running) => running,
+                        Err(_cleanup) => {
                             // Stop the session if error cannot be handled
                             #[cfg(feature = "tracing")]
-                            tracing::error!("Unable to handle error {:?}", error);
+                            tracing::error!("Unable to handle error {:?}", _cleanup);
                             #[cfg(feature = "log")]
-                            log::error!("Unable to handle error {:?}", error);
-                            outcome = Err(error);
+                            log::error!("Unable to handle error {:?}", _cleanup);
                             Running::Stop
                         }
-                    }
+                    };
+                    outcome = Err(error);
+                    running
                 }
             };
 

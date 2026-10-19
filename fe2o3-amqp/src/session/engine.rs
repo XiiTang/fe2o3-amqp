@@ -244,8 +244,9 @@ where
                 // If the peer detached the link on its own, the relay has a
                 // reply to send back. The reply goes out through the same
                 // path as any other detach, and no answer is expected for it.
-                if let Some(detach) = self.session.on_incoming_detach(detach).await? {
-                    if let Some(frame) = self.session.on_outgoing_detach(detach, false) {
+                if let Some((detach, attachment)) = self.session.on_incoming_detach(detach).await? {
+                    if let Some(frame) = self.session.on_outgoing_detach(detach, attachment, false)
+                    {
                         self.outgoing.send(frame).await.map_err(|_| {
                             SessionInnerError::ConnectionStopped(connection_stop_reason_or_closed(
                                 self.session.connection_stop_reason(),
@@ -325,9 +326,9 @@ where
                 responder,
             } => {
                 let result = self.session.allocate_link(link_name, Some(link_relay));
-                if let Err(Ok(handle)) = responder.send(result.map_err(Into::into)) {
+                if let Err(Ok(attachment)) = responder.send(result.map_err(Into::into)) {
                     // Cancelling a local allocator must not end sibling links.
-                    self.session.deallocate_link(handle);
+                    self.session.deallocate_link(&attachment);
                 }
             }
             SessionControl::AllocateIncomingLink {
@@ -344,8 +345,8 @@ where
                     // The receiving end (ie. link) must have been stopped
                     .map_err(|_| SessionInnerError::UnattachedHandle)?;
             }
-            SessionControl::DeallocateLink(link_name) => {
-                self.session.deallocate_link(link_name);
+            SessionControl::DeallocateLink(attachment) => {
+                self.session.deallocate_link(&attachment);
             }
             SessionControl::Disposition(disposition) => {
                 let disposition = self.session.on_outgoing_disposition(disposition)?;
@@ -419,19 +420,20 @@ where
                 .on_outgoing_attach(attach)
                 .map(SessionOutgoingItem::SingleFrame)
                 .map(Some)?,
-            LinkFrame::Flow(flow) => self
+            LinkFrame::Flow(flow, attachment) => self
                 .session
-                .on_outgoing_flow(flow)
-                .map(SessionOutgoingItem::SingleFrame)
-                .map(Some)?,
+                .on_outgoing_flow(flow, attachment)?
+                .map(SessionOutgoingItem::SingleFrame),
             LinkFrame::Transfer {
                 window_slot: _,
                 queue_slot,
                 input_handle,
+                attachment,
                 performative,
                 payload,
             } => self.session.on_outgoing_transfer(
                 input_handle,
+                attachment,
                 performative,
                 payload,
                 queue_slot,
@@ -441,9 +443,9 @@ where
                 .on_outgoing_disposition(disposition)
                 .map(SessionOutgoingItem::SingleFrame)
                 .map(Some)?,
-            LinkFrame::Detach(detach) => self
+            LinkFrame::Detach(detach, attachment) => self
                 .session
-                .on_outgoing_detach(detach, true)
+                .on_outgoing_detach(detach, attachment, true)
                 .map(SessionOutgoingItem::SingleFrame),
 
             #[cfg(feature = "transaction")]
@@ -862,5 +864,302 @@ mod allocation_cancel_tests {
         waiter.await.unwrap().unwrap();
         assert_eq!(engine.session.link_name_by_output_handle.len(), 1);
         assert!(matches!(engine.session.local_state, SessionState::Mapped));
+    }
+}
+
+/// Once the session replies to a peer's detach, the attachment it ended has
+/// no handle: a transfer, link flow or local detach the link made for it,
+/// queued before the reply went out, is not written after the reply.
+#[cfg(test)]
+mod detached_attachment_tests {
+    use super::*;
+    use crate::{
+        endpoint::{AttachmentId, InputHandle, LinkFlow, OutgoingChannel, OutputAttachment},
+        link::{
+            state::{LinkFlowState, LinkFlowStateInner},
+            unsettled_store::Store,
+            LinkRelay,
+        },
+        session::{Builder, SessionState},
+        util::Producer,
+        Payload,
+    };
+    use fe2o3_amqp_types::performatives::{Detach, Flow, Transfer};
+    use tokio::sync::Semaphore;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Stale {
+        Transfer,
+        Flow,
+        Detach,
+    }
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Path {
+        /// The frame reaches the session with the peer's window open.
+        Direct,
+        /// A transfer waits for the peer's window, which opens after the
+        /// reply.
+        ZeroWindowReplay,
+        /// The frame is still queued when the session ends, which consumes
+        /// it before its End.
+        EndDrain,
+        /// A later attachment holds the same handle when the frame arrives.
+        HandleReused,
+    }
+    struct Harness {
+        engine: SessionEngine<super::super::Session>,
+        link_frames: mpsc::Sender<LinkFrame>,
+        written: mpsc::Receiver<SessionFrame>,
+        _link_inboxes: Vec<mpsc::Receiver<LinkFrame>>,
+    }
+    fn harness() -> Harness {
+        let (conn_control, _) = mpsc::channel(1);
+        let (_, control) = mpsc::channel(1);
+        let (_, incoming) = mpsc::channel(1);
+        let (outgoing, written) = mpsc::channel(16);
+        let (link_frames, outgoing_link_frames) = mpsc::channel(16);
+        let mut session = Builder::new().into_session(
+            OutgoingChannel(0),
+            SessionState::Mapped,
+            Arc::new(OnceLock::new()),
+        );
+        session.remote_incoming_window = 8;
+        Harness {
+            engine: SessionEngine {
+                conn_control,
+                control,
+                incoming,
+                outgoing,
+                outgoing_link_frames,
+                session,
+            },
+            link_frames,
+            written,
+            _link_inboxes: Vec::new(),
+        }
+    }
+    impl Harness {
+        /// Allocates a sender link named `name` and attaches it as the peer's
+        /// input handle 0.
+        fn attach(&mut self, name: &str) -> OutputAttachment {
+            let (tx, inbox) = mpsc::channel(4);
+            self._link_inboxes.push(inbox);
+            let flow = Arc::new(LinkFlowState::sender(LinkFlowStateInner {
+                initial_delivery_count: 0,
+                delivery_count: 0,
+                link_credit: 8,
+                available: 0,
+                drain: false,
+                properties: None,
+            }));
+            let relay = LinkRelay::new_sender(
+                tx,
+                Producer::new(Arc::new(tokio::sync::Notify::new()), flow),
+                Arc::new(Store::new(None)),
+            );
+            let attachment = self
+                .engine
+                .session
+                .allocate_link(name.into(), Some(relay))
+                .unwrap();
+            let relay = self
+                .engine
+                .session
+                .link_by_name
+                .get_mut(name)
+                .unwrap()
+                .take()
+                .unwrap();
+            self.engine
+                .session
+                .link_by_input_handle
+                .insert(InputHandle(0), relay);
+            attachment
+        }
+        async fn peer_detaches(&mut self) {
+            let detach = Detach {
+                handle: 0u32.into(),
+                closed: true,
+                error: None,
+            };
+            self.engine
+                .on_incoming(SessionFrame::new(0u16, SessionFrameBody::Detach(detach)))
+                .await
+                .unwrap();
+        }
+        async fn handle(&mut self, frame: LinkFrame) {
+            self.engine.on_outgoing_link_frames(frame).await.unwrap();
+        }
+        async fn peer_opens_window(&mut self) {
+            let flow = Flow {
+                next_incoming_id: Some(self.engine.session.next_outgoing_id),
+                incoming_window: 8,
+                next_outgoing_id: 0,
+                outgoing_window: 8,
+                handle: None,
+                delivery_count: None,
+                link_credit: None,
+                available: None,
+                drain: false,
+                echo: false,
+                properties: None,
+            };
+            self.engine
+                .on_incoming(SessionFrame::new(0u16, SessionFrameBody::Flow(flow)))
+                .await
+                .unwrap();
+        }
+    }
+    fn transfer(attachment: AttachmentId, tag: u8, permit: &Arc<Semaphore>) -> LinkFrame {
+        let mut performative: Transfer =
+            serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x55, 0x43])
+                .unwrap();
+        performative.delivery_tag = Some(vec![tag].into());
+        LinkFrame::Transfer {
+            input_handle: InputHandle(0),
+            attachment,
+            performative,
+            payload: Payload::from_static(b"data"),
+            window_slot: None,
+            queue_slot: Some(permit.clone().try_acquire_owned().unwrap()),
+        }
+    }
+    fn stale(kind: Stale, attachment: AttachmentId, permit: &Arc<Semaphore>) -> LinkFrame {
+        match kind {
+            Stale::Transfer => transfer(attachment, 1, permit),
+            Stale::Flow => LinkFrame::Flow(
+                LinkFlow {
+                    handle: 0u32.into(),
+                    link_credit: Some(8),
+                    ..Default::default()
+                },
+                attachment,
+            ),
+            Stale::Detach => LinkFrame::Detach(
+                Detach {
+                    handle: 0u32.into(),
+                    closed: true,
+                    error: None,
+                },
+                attachment,
+            ),
+        }
+    }
+    #[tokio::test]
+    async fn a_frame_of_an_attachment_the_peer_detached_is_not_written_after_the_reply() {
+        for kind in [Stale::Transfer, Stale::Flow, Stale::Detach] {
+            for path in [
+                Path::Direct,
+                Path::ZeroWindowReplay,
+                Path::EndDrain,
+                Path::HandleReused,
+            ] {
+                if path == Path::ZeroWindowReplay && !matches!(kind, Stale::Transfer) {
+                    // Only transfers wait for the peer's window.
+                    continue;
+                }
+                let case = format!("{kind:?} {path:?}");
+                let mut h = harness();
+                let permits = Arc::new(Semaphore::new(1));
+                let a = h.attach("A");
+                if path == Path::ZeroWindowReplay {
+                    h.engine.session.remote_incoming_window = 0;
+                    h.handle(stale(kind, a.id, &permits)).await;
+                    assert_eq!(
+                        h.engine
+                            .session
+                            .remote_incoming_window_exhausted_buffer
+                            .len(),
+                        1,
+                        "{case}"
+                    );
+                }
+                h.peer_detaches().await;
+                assert!(
+                    matches!(
+                        h.written.try_recv().unwrap().body,
+                        SessionFrameBody::Detach(_)
+                    ),
+                    "{case}: the reply"
+                );
+                let next_outgoing_id = h.engine.session.next_outgoing_id;
+                let b = (path == Path::HandleReused).then(|| h.attach("B"));
+                if let Some(b) = &b {
+                    assert_eq!(b.handle, a.handle, "{case}: B reuses A's handle");
+                }
+                match path {
+                    Path::Direct | Path::HandleReused => {
+                        h.handle(stale(kind, a.id, &permits)).await
+                    }
+                    Path::ZeroWindowReplay => h.peer_opens_window().await,
+                    Path::EndDrain => {
+                        h.link_frames
+                            .send(stale(kind, a.id, &permits))
+                            .await
+                            .unwrap();
+                        h.engine
+                            .on_control(SessionControl::End(None))
+                            .await
+                            .unwrap();
+                        assert!(
+                            matches!(h.written.try_recv().unwrap().body, SessionFrameBody::End(_)),
+                            "{case}: End follows the reply"
+                        );
+                    }
+                }
+                let window = h.engine.session.remote_incoming_window;
+                match h.written.try_recv() {
+                    Err(mpsc::error::TryRecvError::Empty) => {}
+                    Ok(frame) => panic!("{case}: wrote {:?}", frame.body),
+                    Err(error) => panic!("{case}: {error:?}"),
+                }
+                assert_eq!(
+                    h.engine.session.next_outgoing_id, next_outgoing_id,
+                    "{case}: no transfer-id taken"
+                );
+                assert_eq!(window, 8, "{case}: the peer's window is unchanged");
+                assert!(h.engine.session.delivery_tag_by_id.is_empty(), "{case}");
+                assert!(
+                    h.engine
+                        .session
+                        .remote_incoming_window_exhausted_buffer
+                        .is_empty(),
+                    "{case}"
+                );
+                assert!(h.engine.session.close_pending.is_empty(), "{case}");
+                assert_eq!(
+                    permits.available_permits(),
+                    1,
+                    "{case}: queue room released"
+                );
+                if let Some(b) = b {
+                    // B still holds the handle and its own frames go out.
+                    assert!(h
+                        .engine
+                        .session
+                        .is_current_output_attachment(&b.handle, b.id));
+                    h.handle(transfer(b.id, 2, &permits)).await;
+                    let SessionFrameBody::Transfer { performative, .. } =
+                        h.written.try_recv().unwrap().body
+                    else {
+                        panic!("{case}: B's transfer")
+                    };
+                    assert_eq!(performative.delivery_id, Some(next_outgoing_id), "{case}");
+                    assert_eq!(h.engine.session.delivery_tag_by_id.len(), 1, "{case}");
+                    let flow = LinkFlow {
+                        handle: b.handle.clone().into(),
+                        ..Default::default()
+                    };
+                    h.handle(LinkFrame::Flow(flow, b.id)).await;
+                    assert!(
+                        matches!(
+                            h.written.try_recv().unwrap().body,
+                            SessionFrameBody::Flow(_)
+                        ),
+                        "{case}: B's flow"
+                    );
+                }
+            }
+        }
     }
 }

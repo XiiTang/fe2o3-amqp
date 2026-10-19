@@ -1,32 +1,42 @@
+use crate::Payload;
 use fe2o3_amqp_types::{
     definitions::MessageFormat,
     messaging::{DeliveryState, Received},
 };
-use tokio::sync::oneshot;
 
-use crate::Payload;
+use super::delivery::UnsettledMessage;
 
-use super::{delivery::UnsettledMessage, error::LinkStateError};
-
+/// What a resume does with one local delivery, which stays in the unsettled
+/// store until the step that settles it, gives it a new tag or aborts it has
+/// been handed to the session, so a resume cut short leaves every delivery it
+/// has not finished for the next resume, or the close, to settle.
 pub(crate) enum ResumingDelivery {
     Abort {
         message_format: MessageFormat,
-        sender: Option<oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>>,
     },
-    Resend(UnsettledMessage),
-    Resume(UnsettledMessage),
-    RestateOutcome {
-        payload: Payload,
-        local_state: DeliveryState,
-        message_format: MessageFormat,
-        sender: oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>,
+    /// Sends the delivery again as a new one, with a new tag.
+    Resend,
+    /// Resumes the delivery from `remaining`, the part of its payload the
+    /// peer has yet to receive.
+    Resume {
+        remaining: Payload,
     },
+    /// Restates the local terminal outcome.
+    RestateOutcome,
+}
+
+/// What reconciling one delivery with the peer's unsettled map decided.
+pub(crate) enum Resumption {
+    Resuming(ResumingDelivery),
+    /// Nothing is left to send: the delivery settles with this state.
+    Settle(Option<DeliveryState>),
 }
 
 pub(crate) fn resume_delivery(
-    mut local: UnsettledMessage,
+    local: &UnsettledMessage,
     remote: Option<Option<DeliveryState>>,
-) -> Option<ResumingDelivery> {
+) -> Resumption {
+    use Resumption::{Resuming, Settle};
     // The outer None indicates absence of entry
     let remote_state = remote.map(|inner| {
         // The inner None indicates absence of DeliveryState, which is equivalent to
@@ -43,14 +53,13 @@ pub(crate) fn resume_delivery(
         | (Some(DeliveryState::Declared(_)), _)
         | (Some(DeliveryState::TransactionalState(_)), _) => {
             // Illegal delivery states?
-            Some(ResumingDelivery::Abort {
+            Resuming(ResumingDelivery::Abort {
                 message_format: local.message_format,
-                sender: Some(local.sender),
             })
         }
 
         // delivery-tag 1 example
-        (None, None) => Some(ResumingDelivery::Resend(local)),
+        (None, None) => Resuming(ResumingDelivery::Resend),
 
         // delivery-tag 2 and 4 example
         //
@@ -69,29 +78,18 @@ pub(crate) fn resume_delivery(
                 *section_number as usize,
                 *section_offset as usize,
             )
-            .unwrap_or(local.payload);
-            local.payload = remaining;
-            Some(ResumingDelivery::Resume(local))
+            .unwrap_or_else(|| local.payload.clone());
+            Resuming(ResumingDelivery::Resume { remaining })
         }
 
         // delivery-tag 3 example
         (None, Some(DeliveryState::Accepted(_)))
         | (None, Some(DeliveryState::Modified(_)))
         | (None, Some(DeliveryState::Rejected(_)))
-        | (None, Some(DeliveryState::Released(_))) => {
-            // This will fail if the oneshot receiver is already dropped
-            // which means the application probably doesn't care about the
-            // delivery state anyway
-            let _ = local.settle_with_state(remote_state);
-            #[cfg(feature = "tracing")]
-            tracing::error!(error = "Delivery handles are already dropped");
-            #[cfg(feature = "log")]
-            log::error!("error = Delivery handles are already dropped");
-            None
-        }
+        | (None, Some(DeliveryState::Released(_))) => Settle(remote_state),
 
         // delivery-tag 5 example
-        (Some(DeliveryState::Received(_)), None) => Some(ResumingDelivery::Resend(local)),
+        (Some(DeliveryState::Received(_)), None) => Resuming(ResumingDelivery::Resend),
 
         // delivery-tag 6, 7 and 9 examples
         (
@@ -105,17 +103,15 @@ pub(crate) fn resume_delivery(
                     remote_recved.section_number as usize,
                     remote_recved.section_offset as usize,
                 )
-                .unwrap_or(local.payload);
-                local.payload = remaining;
-                Some(ResumingDelivery::Resume(local))
+                .unwrap_or_else(|| local.payload.clone());
+                Resuming(ResumingDelivery::Resume { remaining })
             } else {
                 // delivery-tag 7 and 9 case
                 //
                 // delivery-tag 9 has a null in the remote value,
                 // which is equivalent to (0, 0)
-                Some(ResumingDelivery::Abort {
+                Resuming(ResumingDelivery::Abort {
                     message_format: local.message_format,
-                    sender: Some(local.sender),
                 })
             }
         }
@@ -127,15 +123,7 @@ pub(crate) fn resume_delivery(
         | (Some(DeliveryState::Received(_)), Some(DeliveryState::Modified(_)))
         | (Some(DeliveryState::Received(_)), Some(DeliveryState::Rejected(_)))
         | (Some(DeliveryState::Received(_)), Some(DeliveryState::Released(_))) => {
-            // This will fail if the oneshot receiver is already dropped
-            // which means the application probably doesn't care about the
-            // delivery state anyway
-            let _ = local.settle_with_state(remote_state);
-            #[cfg(feature = "tracing")]
-            tracing::error!(error = "Delivery handles are already dropped");
-            #[cfg(feature = "log")]
-            log::error!("error = Delivery handles are already dropped");
-            None
+            Settle(remote_state)
         }
 
         // delivery-tag 10 example
@@ -148,10 +136,7 @@ pub(crate) fn resume_delivery(
         (Some(DeliveryState::Accepted(_)), None)
         | (Some(DeliveryState::Modified(_)), None)
         | (Some(DeliveryState::Rejected(_)), None)
-        | (Some(DeliveryState::Released(_)), None) => {
-            let _ = local.settle();
-            None
-        }
+        | (Some(DeliveryState::Released(_)), None) => Settle(local.state.clone()),
 
         // delivery-tag 11 and 14 case
         //
@@ -166,9 +151,8 @@ pub(crate) fn resume_delivery(
         | (Some(DeliveryState::Modified(_)), Some(DeliveryState::Received(_)))
         | (Some(DeliveryState::Rejected(_)), Some(DeliveryState::Received(_)))
         | (Some(DeliveryState::Released(_)), Some(DeliveryState::Received(_))) => {
-            Some(ResumingDelivery::Abort {
+            Resuming(ResumingDelivery::Abort {
                 message_format: local.message_format,
-                sender: Some(local.sender),
             })
         }
 
@@ -181,8 +165,7 @@ pub(crate) fn resume_delivery(
         | (Some(DeliveryState::Modified(_)), Some(DeliveryState::Modified(_)))
         | (Some(DeliveryState::Rejected(_)), Some(DeliveryState::Rejected(_)))
         | (Some(DeliveryState::Released(_)), Some(DeliveryState::Released(_))) => {
-            let _ = local.settle();
-            None
+            Settle(local.state.clone())
         }
 
         // delivery-tag 13 example
@@ -191,12 +174,7 @@ pub(crate) fn resume_delivery(
         // outcomes differ. In this case, since the outcome actually takes effect at the sender, it
         // is the sender’s view that is definitive. The sender thus MUST restate this as the
         // terminal outcome, and the receiver SHOULD then echo this and settle.
-        (Some(local_state), Some(_)) => Some(ResumingDelivery::RestateOutcome {
-            message_format: local.message_format,
-            local_state: local_state.clone(),
-            payload: local.payload,
-            sender: local.sender,
-        }),
+        (Some(_), Some(_)) => Resuming(ResumingDelivery::RestateOutcome),
     }
 }
 
@@ -218,6 +196,9 @@ fn split_off_at_section_and_offset(
 #[cfg(test)]
 mod tests {
     use fe2o3_amqp_types::messaging::{Accepted, Modified, Rejected, Released};
+    use tokio::sync::oneshot;
+
+    use crate::link::LinkStateError;
 
     use super::*;
 
@@ -271,13 +252,10 @@ mod tests {
             DeliveryState::Released(Released {}),
         ] {
             let (local, _rx) = unsettled_with_state(Some(state));
-            let resuming = resume_delivery(local, Some(Some(received(0, 0))));
+            let resuming = resume_delivery(&local, Some(Some(received(0, 0))));
             assert!(matches!(
                 resuming,
-                Some(ResumingDelivery::Abort {
-                    message_format: 0,
-                    sender: Some(_)
-                })
+                Resumption::Resuming(ResumingDelivery::Abort { message_format: 0 })
             ));
         }
     }
@@ -287,16 +265,22 @@ mod tests {
     #[test]
     fn local_received_beyond_remote_aborts() {
         let (local, _rx) = unsettled_with_state(Some(received(1, 5)));
-        let resuming = resume_delivery(local, Some(Some(received(1, 2))));
-        assert!(matches!(resuming, Some(ResumingDelivery::Abort { .. })));
+        let resuming = resume_delivery(&local, Some(Some(received(1, 2))));
+        assert!(matches!(
+            resuming,
+            Resumption::Resuming(ResumingDelivery::Abort { .. })
+        ));
     }
 
     /// The peer received at least as much as the sender: resume the remainder.
     #[test]
     fn local_received_up_to_remote_resumes() {
         let (local, _rx) = unsettled_with_state(Some(received(1, 2)));
-        let resuming = resume_delivery(local, Some(Some(received(1, 2))));
-        assert!(matches!(resuming, Some(ResumingDelivery::Resume(_))));
+        let resuming = resume_delivery(&local, Some(Some(received(1, 2))));
+        assert!(matches!(
+            resuming,
+            Resumption::Resuming(ResumingDelivery::Resume { .. })
+        ));
     }
 
     #[cfg(feature = "transaction")]
@@ -307,7 +291,10 @@ mod tests {
         let txn_id = Binary::from(vec![0u8; 4]);
         let remote = Some(Some(DeliveryState::Declared(Declared { txn_id })));
         let (local, _rx) = unsettled_with_state(None);
-        let resuming = resume_delivery(local, remote);
-        assert!(matches!(resuming, Some(ResumingDelivery::Abort { .. })));
+        let resuming = resume_delivery(&local, remote);
+        assert!(matches!(
+            resuming,
+            Resumption::Resuming(ResumingDelivery::Abort { .. })
+        ));
     }
 }

@@ -25,7 +25,10 @@ use tokio::{
 use crate::{
     connection::ConnectionStopReason,
     control::SessionControl,
-    endpoint::{self, IncomingChannel, InputHandle, LinkFlow, OutgoingChannel, OutputHandle},
+    endpoint::{
+        self, AttachmentId, IncomingChannel, InputHandle, LinkFlow, OutgoingChannel,
+        OutputAttachment, OutputHandle,
+    },
     link::{LinkFrame, LinkRelay, SessionStopReason},
     util::{is_consecutive, Constant},
     Payload,
@@ -283,7 +286,7 @@ pub(crate) async fn allocate_link(
     link_name: String,
     link_relay: LinkRelay<()>,
     session_stop_reason: &Arc<OnceLock<SessionStopReason>>,
-) -> Result<OutputHandle, AllocLinkError> {
+) -> Result<OutputAttachment, AllocLinkError> {
     let (responder, resp_rx) = oneshot::channel();
 
     let reason = || match session_stop_reason.get() {
@@ -386,12 +389,7 @@ pub struct Session {
     pub(crate) receive_window: Arc<receive_window::ReceiveWindow>,
     pub(crate) remote_incoming_window: SequenceNo,
     // Outgoing transfers that are blocked by the remote-incoming-window
-    pub(crate) remote_incoming_window_exhausted_buffer: VecDeque<(
-        InputHandle,
-        Transfer,
-        Payload,
-        Option<tokio::sync::OwnedSemaphorePermit>,
-    )>,
+    pub(crate) remote_incoming_window_exhausted_buffer: VecDeque<BufferedTransfer>,
 
     // The remote-outgoing-window reflects the maximum number of incoming transfers that MAY
     // arrive without exceeding the remote endpoint’s outgoing-window. This value MUST be
@@ -406,16 +404,27 @@ pub struct Session {
     pub(crate) desired_capabilities: Option<Vec<Symbol>>,
     pub(crate) properties: Option<Fields>,
 
-    // local links by output handle
-    pub(crate) link_name_by_output_handle: Slab<String>,
-    pub(crate) link_by_name: HashMap<String, Option<LinkRelay<OutputHandle>>>,
-    pub(crate) link_by_input_handle: HashMap<InputHandle, LinkRelay<OutputHandle>>,
-    // Output handles of links whose own detach/close has been sent and is
-    // still awaiting the peer's answer
-    pub(crate) close_pending: HashSet<OutputHandle>,
+    // local links by output handle, with the attachment each handle is
+    // allocated to
+    pub(crate) link_name_by_output_handle: Slab<(String, AttachmentId)>,
+    pub(crate) link_by_name: HashMap<String, Option<LinkRelay<OutputAttachment>>>,
+    pub(crate) link_by_input_handle: HashMap<InputHandle, LinkRelay<OutputAttachment>>,
+    // Attachments whose own detach/close has been sent and is still awaiting
+    // the peer's answer
+    pub(crate) close_pending: HashSet<OutputAttachment>,
     // Maps from DeliveryId to link.DeliveryCount
     pub(crate) delivery_tag_by_id: HashMap<(Role, DeliveryNumber), (InputHandle, DeliveryTag)>, // Role must be the remote peer's role
 }
+
+/// An outgoing transfer waiting for the peer's session window, with the
+/// attachment it was made for.
+pub(crate) type BufferedTransfer = (
+    InputHandle,
+    AttachmentId,
+    Transfer,
+    Payload,
+    Option<tokio::sync::OwnedSemaphorePermit>,
+);
 
 impl Session {
     /// Creates a builder for [`Session`]
@@ -452,13 +461,38 @@ impl Session {
         }
     }
 
+    /// Whether `id` still holds output handle `handle`: the one check every
+    /// transfer, link flow and local detach passes before it goes out. Once
+    /// the session sends the detach that ends an attachment (its own, or its
+    /// reply to the peer's), the handle is released, and a frame the link
+    /// made for that attachment, still queued or waiting for the peer's
+    /// window, must not go out, even when a later attachment reuses the
+    /// handle number.
+    pub(crate) fn is_current_output_attachment(
+        &self,
+        handle: &OutputHandle,
+        id: AttachmentId,
+    ) -> bool {
+        self.link_name_by_output_handle
+            .get(handle.0 as usize)
+            .is_some_and(|(_, current)| *current == id)
+    }
+
+    /// The frame for an outgoing transfer, or `None` when its attachment no
+    /// longer holds its handle: then it takes no transfer-id, leaves the
+    /// peer's window as it was, and its queue room is released.
     fn on_outgoing_transfer_inner(
         &mut self,
         input_handle: InputHandle,
+        attachment: AttachmentId,
         mut transfer: Transfer,
         payload: Payload,
         queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
-    ) -> Result<SessionFrame, SessionInnerError> {
+    ) -> Result<Option<SessionFrame>, SessionInnerError> {
+        if !self.is_current_output_attachment(&transfer.handle.clone().into(), attachment) {
+            return Ok(None);
+        }
+
         // Upon sending a transfer, the sending endpoint will increment its next-outgoing-id, decre-
         // ment its remote-incoming-window, and MAY (depending on policy) decrement its outgoing-
         // window.
@@ -507,7 +541,7 @@ impl Session {
         };
         let mut frame = SessionFrame::new(self.outgoing_channel, body);
         frame.queue_slot = queue_slot;
-        Ok(frame)
+        Ok(Some(frame))
     }
 
     /// Build a session-only flow that re-advertises the session window. It carries no link
@@ -537,7 +571,7 @@ impl Session {
     async fn on_incoming_flow_inner(
         &mut self,
         flow: Flow,
-    ) -> Result<Option<LinkFlow>, SessionInnerError> {
+    ) -> Result<Option<(LinkFlow, AttachmentId)>, SessionInnerError> {
         // Handle session flow control
         //
         // When the endpoint receives a flow frame from its peer, it MUST update
@@ -579,12 +613,16 @@ impl Session {
     ) -> Result<Vec<SessionFrame>, SessionInnerError> {
         // Drain the buffered transfers as much as possible
         while self.remote_incoming_window > 0 {
-            if let Some((input_handle, transfer, payload, queue_slot)) =
+            if let Some((input_handle, attachment, transfer, payload, queue_slot)) =
                 self.remote_incoming_window_exhausted_buffer.pop_front()
             {
-                let frame =
-                    self.on_outgoing_transfer_inner(input_handle, transfer, payload, queue_slot)?;
-                output_frame_buffer.push(frame);
+                output_frame_buffer.extend(self.on_outgoing_transfer_inner(
+                    input_handle,
+                    attachment,
+                    transfer,
+                    payload,
+                    queue_slot,
+                )?);
             } else {
                 break;
             }
@@ -597,6 +635,7 @@ impl Session {
         &mut self,
         output_frame_buffer: Vec<SessionFrame>,
         cur_input_handle: InputHandle,
+        cur_attachment: AttachmentId,
         cur_transfer: Transfer,
         cur_payload: Payload,
         cur_queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -608,16 +647,17 @@ impl Session {
         // Then process the current transfer if there is still space in the
         // remote-incoming-window
         if self.remote_incoming_window > 0 {
-            let frame = self.on_outgoing_transfer_inner(
+            frames.extend(self.on_outgoing_transfer_inner(
                 cur_input_handle,
+                cur_attachment,
                 cur_transfer,
                 cur_payload,
                 cur_queue_slot,
-            )?;
-            frames.push(frame);
+            )?);
         } else {
             self.remote_incoming_window_exhausted_buffer.push_back((
                 cur_input_handle,
+                cur_attachment,
                 cur_transfer,
                 cur_payload,
                 cur_queue_slot,
@@ -658,7 +698,7 @@ impl endpoint::Session for Session {
         &mut self,
         link_name: String,
         link_relay: Option<LinkRelay<()>>, // TODO: why is this `Option`?
-    ) -> Result<OutputHandle, Self::AllocError> {
+    ) -> Result<OutputAttachment, Self::AllocError> {
         match &self.local_state {
             SessionState::Mapped => {}
             _ => {
@@ -707,8 +747,8 @@ impl endpoint::Session for Session {
                 _ => None,
             })
             .collect();
-        for handle in orphaned {
-            self.deallocate_link(handle);
+        for attachment in orphaned {
+            self.deallocate_link(&attachment);
         }
 
         // check whether link name is duplciated
@@ -718,12 +758,15 @@ impl endpoint::Session for Session {
 
         // get a new entry index
         let entry = self.link_name_by_output_handle.vacant_entry();
-        let handle = OutputHandle(entry.key() as u32);
+        let attachment = OutputAttachment {
+            handle: OutputHandle(entry.key() as u32),
+            id: AttachmentId::allocate(),
+        };
 
-        entry.insert(link_name.clone());
-        let value = link_relay.map(|val| val.with_output_handle(handle.clone()));
+        entry.insert((link_name.clone(), attachment.id));
+        let value = link_relay.map(|val| val.with_output_handle(attachment.clone()));
         self.link_by_name.insert(link_name, value);
-        Ok(handle)
+        Ok(attachment)
     }
 
     fn allocate_incoming_link(
@@ -731,30 +774,33 @@ impl endpoint::Session for Session {
         link_name: String,
         link_relay: LinkRelay<()>,
         input_handle: InputHandle,
-    ) -> Result<OutputHandle, Self::AllocError> {
+    ) -> Result<OutputAttachment, Self::AllocError> {
         match self.allocate_link(link_name, None) {
-            Ok(output_handle) => {
-                let value = link_relay.with_output_handle(output_handle.clone());
+            Ok(attachment) => {
+                let value = link_relay.with_output_handle(attachment.clone());
                 self.link_by_input_handle.insert(input_handle, value);
-                Ok(output_handle)
+                Ok(attachment)
             }
             Err(err) => Err(err),
         }
     }
 
-    /// This should only deallocate the output handle. Returns whether the
-    /// link's bookkeeping was still present (i.e. the detach is the first for
-    /// the link rather than a duplicate).
-    fn deallocate_link(&mut self, output_handle: OutputHandle) -> bool {
-        if let Some(name) = self
-            .link_name_by_output_handle
-            .try_remove(output_handle.0 as usize)
-        {
-            let _ = self.link_by_name.remove(&name);
-            true
-        } else {
-            false
+    /// This should only deallocate the output handle, and only while
+    /// `attachment` still holds it. Returns whether it did. Transfers of the
+    /// attachment still waiting for the peer's window can no longer go out,
+    /// so they are dropped and their queue room released; other links'
+    /// keep their order.
+    fn deallocate_link(&mut self, attachment: &OutputAttachment) -> bool {
+        if !self.is_current_output_attachment(&attachment.handle, attachment.id) {
+            return false;
         }
+        let (name, _) = self
+            .link_name_by_output_handle
+            .remove(attachment.handle.0 as usize);
+        let _ = self.link_by_name.remove(&name);
+        self.remote_incoming_window_exhausted_buffer
+            .retain(|(_, id, ..)| *id != attachment.id);
+        true
     }
 
     fn on_incoming_begin(
@@ -814,9 +860,10 @@ impl endpoint::Session for Session {
         flow: Flow,
     ) -> Result<Option<SessionOutgoingItem>, Self::Error> {
         let outgoing_link_flow = self.on_incoming_flow_inner(flow).await?;
-        let outgoing_session_flow = outgoing_link_flow
-            .map(|flow| self.on_outgoing_flow(flow))
-            .transpose()?;
+        let outgoing_session_flow = match outgoing_link_flow {
+            Some((flow, attachment)) => self.on_outgoing_flow(flow, attachment)?,
+            None => None,
+        };
 
         // Process buffered outgoing transfer frames if the updated remote-incoming-window is
         // greater than 0
@@ -965,21 +1012,29 @@ impl endpoint::Session for Session {
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
-    async fn on_incoming_detach(&mut self, detach: Detach) -> Result<Option<Detach>, Self::Error> {
+    async fn on_incoming_detach(
+        &mut self,
+        detach: Detach,
+    ) -> Result<Option<(Detach, AttachmentId)>, Self::Error> {
         #[cfg(feature = "tracing")]
         tracing::trace!(frame = ?detach);
         #[cfg(feature = "log")]
         log::trace!("RECV frame = {:?}", detach);
         // Remove the link by input handle
-        match self
-            .link_by_input_handle
-            .remove(&InputHandle::from(detach.handle.clone()))
-        {
+        let input_handle = InputHandle::from(detach.handle.clone());
+        match self.link_by_input_handle.remove(&input_handle) {
             Some(mut link) => {
                 let output_handle = match &link {
                     LinkRelay::Sender { output_handle, .. }
                     | LinkRelay::Receiver { output_handle, .. } => output_handle.clone(),
                 };
+                // The peer's dispositions for this link's deliveries are no
+                // longer routed through the input handle, which a later link
+                // may reuse, as qpid-proton drops a released link's
+                // deliveries from its session. The link keeps its own
+                // unsettled state for a resume.
+                self.delivery_tag_by_id
+                    .retain(|_, (handle, _)| *handle != input_handle);
                 // If the link is in `close_pending`, this detach answers the
                 // one the link sent itself; otherwise the peer detached the
                 // link on its own.
@@ -991,7 +1046,7 @@ impl endpoint::Session for Session {
                 // trait doc), which releases the link bookkeeping.
                 let response = link.on_incoming_detach(detach, remote_initiated).await;
 
-                Ok(response)
+                Ok(response.map(|reply| (reply, output_handle.id)))
             }
             None => {
                 // The link is no longer registered: both sides closed it at
@@ -1128,7 +1183,14 @@ impl endpoint::Session for Session {
         Ok(frame)
     }
 
-    fn on_outgoing_flow(&mut self, flow: LinkFlow) -> Result<SessionFrame, Self::Error> {
+    fn on_outgoing_flow(
+        &mut self,
+        flow: LinkFlow,
+        attachment: AttachmentId,
+    ) -> Result<Option<SessionFrame>, Self::Error> {
+        if !self.is_current_output_attachment(&flow.handle.clone().into(), attachment) {
+            return Ok(None);
+        }
         let flow = Flow {
             // Session flow states
             next_incoming_id: Some(self.next_incoming_id),
@@ -1147,7 +1209,7 @@ impl endpoint::Session for Session {
 
         let body = SessionFrameBody::Flow(flow);
         let frame = SessionFrame::new(self.outgoing_channel, body);
-        Ok(frame)
+        Ok(Some(frame))
     }
 
     /// Slots remain occupied while a frame waits in a link inbox. Consumption
@@ -1179,15 +1241,22 @@ impl endpoint::Session for Session {
     fn on_outgoing_transfer(
         &mut self,
         input_handle: InputHandle,
+        attachment: AttachmentId,
         transfer: Transfer,
         payload: Payload,
         queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Option<SessionOutgoingItem>, Self::Error> {
+        // A transfer of an ended attachment is not buffered for a later
+        // window either.
+        if !self.is_current_output_attachment(&transfer.handle.clone().into(), attachment) {
+            return Ok(None);
+        }
         // Check if remote-incoming-window is exhausted
         if self.remote_incoming_window == 0 {
             // exhausted
             self.remote_incoming_window_exhausted_buffer.push_back((
                 input_handle,
+                attachment,
                 transfer,
                 payload,
                 queue_slot,
@@ -1195,9 +1264,15 @@ impl endpoint::Session for Session {
             Ok(None)
         } else if self.remote_incoming_window_exhausted_buffer.is_empty() {
             // no buffered transfer
-            let frame =
-                self.on_outgoing_transfer_inner(input_handle, transfer, payload, queue_slot)?;
-            Ok(Some(SessionOutgoingItem::SingleFrame(frame)))
+            Ok(self
+                .on_outgoing_transfer_inner(
+                    input_handle,
+                    attachment,
+                    transfer,
+                    payload,
+                    queue_slot,
+                )?
+                .map(SessionOutgoingItem::SingleFrame))
         } else {
             let output_frame_buffer = Vec::with_capacity(
                 self.remote_incoming_window_exhausted_buffer
@@ -1207,6 +1282,7 @@ impl endpoint::Session for Session {
             self.prepare_session_frames_from_buffered_and_current_transfers(
                 output_frame_buffer,
                 input_handle,
+                attachment,
                 transfer,
                 payload,
                 queue_slot,
@@ -1245,25 +1321,32 @@ impl endpoint::Session for Session {
     }
 
     /// The single outbound path for detach frames (see the trait doc).
-    fn on_outgoing_detach(&mut self, detach: Detach, expects_echo: bool) -> Option<SessionFrame> {
-        let deallocated = self.deallocate_link(detach.handle.clone().into());
+    fn on_outgoing_detach(
+        &mut self,
+        detach: Detach,
+        attachment: AttachmentId,
+        expects_echo: bool,
+    ) -> Option<SessionFrame> {
+        let attachment = OutputAttachment {
+            handle: detach.handle.clone().into(),
+            id: attachment,
+        };
+        if !self.deallocate_link(&attachment) {
+            // The attachment already ended: both sides closed at the same
+            // time and the relay already answered the peer's detach, so this
+            // one would only repeat it, or the handle now belongs to a later
+            // attachment. The engine's own close/detach still completes — it
+            // consumes the peer's detach that the relay forwarded.
+            #[cfg(feature = "tracing")]
+            tracing::debug!("Suppressing a detach for an attachment that already ended");
+            #[cfg(feature = "log")]
+            log::debug!("Suppressing a detach for an attachment that already ended");
+            return None;
+        }
         if expects_echo {
             // Only a detach the link sent itself will be answered by the
-            // peer. An entry for any other detach would stay stale and could
-            // make a later detach on a reused handle look like it is waiting
-            // for an answer.
-            if !deallocated {
-                // Both sides closed at the same time: the relay already sent
-                // the closing detach for this link, so this one would only
-                // repeat it. The engine's own close/detach still completes —
-                // it consumes the peer's detach that the relay forwarded.
-                #[cfg(feature = "tracing")]
-                tracing::debug!("Suppressing duplicate locally initiated detach");
-                #[cfg(feature = "log")]
-                log::debug!("Suppressing duplicate locally initiated detach");
-                return None;
-            }
-            self.close_pending.insert(detach.handle.clone().into());
+            // peer. An entry for any other detach would stay stale.
+            self.close_pending.insert(attachment);
         }
         let body = SessionFrameBody::Detach(detach);
         Some(SessionFrame::new(self.outgoing_channel, body))
@@ -1376,7 +1459,7 @@ mod tests {
     #[tokio::test]
     async fn unread_transfers_hold_session_window_but_do_not_block_settlement() {
         use crate::{
-            endpoint::{InputHandle, OutputHandle},
+            endpoint::InputHandle,
             link::{
                 state::{LinkFlowState, LinkFlowStateInner},
                 unsettled_store::Store,
@@ -1405,7 +1488,7 @@ mod tests {
         }));
         let relay =
             LinkRelay::new_receiver(tx, flow, unsettled.clone(), ReceiverSettleMode::Second)
-                .with_output_handle(OutputHandle(0));
+                .with_output_handle(crate::endpoint::OutputAttachment::for_tests(0));
         session.link_by_input_handle.insert(InputHandle(0), relay);
         let template: Transfer =
             serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x55, 0x43])

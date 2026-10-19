@@ -15,7 +15,7 @@ use crate::{
     connection::{AllocSessionError, ConnectionStopReason},
     control::{ConnectionControl, SessionControl},
     endpoint::{
-        self, IncomingChannel, InputHandle, LinkFlow, OutgoingChannel, OutputHandle, Session,
+        self, IncomingChannel, InputHandle, AttachmentId, LinkFlow, OutgoingChannel, OutputAttachment, Session,
     },
     link::{LinkFrame, LinkRelay, SessionStopReason},
     session::{
@@ -66,7 +66,7 @@ pub(crate) async fn allocate_incoming_link(
     link_relay: LinkRelay<()>,
     input_handle: InputHandle,
     session_stop_reason: &Arc<OnceLock<SessionStopReason>>,
-) -> Result<OutputHandle, AllocLinkError> {
+) -> Result<OutputAttachment, AllocLinkError> {
     let (responder, resp_rx) = oneshot::channel();
 
     let reason = || match session_stop_reason.get() {
@@ -428,7 +428,7 @@ impl endpoint::Session for ListenerSession {
         &mut self,
         link_name: String,
         link_handle: Option<LinkRelay<()>>,
-    ) -> Result<OutputHandle, Self::AllocError> {
+    ) -> Result<OutputAttachment, Self::AllocError> {
         self.session.allocate_link(link_name, link_handle)
     }
 
@@ -437,7 +437,7 @@ impl endpoint::Session for ListenerSession {
         link_name: String,
         link_handle: LinkRelay<()>,
         input_handle: InputHandle,
-    ) -> Result<OutputHandle, Self::AllocError> {
+    ) -> Result<OutputAttachment, Self::AllocError> {
         let output_handle =
             self.session
                 .allocate_incoming_link(link_name, link_handle, input_handle.clone())?;
@@ -458,7 +458,7 @@ impl endpoint::Session for ListenerSession {
                             output_handle: ref oh,
                             ..
                         } => {
-                            let _echo = flow_state.state.on_incoming_flow(flow, oh.clone());
+                            let _echo = flow_state.state.on_incoming_flow(flow, oh.handle.clone());
                             flow_state.notifier.notify_waiters();
                         }
                         LinkRelay::Receiver {
@@ -466,7 +466,7 @@ impl endpoint::Session for ListenerSession {
                             output_handle: ref oh,
                             ..
                         } => {
-                            let _echo = flow_state.on_incoming_flow(flow, oh.clone());
+                            let _echo = flow_state.on_incoming_flow(flow, oh.handle.clone());
                         }
                     }
                 }
@@ -476,8 +476,8 @@ impl endpoint::Session for ListenerSession {
         Ok(output_handle)
     }
 
-    fn deallocate_link(&mut self, output_handle: OutputHandle) -> bool {
-        self.session.deallocate_link(output_handle)
+    fn deallocate_link(&mut self, attachment: &OutputAttachment) -> bool {
+        self.session.deallocate_link(attachment)
     }
 
     fn on_incoming_begin(
@@ -598,7 +598,7 @@ impl endpoint::Session for ListenerSession {
     async fn on_incoming_detach(
         &mut self,
         detach: Detach,
-    ) -> Result<Option<Detach>, Self::Error> {
+    ) -> Result<Option<(Detach, AttachmentId)>, Self::Error> {
         self.session.on_incoming_detach(detach).await
     }
 
@@ -631,8 +631,12 @@ impl endpoint::Session for ListenerSession {
         self.session.on_outgoing_attach(attach)
     }
 
-    fn on_outgoing_flow(&mut self, flow: LinkFlow) -> Result<SessionFrame, Self::Error> {
-        self.session.on_outgoing_flow(flow)
+    fn on_outgoing_flow(
+        &mut self,
+        flow: LinkFlow,
+        attachment: AttachmentId,
+    ) -> Result<Option<SessionFrame>, Self::Error> {
+        self.session.on_outgoing_flow(flow, attachment)
     }
 
     fn receive_window(&self) -> &Arc<crate::session::receive_window::ReceiveWindow> {
@@ -646,12 +650,13 @@ impl endpoint::Session for ListenerSession {
     fn on_outgoing_transfer(
         &mut self,
         input_handle: InputHandle,
+        attachment: AttachmentId,
         transfer: Transfer,
         payload: Payload,
         queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Option<SessionOutgoingItem>, Self::Error> {
         self.session
-            .on_outgoing_transfer(input_handle, transfer, payload, queue_slot)
+            .on_outgoing_transfer(input_handle, attachment, transfer, payload, queue_slot)
     }
 
     fn on_outgoing_disposition(
@@ -661,8 +666,14 @@ impl endpoint::Session for ListenerSession {
         self.session.on_outgoing_disposition(disposition)
     }
 
-    fn on_outgoing_detach(&mut self, detach: Detach, expects_echo: bool) -> Option<SessionFrame> {
-        self.session.on_outgoing_detach(detach, expects_echo)
+    fn on_outgoing_detach(
+        &mut self,
+        detach: Detach,
+        attachment: AttachmentId,
+        expects_echo: bool,
+    ) -> Option<SessionFrame> {
+        self.session
+            .on_outgoing_detach(detach, attachment, expects_echo)
     }
 }
 

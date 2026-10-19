@@ -88,6 +88,45 @@ impl From<OutputHandle> for Handle {
     }
 }
 
+/// One attachment of a link to an output handle. Every allocation, and every
+/// reallocation for a resume on the same or another session, takes an
+/// identity no attachment in the process had before, so a frame made for one
+/// attachment is never taken for a later one that reuses its handle number.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct AttachmentId(u64);
+
+impl AttachmentId {
+    /// A new identity; only a session allocating an output handle takes one.
+    pub(crate) fn allocate() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// A link's output handle together with the attachment it was allocated for.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct OutputAttachment {
+    pub handle: OutputHandle,
+    pub id: AttachmentId,
+}
+
+#[cfg(test)]
+impl OutputAttachment {
+    /// A new attachment of output handle `handle`.
+    pub(crate) fn for_tests(handle: u32) -> Self {
+        Self {
+            handle: OutputHandle(handle),
+            id: AttachmentId::allocate(),
+        }
+    }
+}
+
+impl From<OutputAttachment> for Handle {
+    fn from(attachment: OutputAttachment) -> Self {
+        attachment.handle.into()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, PartialOrd, Eq, Ord, Hash)]
 pub(crate) struct InputHandle(pub Uint);
 

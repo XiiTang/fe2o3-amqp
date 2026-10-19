@@ -21,7 +21,7 @@ cfg_not_wasm32! {
 
 use crate::{
     control::SessionControl,
-    endpoint::{self, LinkAttach, LinkDetach, LinkExt, LinkFlow, OutputHandle},
+    endpoint::{self, LinkAttach, LinkDetach, LinkExt, LinkFlow},
     session::SessionHandle,
     Payload,
 };
@@ -705,7 +705,7 @@ pub struct ReceiverDisposer {
     unsettled: ArcReceiverUnsettledMap,
     rcv_settle_mode: ReceiverSettleMode,
     flow_state: ReceiverFlowState,
-    output_handle: Option<OutputHandle>,
+    output_handle: Option<crate::endpoint::OutputAttachment>,
     processed: Arc<AtomicU32>,
     credit_mode: CreditMode,
     session_stop_reason: Arc<OnceLock<SessionStopReason>>,
@@ -796,11 +796,11 @@ impl ReceiverDisposer {
         if let CreditMode::Auto(max_credit) = self.credit_mode {
             if processed >= max_credit / 2 {
                 self.processed.store(0, Ordering::Release);
-                let handle: Handle = self
+                let attachment = self
                     .output_handle
                     .clone()
-                    .ok_or(DispositionError::IllegalState)?
-                    .into();
+                    .ok_or(DispositionError::IllegalState)?;
+                let handle: Handle = attachment.handle.into();
                 let delivery_count = {
                     let mut guard = self.flow_state.lock.write();
                     guard.link_credit = max_credit;
@@ -817,7 +817,7 @@ impl ReceiverDisposer {
                     properties: None,
                 };
                 self.outgoing
-                    .send(LinkFrame::Flow(flow))
+                    .send(LinkFrame::Flow(flow, attachment.id))
                     .await
                     .map_err(|_| match self.session_stop_reason.get() {
                         Some(reason) => DispositionError::SessionStopped(reason.clone()),
@@ -988,7 +988,7 @@ impl<L: endpoint::ReceiverLink> Drop for ReceiverInner<L> {
         // duplicate.
         let mut remote_detach_received = false;
         while let Ok(frame) = self.incoming.try_recv() {
-            if let LinkFrame::Detach(detach) = frame {
+            if let LinkFrame::Detach(detach, _) = frame {
                 remote_detach_received = true;
                 // If the state change fails, ignore it: the engine is being
                 // dropped anyway.
@@ -1005,13 +1005,16 @@ impl<L: endpoint::ReceiverLink> Drop for ReceiverInner<L> {
         }
 
         if !remote_detach_received {
-            if let Some(handle) = self.link.output_handle_mut().take() {
+            if let Some(attachment) = self.link.output_handle_mut().take() {
                 let detach = Detach {
-                    handle: handle.into(),
+                    handle: attachment.handle.into(),
                     closed: true,
                     error: None,
                 };
-                if let Err(_error) = self.outgoing.try_send(LinkFrame::Detach(detach)) {
+                if let Err(_error) = self
+                    .outgoing
+                    .try_send(LinkFrame::Detach(detach, attachment.id))
+                {
                     #[cfg(any(feature = "log", feature = "tracing"))]
                     {
                         let reason = match &_error {
@@ -1186,9 +1189,10 @@ where
         };
 
         match frame {
-            LinkFrame::Detach(detach) => Err(self.on_incoming_detach(detach).await),
+            LinkFrame::Detach(detach, _) => Err(self.on_incoming_detach(detach).await),
             LinkFrame::Transfer {
                 input_handle: _,
+                attachment: _,
                 performative,
                 payload,
                 window_slot,
@@ -1199,7 +1203,7 @@ where
                 result
             } // cancel safe
             LinkFrame::Attach(_) => Err(LinkStateError::IllegalState.into()),
-            LinkFrame::Flow(_) | LinkFrame::Disposition(_) => {
+            LinkFrame::Flow(..) | LinkFrame::Disposition(_) => {
                 // Flow and Disposition are handled by LinkRelay which runs
                 // in the session loop
                 unreachable!()
@@ -1293,7 +1297,7 @@ where
                 }
             }
             match self.incoming.recv().await {
-                Some(LinkFrame::Detach(detach)) => return self.on_incoming_detach(detach).await,
+                Some(LinkFrame::Detach(detach, _)) => return self.on_incoming_detach(detach).await,
                 Some(_) => continue,
                 None => return self.stopped(),
             }
@@ -2308,7 +2312,7 @@ impl DetachedReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoint::OutputHandle;
+
     use crate::link::state::{LinkFlowState, LinkFlowStateInner, LinkState};
     use crate::util::Sealed;
     use fe2o3_amqp_types::{definitions::SenderSettleMode, messaging::Received};
@@ -2341,7 +2345,7 @@ mod tests {
             unsettled,
             rcv_settle_mode: ReceiverSettleMode::First,
             flow_state: make_flow_state(200),
-            output_handle: Some(OutputHandle(1)),
+            output_handle: Some(crate::endpoint::OutputAttachment::for_tests(1)),
             processed: Arc::new(AtomicU32::new(0)),
             credit_mode,
             session_stop_reason: Arc::new(OnceLock::new()),
@@ -2397,7 +2401,7 @@ mod tests {
             .target("target")
             .create_link(
                 map.clone(),
-                OutputHandle(0),
+                crate::endpoint::OutputAttachment::for_tests(0),
                 make_flow_state(2),
                 Arc::new(OnceLock::new()),
                 65532,
@@ -2425,7 +2429,7 @@ mod tests {
         receiver.request_detach().await.unwrap();
         assert!(matches!(
             sent.recv().await.unwrap(),
-            LinkFrame::Detach(Detach { closed: false, .. })
+            LinkFrame::Detach(Detach { closed: false, .. }, _)
         ));
         let mut transfer: Transfer =
             serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x42, 0x43])
@@ -2434,6 +2438,7 @@ mod tests {
         incoming
             .send(LinkFrame::Transfer {
                 input_handle: crate::endpoint::InputHandle(0),
+                attachment: crate::endpoint::AttachmentId::allocate(),
                 performative: transfer.clone(),
                 payload: full.into(),
                 window_slot: None,
@@ -2447,6 +2452,7 @@ mod tests {
         incoming
             .send(LinkFrame::Transfer {
                 input_handle: crate::endpoint::InputHandle(0),
+                attachment: crate::endpoint::AttachmentId::allocate(),
                 performative: transfer,
                 payload: vec![0, 0x53, 0x75, 0xa0, 2, 0].into(),
                 window_slot: None,
@@ -2455,11 +2461,14 @@ mod tests {
             .await
             .unwrap();
         incoming
-            .send(LinkFrame::Detach(Detach {
-                handle: 0.into(),
-                closed: false,
-                error: None,
-            }))
+            .send(LinkFrame::Detach(
+                Detach {
+                    handle: 0.into(),
+                    closed: false,
+                    error: None,
+                },
+                crate::endpoint::AttachmentId::allocate(),
+            ))
             .await
             .unwrap();
         let delivery = receiver.recv::<Body<serde_amqp::Value>>().await.unwrap();
@@ -2552,7 +2561,7 @@ mod tests {
             .target("target")
             .create_link(
                 map.clone(),
-                OutputHandle(0),
+                crate::endpoint::OutputAttachment::for_tests(0),
                 make_flow_state(1),
                 Arc::new(OnceLock::new()),
                 65532,
@@ -2630,7 +2639,7 @@ mod tests {
             .target("target")
             .create_link(
                 map.clone(),
-                OutputHandle(0),
+                crate::endpoint::OutputAttachment::for_tests(0),
                 make_flow_state(0),
                 Arc::new(OnceLock::new()),
                 65532,
@@ -2809,7 +2818,7 @@ mod tests {
         while let Ok(frame) = rx.try_recv() {
             match frame {
                 LinkFrame::Disposition(_) => dispositions += 1,
-                LinkFrame::Flow(f) => {
+                LinkFrame::Flow(f, _) => {
                     flows += 1;
                     assert_eq!(f.link_credit, Some(max_credit));
                 }
@@ -2959,7 +2968,7 @@ mod tests {
             role: std::marker::PhantomData,
             local_state: LinkState::Attached,
             name: String::from("test-receiver"),
-            output_handle: Some(OutputHandle(0)),
+            output_handle: Some(crate::endpoint::OutputAttachment::for_tests(0)),
             input_handle: None,
             snd_settle_mode: SenderSettleMode::Mixed,
             rcv_settle_mode: ReceiverSettleMode::First,
@@ -3020,6 +3029,7 @@ mod tests {
     fn make_link_frame(transfer: Transfer, payload: Payload) -> LinkFrame {
         LinkFrame::Transfer {
             input_handle: crate::endpoint::InputHandle(0),
+            attachment: crate::endpoint::AttachmentId::allocate(),
             performative: transfer,
             payload,
             window_slot: None,
@@ -3076,7 +3086,7 @@ mod tests {
     ) -> RecvError {
         let (result, ()) = tokio::join!(inner.recv::<String>(), async {
             match outgoing_rx.recv().await.expect("expected a closing detach") {
-                LinkFrame::Detach(detach) => {
+                LinkFrame::Detach(detach, _) => {
                     assert!(detach.closed, "the error detach must close the link");
                     let error = detach
                         .error
@@ -3089,11 +3099,14 @@ mod tests {
 
             // Answer the closing detach to complete the handshake.
             incoming_tx
-                .send(LinkFrame::Detach(Detach {
-                    handle: Handle(0),
-                    closed: true,
-                    error: None,
-                }))
+                .send(LinkFrame::Detach(
+                    Detach {
+                        handle: Handle(0),
+                        closed: true,
+                        error: None,
+                    },
+                    crate::endpoint::AttachmentId::allocate(),
+                ))
                 .await
                 .unwrap();
         });
@@ -3178,7 +3191,7 @@ mod tests {
             biased;
             result = inner.recv::<String>() => panic!("recv ended before the answer: {result:?}"),
             frame = outgoing_rx.recv() => match frame {
-                Some(LinkFrame::Detach(detach)) => {
+                Some(LinkFrame::Detach(detach, _)) => {
                     assert!(detach.closed);
                     assert_eq!(detach.error.unwrap().condition, expected_condition);
                 }
@@ -3192,11 +3205,14 @@ mod tests {
     /// The peer's answer to a closing Detach.
     async fn answer_close(incoming_tx: &mpsc::Sender<LinkFrame>) {
         incoming_tx
-            .send(LinkFrame::Detach(Detach {
-                handle: Handle(0),
-                closed: true,
-                error: None,
-            }))
+            .send(LinkFrame::Detach(
+                Detach {
+                    handle: Handle(0),
+                    closed: true,
+                    error: None,
+                },
+                crate::endpoint::AttachmentId::allocate(),
+            ))
             .await
             .unwrap();
     }
@@ -3242,11 +3258,14 @@ mod tests {
         let mut queued = 0;
         while inner
             .outgoing
-            .try_send(LinkFrame::Detach(Detach {
-                handle: Handle(9),
-                closed: false,
-                error: None,
-            }))
+            .try_send(LinkFrame::Detach(
+                Detach {
+                    handle: Handle(9),
+                    closed: false,
+                    error: None,
+                },
+                crate::endpoint::AttachmentId::allocate(),
+            ))
             .is_ok()
         {
             queued += 1;

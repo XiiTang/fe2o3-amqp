@@ -3,7 +3,7 @@
 use std::sync::{Arc, OnceLock};
 
 use bytes::{Bytes, BytesMut};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 cfg_not_wasm32! {
     use std::time::Duration;
@@ -28,7 +28,7 @@ use crate::{
 
 use super::{
     builder::{self, WithSource, WithoutName, WithoutTarget},
-    delivery::{DeliveryFut, Sendable, UnsettledMessage},
+    delivery::{DeliveryFut, Sendable},
     error::DetachError,
     resumption::ResumingDelivery,
     role,
@@ -222,7 +222,7 @@ impl Sender {
             return Err(self);
         }
         while let Ok(frame) = self.inner.incoming.try_recv() {
-            if let LinkFrame::Detach(detach) = frame {
+            if let LinkFrame::Detach(detach, _) = frame {
                 if detach.closed {
                     self.inner.link.local_state = LinkState::Closed;
                     self.inner.link.output_handle.take();
@@ -582,7 +582,7 @@ where
         let mut remote_detach_received = false;
         let mut detach_error: Option<LinkStateError> = None;
         while let Ok(frame) = self.incoming.try_recv() {
-            if let LinkFrame::Detach(detach) = frame {
+            if let LinkFrame::Detach(detach, _) = frame {
                 remote_detach_received = true;
                 let closed = detach.closed;
                 let error = detach.error.clone();
@@ -609,13 +609,16 @@ where
         // Whether the peer can still be reached with a closing detach
         let mut detach_sent = false;
         if !remote_detach_received {
-            if let Some(handle) = self.link.output_handle_mut().take() {
+            if let Some(attachment) = self.link.output_handle_mut().take() {
                 let detach = Detach {
-                    handle: handle.into(),
+                    handle: attachment.handle.into(),
                     closed: true,
                     error: None,
                 };
-                match self.outgoing.try_send(LinkFrame::Detach(detach)) {
+                match self
+                    .outgoing
+                    .try_send(LinkFrame::Detach(detach, attachment.id))
+                {
                     Ok(()) => detach_sent = true,
                     Err(_error) => {
                         #[cfg(any(feature = "log", feature = "tracing"))]
@@ -655,11 +658,7 @@ where
             }
         });
         if let Some(error) = error {
-            if let Some(entries) = self.link.unsettled().write().take() {
-                for (_, entry) in entries {
-                    let _ = entry.fail(error.clone());
-                }
-            }
+            self.link.unsettled().close(error);
         }
     }
 }
@@ -887,47 +886,57 @@ impl SenderInner<SenderLink<Target>> {
         false
     }
 
-    /// Resumes a delivery with the given state and payload.
+    /// Carries out what the resume decided for the delivery under
+    /// `delivery_tag`. Every local delivery stays in the store until its step
+    /// has been handed to the session, so a resume cut short, by an error,
+    /// the peer's detach or its future being dropped, leaves the ones it has
+    /// not finished for the next resume, or the close, to settle.
     ///
-    /// The resume operation should not replace the unsettled map entry.
+    /// Resent deliveries wait in `resend` until every other one is done.
     async fn handle_resuming_delivery(
         &mut self,
         delivery_tag: DeliveryTag,
         resuming: ResumingDelivery,
-        resend_buf: &mut Vec<UnsettledMessage>,
+        resend: &mut Vec<DeliveryTag>,
     ) -> Result<(), SendError> {
         #[cfg(feature = "tracing")]
         tracing::debug!("Resuming delivery: delivery_tag: {:?}", delivery_tag);
         #[cfg(feature = "log")]
         log::debug!("Resuming delivery: delivery_tag: {:?}", delivery_tag);
         match resuming {
-            ResumingDelivery::Abort {
-                message_format,
-                sender,
-            } => self.abort(delivery_tag, message_format, sender).await?,
-            ResumingDelivery::Resend(unsettled_message) => resend_buf.push(unsettled_message),
-            ResumingDelivery::Resume(unsettled_message) => {
-                self.resume(delivery_tag, unsettled_message).await?
+            ResumingDelivery::Abort { message_format } => {
+                self.abort(delivery_tag, message_format).await?
             }
-            ResumingDelivery::RestateOutcome {
-                message_format,
-                local_state,
-                payload,
-                sender,
-            } => {
-                self.restate_outcome(delivery_tag, message_format, local_state, payload, sender)
-                    .await?
+            ResumingDelivery::Resend => {
+                if !resend.contains(&delivery_tag) {
+                    resend.push(delivery_tag)
+                }
             }
+            ResumingDelivery::Resume { remaining } => self.resume(delivery_tag, remaining).await?,
+            ResumingDelivery::RestateOutcome => self.restate_outcome(delivery_tag).await?,
         }
 
         Ok(())
+    }
+
+    /// The local delivery's message format, delivery state and payload.
+    fn local_delivery(
+        &self,
+        delivery_tag: &DeliveryTag,
+    ) -> Option<(MessageFormat, Option<DeliveryState>, Payload)> {
+        let guard = self.link.unsettled.read();
+        let local = guard.as_ref()?.get(delivery_tag)?;
+        Some((
+            local.message_format,
+            local.state.clone(),
+            local.payload.clone(),
+        ))
     }
 
     async fn abort(
         &mut self,
         delivery_tag: DeliveryTag,
         message_format: MessageFormat,
-        sender: Option<oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>>,
     ) -> Result<(), SendError> {
         let handle = self
             .link
@@ -938,7 +947,7 @@ impl SenderInner<SenderLink<Target>> {
         let transfer = Transfer {
             handle,
             delivery_id: None,
-            delivery_tag: Some(delivery_tag),
+            delivery_tag: Some(delivery_tag.clone()),
             message_format: Some(message_format),
             settled: None,
             more: false,
@@ -950,23 +959,29 @@ impl SenderInner<SenderLink<Target>> {
         };
         let payload = Bytes::new();
 
-        // An aborted delivery is implicitly settled (AMQP 1.0 §2.7.5), so it is
-        // not registered in the unsettled map; the local outcome is None.
         self.link
-            .send_transfer_without_modifying_unsettled_map(&self.outgoing, transfer, payload)
+            .send_resuming_transfer(&self.outgoing, self.incoming.recv(), transfer, payload)
             .await?;
-        if let Some(sender) = sender {
-            let _ = sender.send(Ok(None));
+        // An aborted delivery is implicitly settled (AMQP 1.0 §2.7.5): the
+        // local outcome is None.
+        if let Some(local) = self.link.unsettled.withdraw(&delivery_tag) {
+            let _ = local.settle_with_state(None);
         }
 
         Ok(())
     }
 
+    /// Sends the part of the delivery the peer has yet to receive with its
+    /// original tag and `resume` set. It takes no new link credit: it is not a
+    /// new delivery (AMQP 1.0 §2.6.13).
     async fn resume(
         &mut self,
         delivery_tag: DeliveryTag,
-        unsettled_message: UnsettledMessage,
+        remaining: Payload,
     ) -> Result<(), SendError> {
+        let Some((message_format, state, _)) = self.local_delivery(&delivery_tag) else {
+            return Ok(());
+        };
         let handle = self
             .link
             .output_handle
@@ -982,28 +997,26 @@ impl SenderInner<SenderLink<Target>> {
             handle,
             delivery_id: None,
             delivery_tag: Some(delivery_tag.clone()),
-            message_format: Some(unsettled_message.message_format),
+            message_format: Some(message_format),
             settled: Some(settled),
-            more: false, // This will be determined in `send_payload_with_transfer`
+            more: false, // This will be determined in `split_transfer`
             rcv_settle_mode: None,
-            state: unsettled_message.state.clone(),
+            state,
             resume: true,
             aborted: false,
             batchable: false,
         };
 
-        self.send_transfer_with_outcome(transfer, delivery_tag, unsettled_message)
+        self.send_transfer_with_outcome(transfer, delivery_tag, remaining)
             .await
     }
 
-    async fn restate_outcome(
-        &mut self,
-        delivery_tag: DeliveryTag,
-        message_format: MessageFormat,
-        state: DeliveryState,
-        payload: Payload,
-        sender: oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>,
-    ) -> Result<(), SendError> {
+    /// Restates the delivery's local terminal outcome, which is definitive
+    /// (AMQP 1.0 §2.6.13, delivery-tag 13).
+    async fn restate_outcome(&mut self, delivery_tag: DeliveryTag) -> Result<(), SendError> {
+        let Some((message_format, state, payload)) = self.local_delivery(&delivery_tag) else {
+            return Ok(());
+        };
         let handle = self
             .link
             .output_handle
@@ -1018,65 +1031,57 @@ impl SenderInner<SenderLink<Target>> {
             settled: Some(false),
             more: false,
             rcv_settle_mode: None,
-            state: Some(state),
+            state,
             resume: true,
             aborted: false,
             batchable: false,
         };
 
-        let unsettled = UnsettledMessage::new(payload, None, message_format, sender);
-        self.send_transfer_with_outcome(transfer, delivery_tag, unsettled)
+        self.send_transfer_with_outcome(transfer, delivery_tag, payload)
             .await
     }
 
-    async fn resend(&mut self, unsettled_message: UnsettledMessage) -> Result<(), SendError> {
-        let transfer = self.link.generate_non_resuming_transfer_performative(
-            DeliveryTag::from([0; 4]),
-            unsettled_message.message_format,
-            None,
-            None,
-            false,
-        )?;
-        let payload = unsettled_message.payload.clone();
-        let detached_fut = self.incoming.recv();
-        if self.link.is_settled_on_send(&transfer) {
-            self.link
-                .send_delivery(&self.outgoing, detached_fut, transfer, payload, None, None)
-                .await?;
-            let _ = unsettled_message.settle();
-        } else {
-            self.link
-                .send_delivery(
-                    &self.outgoing,
-                    detached_fut,
-                    transfer,
-                    payload,
-                    Some(unsettled_message),
-                    None,
-                )
-                .await?;
+    /// Sends `payload` for a resumed delivery, which resolves with its
+    /// outcome: at once when the transfer goes out settled, otherwise when the
+    /// peer settles it, through the unsettled map.
+    async fn send_transfer_with_outcome(
+        &mut self,
+        transfer: Transfer,
+        delivery_tag: DeliveryTag,
+        payload: Payload,
+    ) -> Result<(), SendError> {
+        let settled = self.link.is_settled_on_send(&transfer);
+        self.link
+            .send_resuming_transfer(&self.outgoing, self.incoming.recv(), transfer, payload)
+            .await?;
+        if settled {
+            if let Some(local) = self.link.unsettled.withdraw(&delivery_tag) {
+                let _ = local.settle();
+            }
         }
         Ok(())
     }
 
-    /// Sends a transfer and resolves `unsettled` with its outcome: at once when the transfer goes
-    /// out settled, otherwise when the peer settles it, through the unsettled map.
-    async fn send_transfer_with_outcome(
-        &self,
-        transfer: Transfer,
-        delivery_tag: DeliveryTag,
-        unsettled: UnsettledMessage,
+    /// Carries out every delivery a resume decided on, and the resends last
+    /// when `resend_now`.
+    async fn resume_deliveries(
+        &mut self,
+        resuming_deliveries: Vec<(DeliveryTag, ResumingDelivery)>,
+        resend: &mut Vec<DeliveryTag>,
+        resend_now: bool,
     ) -> Result<(), SendError> {
-        let payload = unsettled.payload.clone();
-        if self.link.is_settled_on_send(&transfer) {
-            self.link
-                .send_transfer_without_modifying_unsettled_map(&self.outgoing, transfer, payload)
+        for (delivery_tag, resuming) in resuming_deliveries {
+            self.handle_resuming_delivery(delivery_tag, resuming, resend)
                 .await?;
-            let _ = unsettled.settle();
-        } else {
-            self.link
-                .send_unsettled_transfer(&self.outgoing, transfer, payload, delivery_tag, unsettled)
-                .await?;
+        }
+        if resend_now {
+            while let Some(delivery_tag) = resend.first().cloned() {
+                let detached = self.incoming.recv();
+                self.link
+                    .resend(&self.outgoing, detached, delivery_tag)
+                    .await?;
+                resend.remove(0);
+            }
         }
         Ok(())
     }
@@ -1087,7 +1092,7 @@ impl SenderInner<SenderLink<Target>> {
         is_reattaching: bool,
     ) -> Result<(), SenderResumeErrorKind> {
         self.reallocate_output_handle().await?;
-        let mut resend_buf = Vec::new();
+        let mut resend = Vec::new();
 
         loop {
             let attach_exchange = match initial_remote_attach.take() {
@@ -1103,21 +1108,13 @@ impl SenderInner<SenderLink<Target>> {
             match attach_exchange {
                 SenderAttachExchange::Complete => break,
                 SenderAttachExchange::IncompleteUnsettled(resuming_deliveries) => {
-                    for (delivery_tag, resuming) in resuming_deliveries {
-                        self.handle_resuming_delivery(delivery_tag, resuming, &mut resend_buf)
-                            .await?;
-                    }
+                    self.resume_deliveries(resuming_deliveries, &mut resend, false)
+                        .await?;
                 }
                 SenderAttachExchange::Resume(resuming_deliveries) => {
-                    for (delivery_tag, resuming) in resuming_deliveries {
-                        self.handle_resuming_delivery(delivery_tag, resuming, &mut resend_buf)
-                            .await?;
-                    }
-
-                    // Resend buffered payloads
-                    for unsettled_message in resend_buf.drain(..) {
-                        self.resend(unsettled_message).await?;
-                    }
+                    // Resend buffered payloads last
+                    self.resume_deliveries(resuming_deliveries, &mut resend, true)
+                        .await?;
 
                     // Upon completion of this reduction of state, the two parties MUST suspend and
                     // re-attempt to resume the link. The detach consumes the output handle,
@@ -1384,11 +1381,13 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::*;
-    use crate::endpoint::{InputHandle, OutputHandle, SenderLink as _};
+    use crate::endpoint::{InputHandle, SenderLink as _};
+    use crate::link::delivery::UnsettledMessage;
     use crate::{
         link::state::{LinkFlowState, LinkFlowStateInner, LinkState},
         util::Consumer,
     };
+    use tokio::sync::oneshot;
 
     fn make_sender_inner_with_channels(
         max_frame_size: usize,
@@ -1418,7 +1417,7 @@ mod tests {
             role: PhantomData,
             local_state: LinkState::Attached,
             name: String::from("test-sender"),
-            output_handle: Some(endpoint::OutputHandle(0)),
+            output_handle: Some(endpoint::OutputAttachment::for_tests(0)),
             input_handle: None,
             snd_settle_mode: SenderSettleMode::Mixed,
             rcv_settle_mode: ReceiverSettleMode::First,
@@ -1516,14 +1515,17 @@ mod tests {
         );
         assert!(matches!(
             outgoing.recv().await.unwrap(),
-            LinkFrame::Detach(_)
+            LinkFrame::Detach(_, _)
         ));
         incoming
-            .send(LinkFrame::Detach(fe2o3_amqp_types::performatives::Detach {
-                handle: 0.into(),
-                closed: false,
-                error: None,
-            }))
+            .send(LinkFrame::Detach(
+                fe2o3_amqp_types::performatives::Detach {
+                    handle: 0.into(),
+                    closed: false,
+                    error: None,
+                },
+                crate::endpoint::AttachmentId::allocate(),
+            ))
             .await
             .unwrap();
         tokio::time::timeout(Duration::from_secs(1), sender.detach_borrowed())
@@ -1642,7 +1644,10 @@ mod tests {
             error: None,
         };
         writer
-            .send(LinkFrame::Detach(placeholder))
+            .send(LinkFrame::Detach(
+                placeholder,
+                crate::endpoint::AttachmentId::allocate(),
+            ))
             .await
             .expect("the session end is open");
         (writer.into(), session)
@@ -1715,7 +1720,10 @@ mod tests {
         assert_eq!(credit(&inner.link), (1, 0));
         assert!(!is_registered(&inner.link, &DeliveryTag::from([0; 4])));
 
-        assert!(matches!(session.recv().await, Some(LinkFrame::Detach(_))));
+        assert!(matches!(
+            session.recv().await,
+            Some(LinkFrame::Detach(_, _))
+        ));
         let settlement = inner
             .link
             .send_payload(
@@ -1840,7 +1848,15 @@ mod tests {
 
         let tag = DeliveryTag::from(vec![0x01]);
         let (sender, mut settled) = oneshot::channel();
-        inner.abort(tag.clone(), 0, Some(sender)).await.unwrap();
+        inner
+            .link
+            .unsettled
+            .register(
+                tag.clone(),
+                UnsettledMessage::new(Payload::new(), None, 0, sender),
+            )
+            .unwrap();
+        inner.abort(tag.clone(), 0).await.unwrap();
 
         match outgoing_rx.try_recv().expect("expected a transfer") {
             LinkFrame::Transfer {
@@ -1875,7 +1891,7 @@ mod tests {
         inner.link.input_handle = Some(InputHandle(0));
 
         let tag = DeliveryTag::from(vec![0x02]);
-        inner.abort(tag.clone(), 0, None).await.unwrap();
+        inner.abort(tag.clone(), 0).await.unwrap();
 
         assert!(matches!(
             outgoing_rx.try_recv(),
@@ -1901,12 +1917,10 @@ mod tests {
         // abort arm is `Received(local) > Received(remote)`.
         let tag = DeliveryTag::from(vec![0x01]);
         let (sender, mut settled) = oneshot::channel();
-        let _ = inner
+        inner
             .link
             .unsettled
-            .write()
-            .get_or_insert(OrderedMap::new())
-            .insert(
+            .register(
                 tag.clone(),
                 UnsettledMessage::new(
                     Payload::new(),
@@ -1914,7 +1928,8 @@ mod tests {
                     0,
                     sender,
                 ),
-            );
+            )
+            .unwrap();
         inner.link.local_state = LinkState::Detached;
         inner.link.output_handle = None;
 
@@ -1947,7 +1962,7 @@ mod tests {
                                 LinkRelay::Sender { tx, .. } => tx,
                                 LinkRelay::Receiver { tx, .. } => tx,
                             });
-                            let _ = responder.send(Ok(OutputHandle(1)));
+                            let _ = responder.send(Ok(crate::endpoint::OutputAttachment::for_tests(1)));
                         }
                         Some(SessionControl::GetIncomingWindow(responder)) => {
                             let _ = responder.send(16);
@@ -1974,7 +1989,7 @@ mod tests {
                             assert!(performative.resume);
                             saw_abort = true;
                         }
-                        Some(LinkFrame::Detach(detach)) => {
+                        Some(LinkFrame::Detach(detach, _)) => {
                             assert!(!detach.closed);
                             detaches += 1;
                             let tx = incoming_tx.as_ref().expect("allocate was answered");
@@ -1983,7 +1998,7 @@ mod tests {
                                     handle: fe2o3_amqp_types::definitions::Handle(0),
                                     closed: false,
                                     error: None,
-                                }))
+                                }, crate::endpoint::AttachmentId::allocate()))
                                 .await;
                         }
                         Some(_) => {}
@@ -2008,5 +2023,309 @@ mod tests {
         result.unwrap();
 
         assert!(matches!(settled.try_recv(), Ok(Ok(None))));
+    }
+
+    /// The hand-over a send is waiting in when the peer detaches.
+    #[derive(Clone, Copy, Debug)]
+    enum Stage {
+        /// A new delivery's first frame, which takes its credit.
+        FirstFrame,
+        /// A later frame of a delivery spanning several.
+        LaterFragment,
+        /// A resumed delivery, which keeps its tag and takes no credit.
+        Resume,
+    }
+
+    fn peer_detach(closed: bool) -> LinkFrame {
+        LinkFrame::Detach(
+            Detach {
+                handle: 0.into(),
+                closed,
+                error: None,
+            },
+            crate::endpoint::AttachmentId::allocate(),
+        )
+    }
+
+    /// The transfer that resumes the delivery under `tag` with its original tag.
+    fn resuming_transfer(tag: DeliveryTag) -> Transfer {
+        Transfer {
+            handle: 0.into(),
+            delivery_id: None,
+            delivery_tag: Some(tag),
+            message_format: Some(0),
+            settled: Some(false),
+            more: false,
+            rcv_settle_mode: None,
+            state: None,
+            resume: true,
+            aborted: false,
+            batchable: false,
+        }
+    }
+
+    fn pending_delivery(
+        tag: &DeliveryTag,
+        inner: &SenderInner<SenderLink<Target>>,
+    ) -> oneshot::Receiver<Result<Option<DeliveryState>, LinkStateError>> {
+        let (reply, outcome) = oneshot::channel();
+        inner
+            .link
+            .unsettled
+            .register(
+                tag.clone(),
+                UnsettledMessage::new(Payload::from_static(b"m"), None, 0, reply),
+            )
+            .unwrap();
+        outcome
+    }
+
+    /// The peer's detach and the queue's room become ready together while a send waits for the
+    /// room: the detach wins, nothing more goes out, and a delivery whose first frame was not
+    /// handed over keeps the link's credit.
+    #[tokio::test]
+    async fn a_detach_ready_with_the_queue_room_stops_the_hand_over() {
+        for stage in [Stage::FirstFrame, Stage::LaterFragment, Stage::Resume] {
+            let mut inner = credited_sender(512);
+            let (writer, mut session) = match stage {
+                // The first frame of a 2048-byte delivery fills the channel.
+                Stage::LaterFragment => {
+                    let (writer, session) = mpsc::channel::<LinkFrame>(1);
+                    (writer.into(), session)
+                }
+                Stage::FirstFrame | Stage::Resume => full_session_channel().await,
+            };
+            let tag = DeliveryTag::from(vec![9]);
+            let _outcome = matches!(stage, Stage::Resume).then(|| pending_delivery(&tag, &inner));
+            let (detach, detached) = oneshot::channel();
+            let detached = async { detached.await.ok() };
+            {
+                let send = async {
+                    match stage {
+                        Stage::Resume => {
+                            inner
+                                .link
+                                .send_resuming_transfer(
+                                    &writer,
+                                    detached,
+                                    resuming_transfer(tag.clone()),
+                                    Payload::from_static(b"m"),
+                                )
+                                .await
+                        }
+                        Stage::FirstFrame | Stage::LaterFragment => {
+                            let len = if matches!(stage, Stage::LaterFragment) {
+                                2048
+                            } else {
+                                1
+                            };
+                            inner
+                                .link
+                                .send_payload(
+                                    &writer,
+                                    detached,
+                                    Payload::from(vec![7; len]),
+                                    0,
+                                    Some(false),
+                                    None,
+                                    false,
+                                )
+                                .await
+                                .map(|_| ())
+                        }
+                    }
+                };
+                tokio::pin!(send);
+                assert!(futures_util::poll!(&mut send).is_pending(), "{stage:?}");
+                detach.send(peer_detach(true)).unwrap();
+                // The frame in front of the send leaves: the queue has room.
+                let ahead = session.try_recv().unwrap();
+                if matches!(stage, Stage::LaterFragment) {
+                    assert!(
+                        matches!(ahead, LinkFrame::Transfer { performative, .. } if performative.more)
+                    );
+                }
+                assert!(
+                    matches!(send.await, Err(LinkStateError::RemoteClosed)),
+                    "{stage:?}"
+                );
+            }
+            assert!(
+                session.try_recv().is_err(),
+                "{stage:?}: nothing more is handed over"
+            );
+            let expected = match stage {
+                Stage::FirstFrame | Stage::Resume => (1, 0),
+                Stage::LaterFragment => (0, 1),
+            };
+            assert_eq!(credit(&inner.link), expected, "{stage:?}");
+            assert_eq!(
+                is_registered(&inner.link, &tag),
+                matches!(stage, Stage::Resume),
+                "{stage:?}: a resumed delivery stays for the close or the next resume"
+            );
+        }
+    }
+
+    /// The relay closes the store for the peer's closing detach under the lock a registration
+    /// takes. Closed first, a new delivery is refused with the close's error before it takes
+    /// credit or queue room, and a resend finds nothing to send; registered first, the delivery is
+    /// failed by the close.
+    #[tokio::test]
+    async fn the_store_orders_a_registration_with_the_relay_close() {
+        use fe2o3_amqp_types::definitions::{AmqpError, Error};
+        let error = Error::new(AmqpError::InternalError, Some("gone".into()), None);
+        let close = |inner: &SenderInner<SenderLink<Target>>| {
+            inner
+                .link
+                .unsettled
+                .close(LinkStateError::RemoteClosedWithError(error.clone()))
+        };
+
+        // Closed before a new delivery registers.
+        let mut inner = credited_sender(4096);
+        let (writer, mut session) = mpsc::channel::<LinkFrame>(1);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
+        close(&inner);
+        let refused = inner
+            .link
+            .send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from_static(b"m"),
+                0,
+                Some(false),
+                None,
+                false,
+            )
+            .await;
+        assert!(matches!(refused, Err(LinkStateError::RemoteClosedWithError(e)) if e == error));
+        assert_eq!(credit(&inner.link), (1, 0));
+        assert!(session.try_recv().is_err());
+        assert!(
+            futures_util::poll!(std::pin::pin!(writer.reserve(1))).is_ready(),
+            "the queue room is released"
+        );
+
+        // Closed before a resend moves the delivery to its new tag.
+        let mut inner = credited_sender(4096);
+        let (writer, mut session) = mpsc::channel::<LinkFrame>(1);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
+        let old = DeliveryTag::from(vec![9]);
+        let outcome = pending_delivery(&old, &inner);
+        close(&inner);
+        assert!(
+            matches!(outcome.await, Ok(Err(LinkStateError::RemoteClosedWithError(e))) if e == error)
+        );
+        inner
+            .link
+            .resend(&writer, std::future::pending(), old)
+            .await
+            .unwrap();
+        assert!(session.try_recv().is_err());
+        assert_eq!(credit(&inner.link), (1, 0));
+
+        // Registered before the close.
+        let mut inner = credited_sender(4096);
+        let (writer, mut session) = mpsc::channel::<LinkFrame>(1);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
+        let Settlement::Unsettled { outcome, .. } = inner
+            .link
+            .send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from_static(b"m"),
+                0,
+                Some(false),
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("an unsettled delivery")
+        };
+        assert!(matches!(session.try_recv(), Ok(LinkFrame::Transfer { .. })));
+        close(&inner);
+        assert!(
+            matches!(outcome.await, Ok(Err(LinkStateError::RemoteClosedWithError(e))) if e == error)
+        );
+    }
+
+    /// A resend cut short after its first frame, as a resume's interrupt drops it, keeps the
+    /// delivery the store held before it, under its new tag, with its outcome still to come.
+    #[tokio::test]
+    async fn a_resend_cut_short_after_its_first_frame_keeps_the_delivery() {
+        let mut inner = credited_sender(512);
+        let (writer, mut session) = mpsc::channel::<LinkFrame>(1);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
+        let old = DeliveryTag::from(vec![9]);
+        let (tx, mut outcome) = oneshot::channel();
+        let pending = UnsettledMessage::new(Payload::from(vec![7; 2048]), None, 0, tx);
+        inner.link.unsettled.register(old.clone(), pending).unwrap();
+        {
+            let resend = inner
+                .link
+                .resend(&writer, std::future::pending(), old.clone());
+            tokio::pin!(resend);
+            assert!(futures_util::poll!(&mut resend).is_pending());
+            let Ok(LinkFrame::Transfer { performative, .. }) = session.try_recv() else {
+                panic!("the first frame")
+            };
+            assert!(performative.more, "later frames wait for room");
+        }
+        let held = inner.link.unsettled.read();
+        let held = held.as_ref().unwrap();
+        assert_eq!(held.len(), 1);
+        assert!(!held.contains_key(&old));
+        assert_eq!(held.values().next().unwrap().payload.len(), 2048);
+        assert!(matches!(
+            outcome.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    /// A drain that takes the credit while the first frame waits for queue room leaves the send
+    /// waiting for new credit: it never goes out on credit it no longer has.
+    #[tokio::test]
+    async fn credit_drained_while_the_first_frame_waits_for_room_is_not_taken() {
+        use crate::{endpoint::LinkFlow, util::Produce};
+        let mut inner = credited_sender(4096);
+        let mut producer = inner.link.flow_state.producer();
+        let (writer, mut session) = full_session_channel().await;
+        let send = inner.link.send_payload(
+            &writer,
+            std::future::pending(),
+            Payload::from_static(b"m"),
+            0,
+            Some(false),
+            None,
+            false,
+        );
+        tokio::pin!(send);
+        assert!(futures_util::poll!(&mut send).is_pending());
+        let drain = LinkFlow {
+            handle: 0.into(),
+            delivery_count: Some(0),
+            link_credit: Some(1),
+            drain: true,
+            ..Default::default()
+        };
+        producer.produce((drain, endpoint::OutputHandle(0))).await;
+        assert!(matches!(session.try_recv(), Ok(LinkFrame::Detach(_, _))));
+        assert!(futures_util::poll!(&mut send).is_pending());
+        assert!(session.try_recv().is_err(), "no credit, no transfer");
+        let grant = LinkFlow {
+            handle: 0.into(),
+            delivery_count: Some(1),
+            link_credit: Some(1),
+            ..Default::default()
+        };
+        producer.produce((grant, endpoint::OutputHandle(0))).await;
+        let Settlement::Unsettled { delivery_tag, .. } = send.await.unwrap() else {
+            panic!("an unsettled delivery")
+        };
+        assert_eq!(delivery_tag, DeliveryTag::from([0, 0, 0, 1]));
+        assert!(matches!(session.try_recv(), Ok(LinkFrame::Transfer { .. })));
     }
 }

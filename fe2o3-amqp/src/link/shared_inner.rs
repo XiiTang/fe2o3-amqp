@@ -348,7 +348,7 @@ where
             .await // cancel safe
             .ok_or_else(|| detach_error_from_stop_reason(link_inner))?
         {
-            LinkFrame::Detach(detach) => return Ok(detach),
+            LinkFrame::Detach(detach, _) => return Ok(detach),
             _frame => {
                 // The only other frames should be Attach or Detach, (or Transfer if receiver).
                 // Ignore all other frames

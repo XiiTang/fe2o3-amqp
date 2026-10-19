@@ -11,7 +11,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::{
     connection::DEFAULT_OUTGOING_BUFFER_SIZE,
-    endpoint::{LinkExt, OutputHandle},
+    endpoint::{LinkExt, OutputAttachment},
     link::{Link, LinkIncomingItem, LinkRelay},
     session::{self, SessionHandle},
     util::{Consumer, Producer},
@@ -416,7 +416,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
     pub(crate) fn create_link<C, M>(
         self,
         unsettled: ArcUnsettledMap<M>,
-        output_handle: OutputHandle,
+        output_handle: OutputAttachment,
         flow_state_consumer: C,
         session_stop_reason: Arc<OnceLock<SessionStopReason>>,
         max_frame_size: usize,
@@ -782,7 +782,7 @@ mod suspension_tests {
             }
             let mut link = builder.create_link(
                 Arc::new(Store::new(None)),
-                OutputHandle(0),
+                crate::endpoint::OutputAttachment::for_tests(0),
                 consumer,
                 stop,
                 65532,
@@ -797,11 +797,14 @@ mod suspension_tests {
             let (frames, incoming) = mpsc::channel(8);
             if queued_close {
                 frames
-                    .send(LinkFrame::Detach(Detach {
-                        handle: 0.into(),
-                        closed: true,
-                        error: None,
-                    }))
+                    .send(LinkFrame::Detach(
+                        Detach {
+                            handle: 0.into(),
+                            closed: true,
+                            error: None,
+                        },
+                        crate::endpoint::AttachmentId::allocate(),
+                    ))
                     .await
                     .unwrap();
             }

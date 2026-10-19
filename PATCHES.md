@@ -50,7 +50,7 @@ Run from a configured Rust toolchain:
 cargo test -p fe2o3-amqp --lib --features transaction,acceptor
 cargo test -p fe2o3-amqp --features transaction,acceptor \
   --test large_message_split --test relay_remote_detach \
-  --test clean_teardown --test link_stop_reason
+  --test clean_teardown --test link_stop_reason --test detached_link_frames
 ```
 
 The consolidated integration passes 83 library and 22 in-memory integration
@@ -323,3 +323,73 @@ refusal: the queue bound exactly, one byte over, two frames over and a smaller
 peer frame size, each taking one credit. 135 transaction+acceptor library
 tests and the four Validation integration suites (23 tests) pass, and strict
 Clippy passes, on macOS arm64 / Rust 1.97.0.
+
+
+## A detached attachment's frames stop at the session's reply (Boundless #87)
+
+Once the session answered a peer's detach, the link's frames for that
+attachment still reached the wire after the reply: a transfer already in the
+session queue, one waiting for the peer's session window, a link flow, and a
+local detach, which on a handle a later attachment reused also released that
+attachment. A delivery registered after the relay failed a closed link's
+pending ones waited for an outcome that could no longer come, and a peer's
+disposition for the detached link's delivery-id settled the delivery under
+the same tag of the next link on the handle.
+
+Each output-handle allocation now carries an `AttachmentId`, process-wide and
+never reused, and `LinkFrame::Transfer`, `Flow` and `Detach` carry the id of
+the attachment they were made for. `Session::is_current_output_attachment` is
+the one check: a transfer is checked before it is buffered and again before it
+takes a transfer-id, and a link flow and a local detach are checked as they
+go out. A frame of an ended attachment goes nowhere, takes no transfer-id,
+leaves the peer's window and the session's maps as they were, and releases its
+queue room; ending an attachment drops its transfers still waiting for the
+window. The session drops a detached link's dispositions routes in the step
+that removes its relay, as qpid-proton drops a released link's deliveries from
+its session (`c/src/core/engine.c`, `pn_link_free` and `pn_delivery_map_del`);
+the link keeps its own unsettled deliveries for a resume.
+
+A sender's unsettled store closes for good under its lock, keeping the first
+close error, and the relay closes it before the forward that can wait for the
+link's channel. Every registration goes through `Store::open`, so
+`send_delivery`'s one step that takes credit and registers either sees the
+close and returns its error, keeping the credit, or registers a delivery the
+close fails. Every wait for the session queue, for a new delivery's first
+frame, its later frames and a resumed, restated, aborted or resent delivery,
+ends at the peer's detach. A pause before the first frame is handed over
+returns `RemoteDetached` and keeps the credit; a pause after it keeps the
+whole payload and registration and returns the pending settlement, for an
+explicit resume to send again (AMQP 1.0 §2.6.13: a peer without the tag gets
+it as a new delivery, one holding it with a null state gets it whole under
+its tag with `resume` set and no new credit). A resume keeps each local
+delivery in the store until its step has been handed over, rather than taking
+them out first, so a resume cut short leaves the rest for the next resume or
+the close; this refines Settlement registration above, where a resume
+registered its deliveries again before admission. A resend that moved a
+delivery to its new tag and is then cut short, as a resume's interrupt drops
+it, keeps that delivery under the new tag with its outcome: only a delivery
+new to the store is withdrawn when its send is cut short.
+
+`cargo +1.97.0 test -p fe2o3-amqp --locked --features transaction,acceptor`:
+`session::engine::detached_attachment_tests` processes the peer's detach and
+then an old transfer, flow or local detach, directly, after a zero-window
+replay, in the drain before End and with the handle reused, and fails on any
+of those with the check reduced to the handle. `link::sender::tests`
+`a_detach_ready_with_the_queue_room_stops_the_hand_over` (first frame, later
+fragment, resume), `the_store_orders_a_registration_with_the_relay_close` and
+`credit_drained_while_the_first_frame_waits_for_room_is_not_taken` cover the
+admission races, and
+`a_resend_cut_short_after_its_first_frame_keeps_the_delivery` the dropped
+resend, whose delivery and outcome were withdrawn before.
+`tests/detached_link_frames.rs` scripts the peer over an in-memory stream and
+stops and joins the client's engines at the end of each test: a close while a
+transfer waits for the window, three pause-and-resume cases, and the peer's
+disposition, as receiver and as sender, for a detached link's delivery-id
+after its handle was reused. On the preceding pin four of the first five
+fail: the close and the never-written pause each see an old transfer after the
+reply, the later-fragment pause stalls, and the next link's delivery settles
+with the detached link's outcome; the resume under the original tag already
+took no credit. With the routes kept, the sender's disposition removes the
+next receiver's retained delivery. The library (140) and the in-memory
+integration suites under Validation with `detached_link_frames` pass, and
+strict Clippy passes, on macOS arm64 / Rust 1.97.0.

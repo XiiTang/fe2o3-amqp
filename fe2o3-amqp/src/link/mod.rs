@@ -21,7 +21,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     control::SessionControl,
-    endpoint::{self, InputHandle, LinkAttach, LinkDetach, LinkFlow, OutputHandle, Settlement},
+    endpoint::{
+        self, AttachmentId, InputHandle, LinkAttach, LinkDetach, LinkFlow, OutputAttachment,
+        Settlement,
+    },
     link::delivery::UnsettledMessage,
     util::{AsDeliveryState, Consumer, Produce, Producer},
     Payload,
@@ -189,8 +192,9 @@ pub(crate) struct Link<R, T, F, M> {
     // pub(crate) state_code: Arc<AtomicU8>,
     pub(crate) name: String,
 
-    pub(crate) output_handle: Option<OutputHandle>, // local handle
-    pub(crate) input_handle: Option<InputHandle>,   // remote handle
+    /// The local handle and the attachment it was allocated for
+    pub(crate) output_handle: Option<OutputAttachment>,
+    pub(crate) input_handle: Option<InputHandle>, // remote handle
 
     /// The `Sender` will manage whether to wait for incoming disposition
     pub(crate) snd_settle_mode: SenderSettleMode,
@@ -262,13 +266,13 @@ where
         }
     }
 
-    fn as_complete_attach(&self, handle: OutputHandle, is_reattaching: bool) -> Attach {
+    fn as_complete_attach(&self, handle: endpoint::OutputHandle, is_reattaching: bool) -> Attach {
         self.as_attach_inner(handle, is_reattaching, 1)
     }
 
     fn as_attach_inner(
         &self,
-        handle: OutputHandle,
+        handle: endpoint::OutputHandle,
         is_reattaching: bool,
         partial_unsettled: usize,
     ) -> Attach {
@@ -308,7 +312,7 @@ where
     fn as_maybe_incomplete_attach(
         &self,
         max_frame_size: usize,
-        handle: OutputHandle,
+        handle: endpoint::OutputHandle,
         is_reattaching: bool,
     ) -> Result<Attach, SendAttachErrorKind> {
         let mut denominator = 1usize; // This is going to be the denominator
@@ -338,7 +342,7 @@ where
     ) -> Result<(), SendAttachErrorKind> {
         // Create Attach frame
         let handle = match &self.output_handle {
-            Some(h) => h.clone(),
+            Some(attachment) => attachment.handle.clone(),
             None => return Err(SendAttachErrorKind::IllegalState),
         };
 
@@ -347,8 +351,7 @@ where
             //
             // It is ok to clear the map here because link will always try to send attach
             // before it handles the remote attach.
-            let mut guard = self.unsettled.write();
-            *guard = None;
+            self.unsettled.clear_for_reattach();
             None
         } else {
             let guard = self.unsettled.read();
@@ -459,7 +462,7 @@ where
         match self.output_handle.clone() {
             Some(handle) => {
                 let detach = Detach {
-                    handle: handle.into(),
+                    handle: handle.handle.clone().into(),
                     closed,
                     error,
                 };
@@ -471,7 +474,7 @@ where
 
                 // An error here means the session is already closed, so we can't send a detach
                 writer
-                    .send(LinkFrame::Detach(detach))
+                    .send(LinkFrame::Detach(detach, handle.id))
                     .await // cancel safe
                     .map_err(|_| match self.session_stop_reason.get() {
                         Some(reason) => DetachError::SessionStopped(reason.clone()),
@@ -584,7 +587,10 @@ impl LinkRelay<()> {
         }
     }
 
-    pub fn with_output_handle(self, output_handle: OutputHandle) -> LinkRelay<OutputHandle> {
+    pub fn with_output_handle(
+        self,
+        output_handle: OutputAttachment,
+    ) -> LinkRelay<OutputAttachment> {
         match self {
             LinkRelay::Sender {
                 tx,
@@ -620,7 +626,7 @@ impl LinkRelay<()> {
     }
 }
 
-impl LinkRelay<OutputHandle> {
+impl LinkRelay<OutputAttachment> {
     pub(crate) async fn send(
         &mut self,
         frame: LinkFrame,
@@ -633,10 +639,12 @@ impl LinkRelay<OutputHandle> {
     }
 
     #[allow(unused_variables)]
+    /// Hands a flow to the link; a flow it answers with goes out for the
+    /// relay's attachment.
     pub(crate) async fn on_incoming_flow(
         &mut self,
         flow: LinkFlow,
-    ) -> Result<Option<LinkFlow>, LinkRelayError> {
+    ) -> Result<Option<(LinkFlow, AttachmentId)>, LinkRelayError> {
         match self {
             LinkRelay::Sender {
                 flow_state,
@@ -657,16 +665,18 @@ impl LinkRelay<OutputHandle> {
                     }
                 }
 
-                let ret = flow_state.produce((flow, output_handle.clone())).await;
-                Ok(ret)
+                let ret = flow_state
+                    .produce((flow, output_handle.handle.clone()))
+                    .await;
+                Ok(ret.map(|flow| (flow, output_handle.id)))
             }
             LinkRelay::Receiver {
                 flow_state,
                 output_handle,
                 ..
             } => {
-                let ret = flow_state.on_incoming_flow(flow, output_handle.clone());
-                Ok(ret)
+                let ret = flow_state.on_incoming_flow(flow, output_handle.handle.clone());
+                Ok(ret.map(|flow| (flow, output_handle.id)))
             }
         }
     }
@@ -688,19 +698,15 @@ impl LinkRelay<OutputHandle> {
                 receiver_settle_mode,
                 ..
             } => {
-                let echo = if settled {
+                if settled {
                     // Upon receiving the updated delivery state from the receiver, the sender will, if it has not already spontaneously
                     // attained a terminal state (e.g., through the expiry of the TTL at the sender), update its view of the state and
                     // communicate this back to the sending application.
 
                     // Since we are settling (ie. forgetting) this message, we don't care whether the
                     // receiving end is alive or not
-                    {
-                        let mut guard = unsettled.write();
-                        guard
-                            .as_mut()
-                            .and_then(|m| m.swap_remove(&delivery_tag))
-                            .map(|msg| msg.settle_with_state(state));
+                    if let Some(msg) = unsettled.withdraw(&delivery_tag) {
+                        let _ = msg.settle_with_state(state);
                     }
                     false
                 } else {
@@ -708,21 +714,15 @@ impl LinkRelay<OutputHandle> {
                         Some(s) => s.is_terminal(),
                         None => false, // Probably should not assume the state is not specified
                     };
-                    {
-                        let mut guard = unsettled.write();
-                        // Once the receiving application has finished processing the message,
-                        // it indicates to the link endpoint a **terminal delivery state** that
-                        // reflects the outcome of the application processing
-                        if is_terminal {
-                            let _result = guard
-                                .as_mut()
-                                .and_then(|m| m.swap_remove(&delivery_tag))
-                                .map(|msg| msg.settle_with_state(state));
-                        } else if let Some(msg) =
-                            guard.as_mut().and_then(|m| m.get_mut(&delivery_tag))
-                        {
-                            msg.state = state;
+                    // Once the receiving application has finished processing the message,
+                    // it indicates to the link endpoint a **terminal delivery state** that
+                    // reflects the outcome of the application processing
+                    if is_terminal {
+                        if let Some(msg) = unsettled.withdraw(&delivery_tag) {
+                            let _ = msg.settle_with_state(state);
                         }
+                    } else {
+                        unsettled.set_state(&delivery_tag, state);
                     }
 
                     // If the receiver is in mode Second, it will send a non-settled terminal state
@@ -740,9 +740,7 @@ impl LinkRelay<OutputHandle> {
                             is_terminal
                         }
                     }
-                };
-
-                echo
+                }
             }
             LinkRelay::Receiver { unsettled, .. } => {
                 if settled {
@@ -776,6 +774,7 @@ impl LinkRelay<OutputHandle> {
             LinkRelay::Sender { .. } => Err(LinkRelayError::TransferFrameToSender),
             LinkRelay::Receiver {
                 tx,
+                output_handle,
                 unsettled,
                 more,
                 current_tag,
@@ -835,6 +834,7 @@ impl LinkRelay<OutputHandle> {
                 *current_tag = if *more { tag.clone() } else { None };
                 tx.send(LinkFrame::Transfer {
                     input_handle: InputHandle::from(transfer.handle.clone()),
+                    attachment: output_handle.id,
                     performative: transfer,
                     payload,
                     window_slot,
@@ -865,7 +865,12 @@ impl LinkRelay<OutputHandle> {
         detach: Detach,
         remote_initiated: bool,
     ) -> Option<Detach> {
-        let frame = LinkFrame::Detach(detach.clone());
+        let attachment = match self {
+            LinkRelay::Sender { output_handle, .. } | LinkRelay::Receiver { output_handle, .. } => {
+                output_handle.id
+            }
+        };
+        let frame = LinkFrame::Detach(detach.clone(), attachment);
         match self {
             LinkRelay::Sender {
                 tx,
@@ -873,6 +878,12 @@ impl LinkRelay<OutputHandle> {
                 unsettled,
                 ..
             } => {
+                // The peer closed the link: the store closes before the
+                // forward, which can wait for room in the link's channel, so
+                // no delivery registered meanwhile waits for an outcome.
+                if remote_initiated && detach.closed {
+                    unsettled.close(remote_close_error(&detach));
+                }
                 // A send failure means the link endpoint was dropped; the
                 // response (if any) must still go out.
                 let forward_result = tx.send(frame).await;
@@ -884,13 +895,9 @@ impl LinkRelay<OutputHandle> {
                     // the forward fails and nothing else would fail the
                     // deliveries that are still pending on the closed link.
                     if forward_result.is_err() && detach.closed {
-                        fail_pending_unsettled(unsettled, &detach);
+                        unsettled.close(remote_close_error(&detach));
                     }
                     return None;
-                }
-
-                if detach.closed {
-                    fail_pending_unsettled(unsettled, &detach);
                 }
 
                 Some(Detach {
@@ -917,19 +924,11 @@ impl LinkRelay<OutputHandle> {
     }
 }
 
-/// Fail the pending deliveries of a sender link.
-///
-/// The entries are removed from the shared map before failing, so the link's
-/// drop path and the relay cannot fail the same delivery twice.
-fn fail_pending_unsettled(unsettled: &ArcSenderUnsettledMap, detach: &Detach) {
-    if let Some(entries) = unsettled.write().take() {
-        for (_, entry) in entries {
-            let error = match detach.error.clone() {
-                Some(error) => LinkStateError::RemoteClosedWithError(error),
-                None => LinkStateError::RemoteClosed,
-            };
-            let _ = entry.fail(error);
-        }
+/// The error a peer's closing detach fails a sender's deliveries with.
+fn remote_close_error(detach: &Detach) -> LinkStateError {
+    match detach.error.clone() {
+        Some(error) => LinkStateError::RemoteClosedWithError(error),
+        None => LinkStateError::RemoteClosed,
     }
 }
 
@@ -966,7 +965,10 @@ pub(crate) mod test_util {
     use tokio::sync::mpsc;
 
     use crate::{
-        control::SessionControl, endpoint::OutputHandle, link::LinkFrame, link::LinkRelay,
+        control::SessionControl,
+        endpoint::{AttachmentId, OutputAttachment},
+        link::LinkFrame,
+        link::LinkRelay,
     };
 
     /// Drive the peer side of a §2.6.6 simultaneous-detach race, for either
@@ -1006,24 +1008,27 @@ pub(crate) mod test_util {
                             LinkRelay::Sender { tx, .. } => tx,
                             LinkRelay::Receiver { tx, .. } => tx,
                         };
-                        let _ = responder.send(Ok(OutputHandle(1)));
+                        let _ = responder.send(Ok(OutputAttachment::for_tests(1)));
                     }
                     Some(_) => {}
                     None => break,
                 },
                 frame = outgoing_rx.recv() => match frame {
-                    Some(LinkFrame::Detach(detach)) => {
+                    Some(LinkFrame::Detach(detach, _)) => {
                         detaches += 1;
                         // First detach: the peer does the mirror action, so
                         // reply with the opposite `closed`. Second: the reply
                         // to the closing detach we sent after reattaching.
                         let closed = if detaches == 1 { !detach.closed } else { true };
                         let _ = incoming_tx
-                            .send(LinkFrame::Detach(Detach {
-                                handle: Handle(0),
-                                closed,
-                                error: None,
-                            }))
+                            .send(LinkFrame::Detach(
+                                Detach {
+                                    handle: Handle(0),
+                                    closed,
+                                    error: None,
+                                },
+                                AttachmentId::allocate(),
+                            ))
                             .await;
                         if detaches >= 2 {
                             break;
@@ -1109,7 +1114,7 @@ mod incoming_identity_tests {
             Producer::new(Arc::new(tokio::sync::Notify::new()), flow),
             unsettled.clone(),
         )
-        .with_output_handle(OutputHandle(0));
+        .with_output_handle(crate::endpoint::OutputAttachment::for_tests(0));
         if let LinkRelay::Sender {
             receiver_settle_mode,
             ..
@@ -1158,7 +1163,7 @@ mod incoming_identity_tests {
                 properties: None,
             }));
             let mut relay = LinkRelay::new_receiver(tx, flow, unsettled.clone(), mode)
-                .with_output_handle(OutputHandle(0));
+                .with_output_handle(crate::endpoint::OutputAttachment::for_tests(0));
             let mut first = transfer();
             first.more = true;
             let tag = first.delivery_tag.clone().unwrap();
@@ -1234,7 +1239,7 @@ mod incoming_identity_tests {
                 .receiver_settle_mode(ReceiverSettleMode::Second)
                 .create_link(
                     map.clone(),
-                    OutputHandle(0),
+                    crate::endpoint::OutputAttachment::for_tests(0),
                     flow,
                     Arc::new(OnceLock::new()),
                     65532,
@@ -1277,7 +1282,7 @@ mod detach_admission_tests {
             .target("target")
             .create_link(
                 Arc::new(unsettled_store::Store::new(None)),
-                OutputHandle(7),
+                crate::endpoint::OutputAttachment::for_tests(7),
                 flow,
                 Arc::new(OnceLock::new()),
                 65532,
@@ -1309,7 +1314,7 @@ mod detach_admission_tests {
                     assert!(matches!(error, DetachError::IllegalState));
                 }
                 assert!(matches!(link.local_state, LinkState::Attached));
-                assert_eq!(link.output_handle.as_ref().unwrap().0, 7);
+                assert_eq!(link.output_handle.as_ref().unwrap().handle.0, 7);
                 assert!(!link
                     .operation_dispatch
                     .as_ref()
@@ -1330,14 +1335,14 @@ mod detach_admission_tests {
                 assert!(link.output_handle.is_none());
             } else {
                 assert!(matches!(link.local_state, LinkState::DetachSent));
-                assert_eq!(link.output_handle.as_ref().unwrap().0, 7);
+                assert_eq!(link.output_handle.as_ref().unwrap().handle.0, 7);
             }
             assert!(link
                 .operation_dispatch
                 .as_ref()
                 .unwrap()
                 .load(Ordering::Acquire));
-            let LinkFrame::Detach(detach) = receiver.try_recv().unwrap() else {
+            let LinkFrame::Detach(detach, _) = receiver.try_recv().unwrap() else {
                 panic!("expected Detach");
             };
             assert_eq!(detach.handle, 7u32.into());

@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     connection::ConnectionStopReason,
     control::SessionControl,
-    endpoint::{self, IncomingChannel, InputHandle, LinkFlow, OutgoingChannel, OutputHandle},
+    endpoint::{self, IncomingChannel, InputHandle, AttachmentId, LinkFlow, OutgoingChannel, OutputAttachment},
     link::{target_archetype::VariantOfTargetArchetype, LinkRelay, SessionStopReason},
     session::{
         self,
@@ -256,7 +256,7 @@ where
         &mut self,
         link_name: String,
         link_relay: Option<LinkRelay<()>>,
-    ) -> Result<OutputHandle, Self::AllocError> {
+    ) -> Result<OutputAttachment, Self::AllocError> {
         self.session.allocate_link(link_name, link_relay)
     }
 
@@ -265,13 +265,13 @@ where
         link_name: String,
         link_relay: LinkRelay<()>,
         input_handle: InputHandle,
-    ) -> Result<OutputHandle, Self::AllocError> {
+    ) -> Result<OutputAttachment, Self::AllocError> {
         self.session
             .allocate_incoming_link(link_name, link_relay, input_handle)
     }
 
-    fn deallocate_link(&mut self, output_handle: OutputHandle) -> bool {
-        self.session.deallocate_link(output_handle)
+    fn deallocate_link(&mut self, attachment: &OutputAttachment) -> bool {
+        self.session.deallocate_link(attachment)
     }
 
     fn on_incoming_begin(
@@ -352,7 +352,7 @@ where
     async fn on_incoming_detach(
         &mut self,
         detach: Detach,
-    ) -> Result<Option<Detach>, Self::Error> {
+    ) -> Result<Option<(Detach, AttachmentId)>, Self::Error> {
         self.session.on_incoming_detach(detach).await
     }
 
@@ -385,8 +385,12 @@ where
         self.session.on_outgoing_attach(attach)
     }
 
-    fn on_outgoing_flow(&mut self, flow: LinkFlow) -> Result<SessionFrame, Self::Error> {
-        self.session.on_outgoing_flow(flow)
+    fn on_outgoing_flow(
+        &mut self,
+        flow: LinkFlow,
+        attachment: AttachmentId,
+    ) -> Result<Option<SessionFrame>, Self::Error> {
+        self.session.on_outgoing_flow(flow, attachment)
     }
 
     fn receive_window(&self) -> &Arc<crate::session::receive_window::ReceiveWindow> {
@@ -400,12 +404,13 @@ where
     fn on_outgoing_transfer(
         &mut self,
         input_handle: InputHandle,
+        attachment: AttachmentId,
         transfer: Transfer,
         payload: Payload,
         queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Option<SessionOutgoingItem>, Self::Error> {
         self.session
-            .on_outgoing_transfer(input_handle, transfer, payload, queue_slot)
+            .on_outgoing_transfer(input_handle, attachment, transfer, payload, queue_slot)
     }
 
     fn on_outgoing_disposition(
@@ -415,7 +420,13 @@ where
         self.session.on_outgoing_disposition(disposition)
     }
 
-    fn on_outgoing_detach(&mut self, detach: Detach, expects_echo: bool) -> Option<SessionFrame> {
-        self.session.on_outgoing_detach(detach, expects_echo)
+    fn on_outgoing_detach(
+        &mut self,
+        detach: Detach,
+        attachment: AttachmentId,
+        expects_echo: bool,
+    ) -> Option<SessionFrame> {
+        self.session
+            .on_outgoing_detach(detach, attachment, expects_echo)
     }
 }

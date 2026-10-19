@@ -18,7 +18,9 @@ use crate::{
     Payload, SendBound,
 };
 
-use super::{IncomingChannel, InputHandle, LinkFlow, OutgoingChannel, OutputHandle};
+use super::{
+    AttachmentId, IncomingChannel, InputHandle, LinkFlow, OutgoingChannel, OutputAttachment,
+};
 
 pub(crate) trait Session {
     type AllocError: SendBound;
@@ -48,18 +50,18 @@ pub(crate) trait Session {
         &mut self,
         link_name: String,
         link_relay: Option<LinkRelay<()>>,
-    ) -> Result<OutputHandle, Self::AllocError>;
+    ) -> Result<OutputAttachment, Self::AllocError>;
 
     fn allocate_incoming_link(
         &mut self,
         link_name: String,
         link_relay: LinkRelay<()>,
         input_handle: InputHandle,
-    ) -> Result<OutputHandle, Self::AllocError>;
+    ) -> Result<OutputAttachment, Self::AllocError>;
 
-    /// Release the link's bookkeeping (name and output handle). Returns
-    /// whether the bookkeeping was still present.
-    fn deallocate_link(&mut self, output_handle: OutputHandle) -> bool;
+    /// Release the link's bookkeeping (name and output handle) while
+    /// `attachment` still holds the handle. Returns whether it did.
+    fn deallocate_link(&mut self, attachment: &OutputAttachment) -> bool;
 
     fn on_incoming_begin(
         &mut self,
@@ -99,14 +101,15 @@ pub(crate) trait Session {
         disposition: Disposition,
     ) -> Result<Option<Vec<Disposition>>, Self::Error>;
 
-    /// Handle an incoming detach. Returns the detach to send back when the
-    /// peer detached the link on its own, or `None` when it only answers a
-    /// detach the link sent itself. The reply is not sent here; the engine
-    /// sends it through [`Session::on_outgoing_detach`].
+    /// Handle an incoming detach. Returns the detach to send back, with the
+    /// attachment it ends, when the peer detached the link on its own, or
+    /// `None` when it only answers a detach the link sent itself. The reply
+    /// is not sent here; the engine sends it through
+    /// [`Session::on_outgoing_detach`].
     fn on_incoming_detach(
         &mut self,
         detach: Detach,
-    ) -> impl Future<Output = Result<Option<Detach>, Self::Error>> + Send;
+    ) -> impl Future<Output = Result<Option<(Detach, AttachmentId)>, Self::Error>> + Send;
 
     fn on_incoming_end(&mut self, channel: IncomingChannel, end: End)
         -> Result<(), Self::EndError>;
@@ -126,7 +129,13 @@ pub(crate) trait Session {
     // Intercepting LinkFrames
     fn on_outgoing_attach(&mut self, attach: Attach) -> Result<SessionFrame, Self::Error>;
 
-    fn on_outgoing_flow(&mut self, flow: LinkFlow) -> Result<SessionFrame, Self::Error>;
+    /// The frame for a link's flow, or `None` when its attachment no longer
+    /// holds its output handle.
+    fn on_outgoing_flow(
+        &mut self,
+        flow: LinkFlow,
+        attachment: AttachmentId,
+    ) -> Result<Option<SessionFrame>, Self::Error>;
 
     /// Returns a session-only flow (no link handle) when the session should proactively
     /// re-advertise its window after receiving transfers. Called by the session engine after
@@ -135,9 +144,13 @@ pub(crate) trait Session {
 
     fn maybe_outgoing_session_flow(&mut self) -> Option<SessionOutgoingItem>;
 
+    /// The frames to send for a link's transfer: none when the peer's window
+    /// is closed (it waits) or its attachment no longer holds its output
+    /// handle (it is dropped).
     fn on_outgoing_transfer(
         &mut self,
         input_handle: InputHandle,
+        attachment: AttachmentId,
         transfer: Transfer,
         payload: Payload,
         queue_slot: Option<tokio::sync::OwnedSemaphorePermit>,
@@ -155,8 +168,14 @@ pub(crate) trait Session {
     /// answer can be recognized. Leave it unset when this detach answers a
     /// detach the peer sent itself.
     ///
-    /// Returns `None` when the link was already closed towards the peer:
-    /// both sides closed at the same time, the relay already answered the
-    /// peer's detach, and this detach would only repeat that answer.
-    fn on_outgoing_detach(&mut self, detach: Detach, expects_echo: bool) -> Option<SessionFrame>;
+    /// Returns `None` when `attachment` no longer holds the handle: both
+    /// sides closed at the same time and the relay already answered the
+    /// peer's detach, so this detach would only repeat that answer, or the
+    /// handle went to a later attachment.
+    fn on_outgoing_detach(
+        &mut self,
+        detach: Detach,
+        attachment: AttachmentId,
+        expects_echo: bool,
+    ) -> Option<SessionFrame>;
 }

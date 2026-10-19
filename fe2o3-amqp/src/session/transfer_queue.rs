@@ -120,13 +120,14 @@ fn retained(payload_len: usize) -> Option<usize> {
 mod tests {
     use super::*;
     use crate::{
-        endpoint::{InputHandle, OutgoingChannel, Session as _},
+        endpoint::{AttachmentId, InputHandle, OutgoingChannel, Session as _},
         session::{Session, SessionState},
         Payload,
     };
     use fe2o3_amqp_types::performatives::Detach;
     use std::sync::OnceLock;
-    fn transfer(id: u32) -> LinkFrame {
+    /// A transfer on output handle 0, of `attachment`.
+    fn transfer_of(attachment: AttachmentId, id: u32) -> LinkFrame {
         let mut performative: fe2o3_amqp_types::performatives::Transfer =
             serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x55, 0x43])
                 .unwrap();
@@ -134,11 +135,16 @@ mod tests {
         performative.delivery_tag = Some(vec![id as u8].into());
         LinkFrame::Transfer {
             input_handle: InputHandle(0),
+            attachment,
             performative,
             payload: Payload::from_static(b"data"),
             window_slot: None,
             queue_slot: None,
         }
+    }
+    /// A transfer for queue tests, which no session sees.
+    fn transfer(id: u32) -> LinkFrame {
+        transfer_of(AttachmentId::allocate(), id)
     }
     #[tokio::test]
     async fn zero_peer_window_keeps_a_bounded_backlog_without_blocking_controls() {
@@ -153,10 +159,12 @@ mod tests {
             SessionState::Mapped,
             Arc::new(OnceLock::new()),
         );
+        let attachment = session.allocate_link("link".into(), None).unwrap();
         for id in 0..2 {
-            writer.send(transfer(id)).await.unwrap();
+            writer.send(transfer_of(attachment.id, id)).await.unwrap();
             let LinkFrame::Transfer {
                 input_handle,
+                attachment,
                 performative,
                 payload,
                 queue_slot,
@@ -166,13 +174,13 @@ mod tests {
                 panic!()
             };
             assert!(session
-                .on_outgoing_transfer(input_handle, performative, payload, queue_slot)
+                .on_outgoing_transfer(input_handle, attachment, performative, payload, queue_slot)
                 .unwrap()
                 .is_none());
         }
         assert_eq!(bytes.available_permits(), 0);
         assert_eq!(session.remote_incoming_window_exhausted_buffer.len(), 2);
-        let waiting = writer.send(transfer(2));
+        let waiting = writer.send(transfer_of(attachment.id, 2));
         tokio::pin!(waiting);
         assert!(matches!(
             futures_util::poll!(&mut waiting),
@@ -181,14 +189,17 @@ mod tests {
         // Controls never compete for the payload budget and the session driver
         // can consume them while waiting for an explicit peer window update.
         writer
-            .send(LinkFrame::Detach(Detach {
-                handle: 1u32.into(),
-                closed: true,
-                error: None,
-            }))
+            .send(LinkFrame::Detach(
+                Detach {
+                    handle: 1u32.into(),
+                    closed: true,
+                    error: None,
+                },
+                crate::endpoint::AttachmentId::allocate(),
+            ))
             .await
             .unwrap();
-        assert!(matches!(rx.recv().await.unwrap(), LinkFrame::Detach(_)));
+        assert!(matches!(rx.recv().await.unwrap(), LinkFrame::Detach(_, _)));
         session.remote_incoming_window = 2;
         let frames = session
             .prepare_session_frames_from_buffered_transfers(Vec::new())

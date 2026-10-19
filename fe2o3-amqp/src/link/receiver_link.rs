@@ -36,15 +36,20 @@ where
         echo: bool,
         include_properties: bool,
     ) -> Result<(), Self::FlowError> {
-        let handle = self
+        let attachment = self
             .output_handle
             .clone()
-            .ok_or(Self::FlowError::IllegalState)?
-            .into();
+            .ok_or(Self::FlowError::IllegalState)?;
 
-        let flow = self.get_link_flow(handle, link_credit, drain, echo, include_properties);
+        let flow = self.get_link_flow(
+            attachment.handle.into(),
+            link_credit,
+            drain,
+            echo,
+            include_properties,
+        );
         writer
-            .send(LinkFrame::Flow(flow))
+            .send(LinkFrame::Flow(flow, attachment.id))
             .await // cancel safe
             .map_err(|_| match self.session_stop_reason.get() {
                 Some(reason) => Self::FlowError::SessionStopped(reason.clone()),
@@ -752,7 +757,7 @@ where
         &self.name
     }
 
-    fn output_handle_mut(&mut self) -> &mut Option<OutputHandle> {
+    fn output_handle_mut(&mut self) -> &mut Option<crate::endpoint::OutputAttachment> {
         &mut self.output_handle
     }
 
@@ -903,7 +908,7 @@ where
         + Sync,
 {
     match reader.recv().await {
-        Some(LinkFrame::Detach(remote_detach)) => match link.on_detach_reply(remote_detach) {
+        Some(LinkFrame::Detach(remote_detach, _)) => match link.on_detach_reply(remote_detach) {
             Ok(_) => err,
             Err(detach_error) => detach_error.try_into().unwrap_or(err),
         },
@@ -965,7 +970,7 @@ mod tests {
                 .target("target")
                 .create_link(
                     map.clone(),
-                    OutputHandle(0),
+                    crate::endpoint::OutputAttachment::for_tests(0),
                     flow,
                     Arc::new(OnceLock::new()),
                     65532,

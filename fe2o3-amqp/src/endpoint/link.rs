@@ -21,7 +21,7 @@ use crate::{
     Payload,
 };
 
-use super::{OutputHandle, Settlement};
+use super::Settlement;
 
 pub(crate) trait LinkDetach {
     type DetachError: Send;
@@ -100,7 +100,7 @@ pub(crate) trait LinkExt: Link {
 
     fn name(&self) -> &str;
 
-    fn output_handle_mut(&mut self) -> &mut Option<OutputHandle>;
+    fn output_handle_mut(&mut self) -> &mut Option<super::OutputAttachment>;
 
     /// The shared cell holding why the session (or its connection) stopped
     fn session_stop_reason(&self) -> &Arc<OnceLock<SessionStopReason>>;

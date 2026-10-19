@@ -4,14 +4,20 @@ use crate::link::LinkFrame;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Semaphore};
 const RETAINED_BYTES: usize = 32 * 1024 * 1024;
+/// What a transfer frame retains beyond its payload.
+const FRAME_OVERHEAD: usize = 1024;
+/// The largest payload one transfer frame may carry into the queue. A link
+/// splits every delivery into frames no larger than this and the peer's
+/// max-frame-size (`SenderLink::split_transfer`), so the queue never has to
+/// refuse a frame of a message the link may carry.
+pub(crate) const MAX_FRAME_PAYLOAD: usize = RETAINED_BYTES - FRAME_OVERHEAD;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Sender {
     tx: mpsc::Sender<LinkFrame>,
     bytes: Arc<Semaphore>,
 }
-/// The queue refused a transfer frame: it is closed, or the frame is larger
-/// than it retains.
+/// The queue refused a transfer frame: it is closed.
 #[derive(Debug)]
 pub(crate) struct Refused;
 /// Room the queue holds for one transfer frame.
@@ -63,10 +69,7 @@ impl Sender {
     /// retained bytes, then a queue slot. Holding it takes nothing else; it
     /// is given back when dropped unsent.
     pub(crate) async fn reserve(&self, payload_len: usize) -> Result<Room, Refused> {
-        let size = payload_len.saturating_add(1024);
-        if size > RETAINED_BYTES {
-            return Err(Refused);
-        }
+        let size = retained(payload_len).ok_or(Refused)?;
         let bytes = tokio::select! {
             _ = self.tx.closed() => return Err(Refused),
             permit = self.bytes.clone().acquire_many_owned(size as u32) => permit.map_err(|_| Refused)?,
@@ -89,10 +92,9 @@ impl Sender {
         } = &mut frame
         {
             if queue_slot.is_none() {
-                let size = payload.len().saturating_add(1024);
-                if size > RETAINED_BYTES {
+                let Some(size) = retained(payload.len()) else {
                     return Err(mpsc::error::TrySendError::Full(frame));
-                }
+                };
                 match self.bytes.clone().try_acquire_many_owned(size as u32) {
                     Ok(permit) => *queue_slot = Some(permit),
                     Err(_) => return Err(mpsc::error::TrySendError::Full(frame)),
@@ -101,6 +103,17 @@ impl Sender {
         }
         self.tx.try_send(frame)
     }
+}
+
+/// The bytes a transfer frame of `payload_len` retains. Every frame was split
+/// to at most `MAX_FRAME_PAYLOAD`; a larger one could never get its bytes, so
+/// it is refused rather than left waiting.
+fn retained(payload_len: usize) -> Option<usize> {
+    debug_assert!(
+        payload_len <= MAX_FRAME_PAYLOAD,
+        "a transfer frame of {payload_len} bytes bypassed the link's frame split"
+    );
+    (payload_len <= MAX_FRAME_PAYLOAD).then_some(payload_len + FRAME_OVERHEAD)
 }
 
 #[cfg(test)]

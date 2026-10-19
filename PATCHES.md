@@ -293,3 +293,33 @@ delivery_count)` at `(0, 1)` instead of `(1, 0)` on the previous commit;
 `a_delivery_is_registered_when_its_first_frame_reaches_the_session` keeps the
 settlement registration rule. The library (135) and the four in-memory
 integration suites under Validation pass on macOS arm64.
+
+## A frame is split to what the session queue retains (Boundless #86)
+
+The bounded transfer queue (Retained additions) retains at most 32 MiB of
+frames and refused one whose payload plus its 1 KiB allowance exceeded that,
+while `split_transfer` split a delivery only by the peer's max-frame-size,
+`u32::MAX` when the peer omits it. A message the link's max-message-size
+admits but larger than about 32 MiB went out as one frame and its send
+failed (`IllegalState`, the stop error of a session that had not stopped).
+qpid-proton (`transport.c` `pni_process_tpwork_sender`) and rhea
+(`session.js`) also split by the peer's frame size alone, but neither has a
+bounded queue.
+
+`split_transfer` is the one place a delivery is cut into frames, for new,
+resumed, restated, aborted and resent deliveries alike; it now bounds each
+frame's payload by the smaller of the peer's max-frame-size and
+`transfer_queue::MAX_FRAME_PAYLOAD`, which the queue derives from its own
+bound. The queue's size refusal becomes a debug assertion, kept as a refusal
+in release builds because a frame larger than the semaphore could never be
+admitted.
+
+`a_message_larger_than_the_session_retains_per_frame_round_trips`
+(`large_message_split`) sends 33 MiB to an in-memory listener whose Open
+omits max-frame-size (checked on the wire) and fails at the preceding pin
+with `IllegalState`. `a_delivery_is_split_to_what_the_peer_and_the_session_queue_take`
+replaces `a_frame_the_queue_refuses_keeps_its_credit`, which asserted the
+refusal: the queue bound exactly, one byte over, two frames over and a smaller
+peer frame size, each taking one credit. 135 transaction+acceptor library
+tests and the four Validation integration suites (23 tests) pass, and strict
+Clippy passes, on macOS arm64 / Rust 1.97.0.

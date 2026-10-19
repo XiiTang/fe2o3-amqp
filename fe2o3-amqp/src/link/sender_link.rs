@@ -125,7 +125,10 @@ where
         Ok(settled)
     }
 
-    /// The frames a delivery's transfer and payload go out in, in order.
+    /// The frames a delivery's transfer and payload go out in, in order. Every
+    /// transfer a link hands to the session is split here: new deliveries
+    /// (`send_delivery`), and resumed, restated and aborted ones
+    /// (`send_transfer_tracked`).
     fn split_transfer(
         &self,
         mut transfer: Transfer,
@@ -161,11 +164,16 @@ where
         let performative_size =
             serialized_size(&transfer).map_err(|_| LinkStateError::IllegalState)?; // This should not happen
         transfer.delivery_id = orig_delivery_id;
-        let max_payload = self.max_frame_size - 4 - performative_size;
+        // A frame is also bounded by what the session's transfer queue
+        // retains per frame: a peer that omits max-frame-size accepts frames
+        // of any size, which the queue could never take.
+        let max_payload = (self.max_frame_size - 4 - performative_size)
+            .min(crate::session::transfer_queue::MAX_FRAME_PAYLOAD);
 
         // Split the payload so that every transfer frame fits within the
-        // negotiated max frame size, keeping the session's transfer-id and
-        // window accounting consistent with the frames actually sent.
+        // negotiated max frame size and the queue, keeping the session's
+        // transfer-id and window accounting consistent with the frames
+        // actually sent.
         let more = payload.len() > max_payload;
         if !more {
             transfer.more = false;

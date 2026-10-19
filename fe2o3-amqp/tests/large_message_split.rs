@@ -339,3 +339,121 @@ async fn resume_on_new_connection_refreshes_max_frame_size() {
     client_b.close().await.unwrap();
     client_a.close().await.unwrap();
 }
+
+/// Records what one side of a stream writes.
+#[derive(Debug)]
+struct Tap<S> {
+    inner: S,
+    written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+}
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Tap<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Tap<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(written)) = &poll {
+            self.written
+                .lock()
+                .unwrap()
+                .extend_from_slice(&buf[..*written]);
+        }
+        poll
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+/// A peer that omits max-frame-size takes frames of any size, but the
+/// sender's session retains a bounded number of bytes per frame. A message
+/// larger than that bound, which the link's max-message-size admits, still
+/// goes out whole: in frames the session retains.
+#[tokio::test]
+async fn a_message_larger_than_the_session_retains_per_frame_round_trips() {
+    use fe2o3_amqp::link::receive_budget::ReceiveBudget;
+    use serde_amqp::Value;
+
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server_io = Tap {
+        inner: server_io,
+        written: written.clone(),
+    };
+    let acceptor = ConnectionAcceptor::builder()
+        .container_id("test-listener")
+        .max_frame_size(u32::MAX)
+        .build();
+    let connection_task = tokio::spawn(async move { acceptor.accept(server_io).await });
+    let mut client_connection = common::expect_ok!(Connection::builder()
+        .container_id("test-client")
+        .open_with_stream(client_io))
+    .await;
+    let mut server_connection = connection_task.await.unwrap().unwrap();
+
+    // The listener's Open leaves max-frame-size out rather than stating
+    // its default value.
+    let open = {
+        let written = written.lock().unwrap();
+        assert_eq!(&written[..8], b"AMQP\0\x01\0\0");
+        let size = u32::from_be_bytes(written[8..12].try_into().unwrap()) as usize;
+        let offset = usize::from(written[12]) * 4;
+        serde_amqp::from_slice::<Value>(&written[8 + offset..8 + size]).unwrap()
+    };
+    let Value::Described(open) = open else {
+        panic!("expected a described Open, got {open:?}")
+    };
+    let Value::List(fields) = open.value else {
+        panic!("expected the Open's field list")
+    };
+    assert!(
+        matches!(fields.get(2), None | Some(Value::Null)),
+        "max-frame-size is omitted: {fields:?}"
+    );
+
+    let (mut listener_session, mut client_session) =
+        establish_session_pair(&mut server_connection, &mut client_connection, 5000).await;
+    let (mut sender, mut receiver) =
+        establish_link_pair(&mut listener_session, &mut client_session).await;
+    receiver
+        .set_receive_budget(ReceiveBudget::new(64 * 1024 * 1024))
+        .unwrap();
+
+    let payload = "x".repeat(33 * 1024 * 1024);
+    let send_payload = payload.clone();
+    let send_task = tokio::spawn(async move {
+        let outcome = sender.send(Message::from(send_payload)).await.unwrap();
+        outcome.accepted_or("Not accepted").unwrap();
+        sender.close().await.unwrap();
+    });
+    let received = tokio::time::timeout(Duration::from_secs(60), receiver.recv::<String>())
+        .await
+        .expect("timed out waiting for message")
+        .expect("recv failed");
+    receiver.accept(&received).await.unwrap();
+    assert!(received.body() == &payload, "the payload round trips whole");
+    receiver.close().await.unwrap();
+    send_task.await.unwrap();
+
+    client_session.close().await.unwrap();
+    client_connection.close().await.unwrap();
+}

@@ -1735,47 +1735,71 @@ mod tests {
         assert_eq!(credit(&inner.link), (0, 1));
     }
 
-    /// A frame the session queue refuses, being larger than it retains, takes nothing either,
-    /// and the link can still send.
-    #[tokio::test]
-    async fn a_frame_the_queue_refuses_keeps_its_credit() {
-        let mut inner = credited_sender(u32::MAX as usize);
+    /// The payload sizes of the frames one send of `len` bytes goes out in, received as the
+    /// session takes them: a frame holds its share of the queue's bytes until the session is done
+    /// with it. Every frame but the first has no delivery tag of its own.
+    async fn frames_of_one_send(
+        inner: &mut SenderInner<SenderLink<Target>>,
+        len: usize,
+    ) -> Vec<usize> {
         let (writer, mut session) = mpsc::channel::<LinkFrame>(1);
         let writer = crate::session::transfer_queue::Sender::from(writer);
+        let send = inner.link.send_payload(
+            &writer,
+            std::future::pending(),
+            Payload::from(vec![7; len]),
+            0,
+            Some(false),
+            None,
+            false,
+        );
+        let session = async {
+            let mut frames = Vec::new();
+            loop {
+                let Some(LinkFrame::Transfer {
+                    performative,
+                    payload,
+                    ..
+                }) = session.recv().await
+                else {
+                    panic!("expected a transfer frame");
+                };
+                assert_eq!(performative.delivery_tag.is_some(), frames.is_empty());
+                frames.push(payload.len());
+                if !performative.more {
+                    return frames;
+                }
+            }
+        };
+        let (sent, frames) = tokio::join!(send, session);
+        sent.expect("the delivery is handed over");
+        frames
+    }
 
-        let refused = inner
-            .link
-            .send_payload(
-                &writer,
-                std::future::pending(),
-                Payload::from(vec![7; 32 * 1024 * 1024]),
-                0,
-                Some(false),
-                None,
-                false,
-            )
-            .await;
-        assert!(refused.is_err());
-        assert_eq!(credit(&inner.link), (1, 0));
-        assert!(!is_registered(&inner.link, &DeliveryTag::from([0; 4])));
+    /// A peer that omits max-frame-size takes frames of any size, but the session queue retains
+    /// a bounded payload per frame. A delivery goes out in frames of the smaller of the two, and
+    /// takes one credit however many frames it spans.
+    #[tokio::test]
+    async fn a_delivery_is_split_to_what_the_peer_and_the_session_queue_take() {
+        use crate::session::transfer_queue::MAX_FRAME_PAYLOAD;
+        let omitted = u32::MAX as usize;
+        for (len, expected) in [
+            (MAX_FRAME_PAYLOAD, vec![MAX_FRAME_PAYLOAD]),
+            (MAX_FRAME_PAYLOAD + 1, vec![MAX_FRAME_PAYLOAD, 1]),
+            (
+                2 * MAX_FRAME_PAYLOAD + 2,
+                vec![MAX_FRAME_PAYLOAD, MAX_FRAME_PAYLOAD, 2],
+            ),
+        ] {
+            let mut inner = credited_sender(omitted);
+            assert_eq!(frames_of_one_send(&mut inner, len).await, expected);
+            assert_eq!(credit(&inner.link), (0, 1));
+        }
 
-        inner
-            .link
-            .send_payload(
-                &writer,
-                std::future::pending(),
-                Payload::from_static(b"m"),
-                0,
-                Some(false),
-                None,
-                false,
-            )
-            .await
-            .expect("the transfer is handed over");
-        assert!(matches!(
-            session.recv().await,
-            Some(LinkFrame::Transfer { .. })
-        ));
+        let mut inner = credited_sender(4096);
+        let frames = frames_of_one_send(&mut inner, 10_000).await;
+        assert_eq!(frames.iter().sum::<usize>(), 10_000);
+        assert!(frames.len() > 2 && frames.iter().all(|len| *len < 4096));
         assert_eq!(credit(&inner.link), (0, 1));
     }
 

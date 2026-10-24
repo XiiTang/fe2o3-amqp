@@ -26,7 +26,10 @@ use super::{
 
 /// Listener side link endpoint
 #[derive(Debug)]
-#[allow(clippy::large_enum_variant, reason = "retain the inline sender and receiver representations without allocation")]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "retain the inline sender and receiver representations without allocation"
+)]
 pub enum LinkEndpoint {
     /// Sender
     Sender(crate::link::Sender),
@@ -39,6 +42,7 @@ pub enum LinkEndpoint {
 pub(crate) struct SharedLinkAcceptorFields {
     /// The maximum message size supported by the link endpoint
     pub max_message_size: Option<Ulong>,
+    pub unsettled_limits: Option<crate::link::UnsettledLimits>,
 
     /// Link properties
     pub properties: Option<Fields>,
@@ -78,6 +82,7 @@ impl Default for SharedLinkAcceptorFields {
         Self {
             buffer_size: DEFAULT_OUTGOING_BUFFER_SIZE,
             max_message_size: None,
+            unsettled_limits: None,
             properties: None,
             offered_capabilities: None,
             desired_capabilities: None,

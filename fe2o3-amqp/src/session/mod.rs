@@ -992,7 +992,7 @@ impl endpoint::Session for Session {
                             disposition.settled,
                             disposition.state.clone(),
                             delivery_tag,
-                        );
+                        )?;
                     }
                 }
             }
@@ -1011,7 +1011,7 @@ impl endpoint::Session for Session {
                             disposition.settled,
                             disposition.state.clone(),
                             delivery_tag.clone(),
-                        );
+                        )?;
 
                         if echo {
                             delivery_ids.push(delivery_id);
@@ -1533,7 +1533,7 @@ mod tests {
             Arc::new(OnceLock::new()),
         );
         let (tx, mut inbox) = tokio::sync::mpsc::channel(6);
-        let unsettled = Arc::new(Store::new(None));
+        let unsettled = Arc::new(Store::new(None, None).unwrap());
         let flow = Arc::new(LinkFlowState::receiver(LinkFlowStateInner {
             initial_delivery_count: 0,
             delivery_count: 0,

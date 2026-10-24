@@ -21,7 +21,9 @@ pub use receiver::{
 };
 pub use sender::Sender;
 use serde_amqp::serialized_size;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+#[cfg(test)]
+use tokio::sync::oneshot;
 
 use crate::{
     control::SessionControl,
@@ -63,6 +65,7 @@ mod source;
 pub(crate) mod state;
 pub mod target_archetype;
 pub(crate) mod unsettled_store;
+pub use unsettled_store::{UnsettledCapacityExceeded, UnsettledLimits};
 
 /// Internal purpose of Attach validation; close-only never reconciles deliveries.
 pub(crate) enum AttachPurpose {
@@ -701,78 +704,38 @@ impl LinkRelay<OutputAttachment> {
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
     pub(crate) fn on_incoming_disposition(
         &mut self,
-        _role: Role, // Is a role check necessary?
+        _role: Role,
         settled: bool,
         state: Option<DeliveryState>,
-        // Disposition only contains the delivery ids, which are assigned by the
-        // sessions
         delivery_tag: DeliveryTag,
-    ) -> bool {
+    ) -> Result<bool, UnsettledCapacityExceeded> {
         match self {
             LinkRelay::Sender {
                 unsettled,
                 receiver_settle_mode,
                 ..
             } => {
-                if settled {
-                    // Upon receiving the updated delivery state from the receiver, the sender will, if it has not already spontaneously
-                    // attained a terminal state (e.g., through the expiry of the TTL at the sender), update its view of the state and
-                    // communicate this back to the sending application.
-
-                    // Since we are settling (ie. forgetting) this message, we don't care whether the
-                    // receiving end is alive or not
-                    if let Some(msg) = unsettled.withdraw(&delivery_tag) {
-                        let _ = msg.settle_with_state(state);
+                unsettled.check()?;
+                let terminal = state.as_ref().is_some_and(DeliveryState::is_terminal);
+                if settled || terminal {
+                    if let Some(message) = unsettled.withdraw(&delivery_tag) {
+                        let _ = message.settle_with_state(state);
                     }
-                    false
                 } else {
-                    let is_terminal = match &state {
-                        Some(s) => s.is_terminal(),
-                        None => false, // Probably should not assume the state is not specified
-                    };
-                    // Once the receiving application has finished processing the message,
-                    // it indicates to the link endpoint a **terminal delivery state** that
-                    // reflects the outcome of the application processing
-                    if is_terminal {
-                        if let Some(msg) = unsettled.withdraw(&delivery_tag) {
-                            let _ = msg.settle_with_state(state);
-                        }
-                    } else {
-                        unsettled.set_state(&delivery_tag, state);
-                    }
-
-                    // If the receiver is in mode Second, it will send a non-settled terminal state
-                    // to indicate end of processing
-                    match receiver_settle_mode {
-                        ReceiverSettleMode::First => {
-                            // The receiver will spontaneously settle all incoming transfers.
-                            false
-                        }
-                        ReceiverSettleMode::Second => {
-                            // The receiver will only settle after sending the disposition to
-                            // the sender and receiving a disposition indicating settlement of the
-                            // delivery from the sender.
-
-                            is_terminal
-                        }
-                    }
+                    unsettled.set_state(&delivery_tag, state)?;
                 }
+                Ok(!settled
+                    && terminal
+                    && matches!(receiver_settle_mode, ReceiverSettleMode::Second))
             }
             LinkRelay::Receiver { unsettled, .. } => {
+                unsettled.check()?;
                 if settled {
-                    let mut guard = unsettled.write();
-                    // let _state = remove_from_unsettled(unsettled, &delivery_tag).await;
-                    let _state = guard.as_mut().and_then(|m| m.swap_remove(&delivery_tag));
+                    unsettled.remove(&delivery_tag);
                 } else {
-                    let mut guard = unsettled.write();
-                    if let Some(msg_state) = guard.as_mut().and_then(|m| m.get_mut(&delivery_tag)) {
-                        msg_state.remote_state(state);
-                    }
+                    unsettled.update(&delivery_tag, |entry| entry.remote_state(state))?;
                 }
-
-                // Only the sender needs to auto-reply to receiver's disposition, thus
-                // `echo = false`
-                false
+                Ok(false)
             }
         }
     }
@@ -819,11 +782,9 @@ impl LinkRelay<OutputAttachment> {
                 // Publish initial unsettled identity before handing bytes to the
                 // receiver. A following disposition can otherwise race decoding.
                 let known = if let Some(tag) = &tag {
-                    let mut guard = unsettled.write();
+                    unsettled.check()?;
                     if settled || transfer.aborted {
-                        if let Some(map) = guard.as_mut() {
-                            map.swap_remove(tag);
-                        }
+                        unsettled.remove(tag);
                         false
                     } else {
                         if first
@@ -832,16 +793,22 @@ impl LinkRelay<OutputAttachment> {
                             && transfer.message_format.is_some()
                             && tag.len() <= 32
                         {
-                            let map = guard.get_or_insert_with(UnsettledMap::new);
-                            if map.contains_key(tag) {
+                            if unsettled
+                                .read()
+                                .as_ref()
+                                .is_some_and(|map| map.contains_key(tag))
+                            {
                                 return Err(LinkRelayError::InvalidTransfer);
                             }
-                            map.insert(
+                            unsettled.insert(
                                 tag.clone(),
                                 receiver_delivery::ReceiverDelivery::new(transfer.state.clone()),
-                            );
+                            )?;
                         }
-                        guard.as_ref().is_some_and(|map| map.contains_key(tag))
+                        unsettled
+                            .read()
+                            .as_ref()
+                            .is_some_and(|map| map.contains_key(tag))
                     }
                 } else {
                     false
@@ -1154,10 +1121,56 @@ mod tests {
 #[cfg(test)]
 mod incoming_identity_tests {
     use super::*;
+    use crate::link::state::LinkFlowStateInner;
     fn transfer() -> Transfer {
         serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x55, 0x43])
             .unwrap()
     }
+    #[tokio::test]
+    async fn unsettled_receiver_relay_caps_count_and_bytes_before_forwarding() {
+        for limits in [UnsettledLimits::new(1, 128), UnsettledLimits::new(10, 2)] {
+            let (tx, mut frames) = mpsc::channel(8);
+            let store = Arc::new(unsettled_store::Store::new(None, Some(limits)).unwrap());
+            let flow = Arc::new(LinkFlowState::receiver(LinkFlowStateInner {
+                initial_delivery_count: 0,
+                delivery_count: 0,
+                link_credit: 10,
+                available: 0,
+                drain: false,
+                properties: None,
+            }));
+            let mut relay =
+                LinkRelay::new_receiver(tx, flow, store.clone(), ReceiverSettleMode::Second)
+                    .with_output_handle(crate::endpoint::OutputAttachment::for_tests(0));
+            let mut frame = transfer();
+            frame.more = false;
+            let first = relay
+                .on_incoming_transfer(frame.clone(), Payload::new(), None)
+                .await;
+            if limits.max_bytes == 2 {
+                assert!(matches!(
+                    first,
+                    Err(LinkRelayError::UnsettledCapacityExceeded(_))
+                ));
+            } else {
+                first.unwrap();
+                frames.try_recv().unwrap();
+                frame.delivery_id = Some(1);
+                frame.delivery_tag = Some(vec![2].into());
+                let result = relay
+                    .on_incoming_transfer(frame, Payload::new(), None)
+                    .await;
+                assert!(matches!(
+                    result,
+                    Err(LinkRelayError::UnsettledCapacityExceeded(_))
+                ));
+            }
+            assert!(frames.try_recv().is_err());
+            assert_eq!(store.usage(), (0, 0));
+            assert!(store.check().is_err());
+        }
+    }
+
     #[tokio::test]
     async fn second_settlement_waits_for_a_terminal_peer_outcome() {
         let (tx, _rx) = mpsc::channel(8);
@@ -1168,7 +1181,7 @@ mod incoming_identity_tests {
             tag.clone(),
             UnsettledMessage::new(Payload::new(), None, 0, reply),
         );
-        let unsettled = Arc::new(unsettled_store::Store::new(Some(messages)));
+        let unsettled = Arc::new(unsettled_store::Store::new(Some(messages), None).unwrap());
         let flow = Arc::new(LinkFlowState::sender(state::LinkFlowStateInner {
             initial_delivery_count: 0,
             delivery_count: 0,
@@ -1194,23 +1207,22 @@ mod incoming_identity_tests {
             section_number: 1,
             section_offset: 0,
         };
-        assert!(!relay.on_incoming_disposition(
-            Role::Receiver,
-            false,
-            Some(received.into()),
-            tag.clone()
-        ));
+        assert!(!relay
+            .on_incoming_disposition(Role::Receiver, false, Some(received.into()), tag.clone())
+            .unwrap());
         assert!(matches!(
             outcome.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
         assert!(unsettled.read().as_ref().unwrap().contains_key(&tag));
-        assert!(relay.on_incoming_disposition(
-            Role::Receiver,
-            false,
-            Some(fe2o3_amqp_types::messaging::Accepted {}.into()),
-            tag
-        ));
+        assert!(relay
+            .on_incoming_disposition(
+                Role::Receiver,
+                false,
+                Some(fe2o3_amqp_types::messaging::Accepted {}.into()),
+                tag
+            )
+            .unwrap());
         assert!(matches!(
             outcome.await.unwrap(),
             Ok(Some(DeliveryState::Accepted(_)))
@@ -1221,7 +1233,7 @@ mod incoming_identity_tests {
     async fn settlement_before_application_decode_and_fragment_continuations_use_one_identity() {
         for mode in [ReceiverSettleMode::First, ReceiverSettleMode::Second] {
             let (tx, mut input) = mpsc::channel(8);
-            let unsettled = Arc::new(unsettled_store::Store::new(None));
+            let unsettled = Arc::new(unsettled_store::Store::new(None, None).unwrap());
             let flow = Arc::new(LinkFlowState::receiver(state::LinkFlowStateInner {
                 initial_delivery_count: 0,
                 delivery_count: 0,
@@ -1243,7 +1255,9 @@ mod incoming_identity_tests {
                 Some((0, tag.clone()))
             );
             assert!(unsettled.read().as_ref().unwrap().contains_key(&tag));
-            assert!(!relay.on_incoming_disposition(Role::Sender, true, None, tag.clone()));
+            assert!(!relay
+                .on_incoming_disposition(Role::Sender, true, None, tag.clone())
+                .unwrap());
             assert!(!unsettled.read().as_ref().unwrap().contains_key(&tag));
             let mut next = first.clone();
             next.delivery_id = None;
@@ -1285,12 +1299,11 @@ mod incoming_identity_tests {
     fn completed_decode_never_recreates_a_delivery_settled_before_application_read() {
         use crate::endpoint::ReceiverLink as _;
         for settled in [false, true] {
-            let map = Arc::new(unsettled_store::Store::new(None));
+            let map = Arc::new(unsettled_store::Store::new(None, None).unwrap());
             let tag = transfer().delivery_tag.unwrap();
             if !settled {
-                map.write()
-                    .get_or_insert_with(UnsettledMap::new)
-                    .insert(tag.clone(), receiver_delivery::ReceiverDelivery::new(None));
+                map.insert(tag.clone(), receiver_delivery::ReceiverDelivery::new(None))
+                    .unwrap();
             }
             let flow = Arc::new(LinkFlowState::receiver(state::LinkFlowStateInner {
                 initial_delivery_count: 0,
@@ -1349,7 +1362,7 @@ mod detach_admission_tests {
             .source("source")
             .target("target")
             .create_link(
-                Arc::new(unsettled_store::Store::new(None)),
+                Arc::new(unsettled_store::Store::new(None, None).unwrap()),
                 crate::endpoint::OutputAttachment::for_tests(7),
                 flow,
                 Arc::new(OnceLock::new()),

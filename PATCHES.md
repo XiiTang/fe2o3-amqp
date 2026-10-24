@@ -898,3 +898,52 @@ Regression evidence: the existing `detached_link_frames` cases
 on the first W4e implementation. They exercise the native effect; the allocation
 checkpoint tests also require an abandoned incoming allocation's relay to be
 removed. The final rerun is a required verification of this correction.
+
+## W17c: configured bounds at the unsettled owner
+
+At 44afcb79, link/unsettled_store.rs:54-57,110-128,155-158 exposes an
+unrestricted mutable map and unbounded sender registration/state replacement;
+link/mod.rs:803-826 inserts receiver entries directly. Replenished protocol
+windows therefore permit retained unsettled state to grow without an aggregate
+bound. Recovery and receiver receipt/settlement updates also change retained
+state through that mutable map.
+
+`Store::new(value, limits)` accepts optional `UnsettledLimits::new(max_entries,
+max_bytes)`. `Sender`/`Receiver`/controller builders, `LinkAcceptor` and
+`ControlLinkAcceptor` builders expose `unsettled_limits(limits)`. No deployment
+cap values are chosen: omitted limits preserve unconfigured upstream behavior.
+The same Store and limits remain owned across detach/resume and reattach.
+
+`Mutation::check` is the single capacity checkpoint for constructor retention,
+registration and size-changing updates. Raw mutation is private, with no
+DerefMut or mutable-map guard outside Store. Receiver updates, receipt metadata,
+settlement batches and recovery reconciliation use its bounded methods. Removal
+returns room. Admission checks run before credit/queue waits as well as under
+the actual handoff lock, so known exhaustion cannot wait for unrelated credit.
+This follows the pre-push semantic-owner pattern in russh 7596d8a,
+russh/src/channels/inbox.rs:45-74, rather than allocator callbacks.
+
+The byte limit counts tags, sender payloads, encoded local/remote delivery states
+and retained delivery-info tags; the separate entry limit bounds structural
+population. It is a retained-content bound, not an allocator-memory measurement.
+Checked arithmetic refuses unrepresentable sizes. Exhaustion permanently closes
+the unsettled owner with `UnsettledCapacityExceeded`, fails pending sender
+outcomes outside the lock through W4e's completion disposition, and is retained
+through recovery. Receiver-relay exhaustion ends its session through the normal
+ResourceLimitExceeded End exchange, retaining the typed cause if cleanup fails.
+
+Regression evidence: Store count/byte refusal, sender state growth, receiver
+local/remote growth, replacement/removal room, and permanently ended recovery;
+`unsettled_sender_caps_precede_credit_and_dispatch_and_fail_pending_outcomes`,
+`unsettled_exhaustion_is_known_even_without_peer_credit`,
+`unsettled_receiver_relay_caps_count_and_bytes_before_forwarding`, and
+`unsettled_recovery_reconciliation_refuses_state_growth` cover real callers.
+Restoring the preceding unbounded capacity policy makes the regression selection
+fail (exit 101); restoring the checkpoint passes all 13 selected library tests
+(exit 0), on macOS arm64 / Rust 1.98.1. `tests/unsettled_limits.rs` exercises both
+configured roles across a replenished one-frame session window and link credit.
+
+The new typed native error variants require corresponding consumer match arms
+when integrating this pin. The fork does not classify them by diagnostic text
+or manufacture a peer close. Boundless's W17c integration owns that mapping and
+selects measured constructor values later.

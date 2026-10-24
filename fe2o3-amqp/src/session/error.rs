@@ -81,6 +81,9 @@ impl From<SessionStateError> for BeginError {
 /// Error with session operations
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SessionInnerError {
+    /// An attached link exceeded its configured unsettled retention bound.
+    #[error(transparent)]
+    UnsettledCapacityExceeded(#[from] crate::link::UnsettledCapacityExceeded),
     #[error("Invalid or duplicate transfer identity")]
     InvalidTransfer,
     /// The peer sent more transfers than the advertised session window.
@@ -138,6 +141,9 @@ impl From<SessionStateError> for SessionInnerError {
 impl From<LinkRelayError> for SessionInnerError {
     fn from(error: LinkRelayError) -> Self {
         match error {
+            LinkRelayError::UnsettledCapacityExceeded(error) => {
+                Self::UnsettledCapacityExceeded(error)
+            }
             LinkRelayError::InvalidTransfer => Self::InvalidTransfer,
             LinkRelayError::UnattachedHandle => Self::UnattachedHandle,
             LinkRelayError::TransferFrameToSender => Self::TransferFrameToSender,
@@ -149,6 +155,9 @@ impl From<LinkRelayError> for SessionInnerError {
 #[allow(clippy::enum_variant_names)]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// An attached link exceeded its configured unsettled retention bound.
+    #[error(transparent)]
+    UnsettledCapacityExceeded(#[from] crate::link::UnsettledCapacityExceeded),
     /// The session engine task failed before publishing its natural end.
     #[error(transparent)]
     JoinError(#[from] tokio::task::JoinError),
@@ -200,6 +209,9 @@ pub enum Error {
 impl From<SessionInnerError> for Error {
     fn from(error: SessionInnerError) -> Self {
         match error {
+            SessionInnerError::UnsettledCapacityExceeded(error) => {
+                Self::UnsettledCapacityExceeded(error)
+            }
             SessionInnerError::InvalidTransfer => Self::InvalidTransfer,
             SessionInnerError::WindowViolation => Self::WindowViolation,
             SessionInnerError::UnattachedHandle => Self::UnattachedHandle,
@@ -223,6 +235,9 @@ impl From<SessionInnerError> for Error {
 impl From<LinkRelayError> for Error {
     fn from(error: LinkRelayError) -> Self {
         match error {
+            LinkRelayError::UnsettledCapacityExceeded(error) => {
+                Self::UnsettledCapacityExceeded(error)
+            }
             LinkRelayError::InvalidTransfer => Self::InvalidTransfer,
             LinkRelayError::UnattachedHandle => Self::UnattachedHandle,
             LinkRelayError::TransferFrameToSender => {

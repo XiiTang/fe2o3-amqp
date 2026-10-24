@@ -495,6 +495,14 @@ where
         use fe2o3_amqp_types::transaction::TransactionError;
 
         match kind {
+            SessionInnerError::UnsettledCapacityExceeded(_) => {
+                self.end_session(Some(Error::new(
+                    AmqpError::ResourceLimitExceeded,
+                    None,
+                    None,
+                )))
+                .await
+            }
             SessionInnerError::WindowViolation => {
                 let error = Error::new(SessionError::WindowViolation, None, None);
                 self.end_session(Some(error)).await
@@ -741,9 +749,17 @@ where
                             outcome = Err(error);
                             running
                         }
-                        Err(error) => {
-                            // Stop the session if error cannot be handled
-                            outcome = Err(error);
+                        Err(cleanup_error) => {
+                            // Exhaustion remains the terminal cause even if the peer
+                            // disappears during the End exchange.
+                            outcome = Err(
+                                if matches!(error, SessionInnerError::UnsettledCapacityExceeded(_))
+                                {
+                                    error
+                                } else {
+                                    cleanup_error
+                                },
+                            );
                             Running::Stop
                         }
                     }
@@ -770,6 +786,13 @@ where
                 SessionStopReason::RemoteEndedWithError(error.clone())
             }
             Err(SessionInnerError::RemoteEnded) => SessionStopReason::RemoteEnded,
+            Err(SessionInnerError::UnsettledCapacityExceeded(_)) => {
+                SessionStopReason::EndedWithError(fe2o3_amqp_types::definitions::Error::new(
+                    AmqpError::ResourceLimitExceeded,
+                    None,
+                    None,
+                ))
+            }
             _ => SessionStopReason::Ended,
         };
         let _ =
@@ -835,7 +858,7 @@ mod allocation_cancel_tests {
             LinkRelay::new_receiver(
                 tx,
                 flow,
-                Arc::new(Store::new(None)),
+                Arc::new(Store::new(None, None).unwrap()),
                 ReceiverSettleMode::First,
             ),
             rx,
@@ -1121,7 +1144,7 @@ mod detached_attachment_tests {
             let relay = LinkRelay::new_sender(
                 tx,
                 Producer::new(Arc::new(tokio::sync::Notify::new()), flow),
-                Arc::new(Store::new(None)),
+                Arc::new(Store::new(None, None).unwrap()),
             );
             let attachment = self
                 .engine

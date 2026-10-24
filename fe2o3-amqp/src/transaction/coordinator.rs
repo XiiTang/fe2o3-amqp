@@ -178,6 +178,12 @@ impl TxnCoordinator {
     async fn on_recv_error(&mut self, error: RecvError) -> Running {
         match error {
             RecvError::LinkStateError(error) => match error {
+                crate::link::LinkStateError::UnsettledCapacityExceeded(_) => {
+                    let error =
+                        definitions::Error::new(AmqpError::ResourceLimitExceeded, None, None);
+                    let _ = self.inner.close_with_error(Some(error)).await;
+                    Running::Stop
+                }
                 crate::link::LinkStateError::IllegalState => {
                     #[cfg(feature = "tracing")]
                     tracing::error!(?error);
@@ -299,6 +305,12 @@ impl TxnCoordinator {
         match disposition_result {
             Ok(_) => Running::Continue,
             Err(disposition_error) => match disposition_error {
+                IllegalLinkStateError::UnsettledCapacityExceeded(_) => {
+                    let error =
+                        definitions::Error::new(AmqpError::ResourceLimitExceeded, None, None);
+                    let _ = self.inner.close_with_error(Some(error)).await;
+                    Running::Stop
+                }
                 IllegalLinkStateError::IllegalState => {
                     let error = definitions::Error::new(AmqpError::IllegalState, None, None);
                     // TODO: detach instead of closing

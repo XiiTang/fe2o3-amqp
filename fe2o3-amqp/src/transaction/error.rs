@@ -152,6 +152,9 @@ impl From<SendError> for ControllerSendError {
 impl From<IllegalLinkStateError> for ControllerSendError {
     fn from(value: IllegalLinkStateError) -> Self {
         match value {
+            IllegalLinkStateError::UnsettledCapacityExceeded(error) => {
+                LinkStateError::UnsettledCapacityExceeded(error).into()
+            }
             IllegalLinkStateError::IllegalState => LinkStateError::IllegalState.into(),
             IllegalLinkStateError::SessionStopped(reason) => {
                 LinkStateError::SessionStopped(reason).into()
@@ -268,6 +271,9 @@ impl From<DetachError> for PostError {
 impl From<IllegalLinkStateError> for PostError {
     fn from(value: IllegalLinkStateError) -> Self {
         match value {
+            IllegalLinkStateError::UnsettledCapacityExceeded(error) => {
+                LinkStateError::UnsettledCapacityExceeded(error).into()
+            }
             IllegalLinkStateError::IllegalState => LinkStateError::IllegalState.into(),
             IllegalLinkStateError::SessionStopped(reason) => {
                 LinkStateError::SessionStopped(reason).into()

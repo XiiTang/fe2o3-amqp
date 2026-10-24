@@ -83,6 +83,8 @@ pub struct Builder<Role, T, NameState, SS, TS> {
 
     /// The maximum message size supported by the link endpoint
     pub max_message_size: Option<Ulong>,
+    /// Optional configured unsettled retention bounds, kept across recovery.
+    pub unsettled_limits: Option<super::UnsettledLimits>,
 
     /// The extension capabilities the sender supports
     pub offered_capabilities: Option<Vec<Symbol>>,
@@ -135,6 +137,7 @@ impl<Role, T> Default for Builder<Role, T, WithoutName, WithoutSource, WithoutTa
             target: Default::default(),
             initial_delivery_count: Default::default(),
             max_message_size: Default::default(),
+            unsettled_limits: None,
             offered_capabilities: Default::default(),
             desired_capabilities: Default::default(),
             properties: Default::default(),
@@ -177,6 +180,14 @@ impl<T, NameState, SS, TS> Builder<role::ReceiverMarker, T, NameState, SS, TS> {
 }
 
 impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
+    /// Bound this link's unsettled entry count and aggregate retained content.
+    /// No deployment defaults are selected by the library; omitted limits keep
+    /// upstream behavior. Exhaustion permanently ends the unsettled owner.
+    pub fn unsettled_limits(mut self, limits: super::UnsettledLimits) -> Self {
+        self.unsettled_limits = Some(limits);
+        self
+    }
+
     /// The name of the link
     pub fn name(self, name: impl Into<String>) -> Builder<Role, T, WithName, SS, TS> {
         Builder {
@@ -187,6 +198,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             target: self.target,
             initial_delivery_count: self.initial_delivery_count,
             max_message_size: self.max_message_size,
+            unsettled_limits: self.unsettled_limits,
             offered_capabilities: self.offered_capabilities,
             desired_capabilities: self.desired_capabilities,
             buffer_size: self.buffer_size,
@@ -214,6 +226,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             target: self.target,
             initial_delivery_count: self.initial_delivery_count,
             max_message_size: self.max_message_size,
+            unsettled_limits: self.unsettled_limits,
             offered_capabilities: self.offered_capabilities,
             desired_capabilities: self.desired_capabilities,
             buffer_size: self.buffer_size,
@@ -241,6 +254,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             target: self.target,
             initial_delivery_count: self.initial_delivery_count,
             max_message_size: self.max_message_size,
+            unsettled_limits: self.unsettled_limits,
             offered_capabilities: self.offered_capabilities,
             desired_capabilities: self.desired_capabilities,
             buffer_size: self.buffer_size,
@@ -280,6 +294,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             target: self.target,
             initial_delivery_count: self.initial_delivery_count,
             max_message_size: self.max_message_size,
+            unsettled_limits: self.unsettled_limits,
             offered_capabilities: self.offered_capabilities,
             desired_capabilities: self.desired_capabilities,
             properties: self.properties,
@@ -310,6 +325,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             target: Some(target.into()), // setting target
             initial_delivery_count: self.initial_delivery_count,
             max_message_size: self.max_message_size,
+            unsettled_limits: self.unsettled_limits,
             offered_capabilities: self.offered_capabilities,
             desired_capabilities: self.desired_capabilities,
             buffer_size: self.buffer_size,
@@ -341,6 +357,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
                 target: Some(coordinator), // setting target
                 initial_delivery_count: self.initial_delivery_count,
                 max_message_size: self.max_message_size,
+            unsettled_limits: self.unsettled_limits,
                 offered_capabilities: self.offered_capabilities,
                 desired_capabilities: self.desired_capabilities,
                 buffer_size: self.buffer_size,
@@ -550,7 +567,10 @@ where
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(capacity);
         let outgoing = session.outgoing.clone();
         let (producer, consumer) = self.create_flow_state_containers();
-        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(
+            None,
+            self.unsettled_limits,
+        )?);
 
         let link_relay = LinkRelay::new_sender(incoming_tx, producer, unsettled.clone());
         let output_handle = session::allocate_link(
@@ -672,7 +692,10 @@ where
         let (incoming_tx, mut incoming_rx) = mpsc::channel::<LinkIncomingItem>(capacity);
         let outgoing = session.outgoing.clone();
         let (relay_flow_state, flow_state) = self.create_flow_state_containers();
-        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(
+            None,
+            self.unsettled_limits,
+        )?);
         let auto_accept = self.auto_accept;
 
         let link_relay = LinkRelay::new_receiver(
@@ -781,7 +804,7 @@ mod suspension_tests {
                 stop.set(SessionStopReason::Stopped).unwrap();
             }
             let mut link = builder.create_link(
-                Arc::new(Store::new(None)),
+                Arc::new(Store::new(None, None).unwrap()),
                 crate::endpoint::OutputAttachment::for_tests(0),
                 consumer,
                 stop,

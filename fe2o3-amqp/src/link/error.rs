@@ -110,6 +110,9 @@ impl ErrorRecovery {
 /// Error associated with detaching
 #[derive(Debug, thiserror::Error)]
 pub enum DetachError {
+    /// The configured unsettled retention bound ended this native owner.
+    #[error(transparent)]
+    UnsettledCapacityExceeded(#[from] super::UnsettledCapacityExceeded),
     /// ILlegal link state
     #[error("Illegal local state")]
     IllegalState,
@@ -155,9 +158,10 @@ impl DetachError {
             Self::RemoteDetachedWithError(_) | Self::DetachedByRemote => {
                 ErrorRecovery::ReattachLink
             }
-            Self::ClosedByRemote | Self::RemoteClosedWithError(_) | Self::IllegalState => {
-                ErrorRecovery::NewLink
-            }
+            Self::UnsettledCapacityExceeded(_)
+            | Self::ClosedByRemote
+            | Self::RemoteClosedWithError(_)
+            | Self::IllegalState => ErrorRecovery::NewLink,
         }
     }
 }
@@ -217,6 +221,9 @@ impl From<ApplyRemoteDetachError> for LinkStateError {
 /// Errors associated with attaching a link as sender
 #[derive(Debug, thiserror::Error)]
 pub enum SenderAttachError {
+    /// The configured unsettled retention bound ended this native owner.
+    #[error(transparent)]
+    UnsettledCapacityExceeded(#[from] super::UnsettledCapacityExceeded),
     /// The declared session window cannot fit the native queue address space.
     #[error("Session window exceeds native queue capacity")]
     NativeBufferTooLarge,
@@ -415,6 +422,9 @@ impl std::error::Error for DesiredFilterNotSupported {}
 /// Errors associated with attaching a link as receiver
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiverAttachError {
+    /// The configured unsettled retention bound ended this native owner.
+    #[error(transparent)]
+    UnsettledCapacityExceeded(#[from] super::UnsettledCapacityExceeded),
     /// The declared session window cannot fit the native queue address space.
     #[error("Session window exceeds native queue capacity")]
     NativeBufferTooLarge,
@@ -502,6 +512,9 @@ impl<'a> TryFrom<&'a ReceiverAttachError> for definitions::Error {
 
     fn try_from(value: &'a ReceiverAttachError) -> Result<Self, Self::Error> {
         let condition: ErrorCondition = match value {
+            ReceiverAttachError::UnsettledCapacityExceeded(_) => {
+                AmqpError::ResourceLimitExceeded.into()
+            }
             ReceiverAttachError::SessionStopped(_) => AmqpError::IllegalState.into(),
             ReceiverAttachError::DuplicatedLinkName => SessionError::HandleInUse.into(),
             ReceiverAttachError::IllegalState => AmqpError::IllegalState.into(),
@@ -542,6 +555,9 @@ impl TryFrom<DetachError> for SenderAttachError {
     #[allow(deprecated)]
     fn try_from(value: DetachError) -> Result<Self, Self::Error> {
         match value {
+            DetachError::UnsettledCapacityExceeded(error) => {
+                Ok(SenderAttachError::UnsettledCapacityExceeded(error))
+            }
             DetachError::IllegalState => Ok(Self::IllegalState),
             DetachError::SessionStopped(reason) => Ok(Self::SessionStopped(reason)),
             DetachError::RemoteDetachedWithError(error)
@@ -561,6 +577,9 @@ impl TryFrom<DetachError> for ReceiverAttachError {
     #[allow(deprecated)]
     fn try_from(value: DetachError) -> Result<Self, Self::Error> {
         match value {
+            DetachError::UnsettledCapacityExceeded(error) => {
+                Ok(ReceiverAttachError::UnsettledCapacityExceeded(error))
+            }
             DetachError::IllegalState => Ok(Self::IllegalState),
             DetachError::SessionStopped(reason) => Ok(Self::SessionStopped(reason)),
             DetachError::RemoteDetachedWithError(error)
@@ -579,6 +598,9 @@ impl<'a> TryFrom<&'a SenderAttachError> for definitions::Error {
 
     fn try_from(value: &'a SenderAttachError) -> Result<Self, Self::Error> {
         let condition: ErrorCondition = match value {
+            SenderAttachError::UnsettledCapacityExceeded(_) => {
+                AmqpError::ResourceLimitExceeded.into()
+            }
             SenderAttachError::SessionStopped(_) => AmqpError::IllegalState.into(),
             SenderAttachError::DuplicatedLinkName => SessionError::HandleInUse.into(),
             SenderAttachError::IllegalState => AmqpError::IllegalState.into(),
@@ -608,6 +630,9 @@ impl<'a> TryFrom<&'a SenderAttachError> for definitions::Error {
 /// Errors associated with link state
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum LinkStateError {
+    /// The configured unsettled retention bound ended this native owner.
+    #[error(transparent)]
+    UnsettledCapacityExceeded(#[from] super::UnsettledCapacityExceeded),
     /// ILlegal link state
     #[error("Illegal local state")]
     IllegalState,
@@ -642,6 +667,9 @@ impl From<DetachError> for LinkStateError {
     #[allow(deprecated)]
     fn from(value: DetachError) -> Self {
         match value {
+            DetachError::UnsettledCapacityExceeded(error) => {
+                LinkStateError::UnsettledCapacityExceeded(error)
+            }
             DetachError::IllegalState => Self::IllegalState,
             DetachError::SessionStopped(reason) => Self::SessionStopped(reason),
             DetachError::RemoteDetachedWithError(error) => Self::RemoteDetachedWithError(error),
@@ -658,7 +686,8 @@ impl LinkStateError {
         match self {
             Self::RemoteDetached | Self::RemoteDetachedWithError(_) => ErrorRecovery::ReattachLink,
             Self::SessionStopped(reason) => session_stop_recovery(reason),
-            Self::RemoteClosed
+            Self::UnsettledCapacityExceeded(_)
+            | Self::RemoteClosed
             | Self::RemoteClosedWithError(_)
             | Self::IllegalState
             | Self::ExpectImmediateDetach => ErrorRecovery::NewLink,
@@ -669,6 +698,9 @@ impl LinkStateError {
 /// Errors associated with receiving a transfer
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ReceiverTransferError {
+    /// The configured unsettled retention bound ended this native owner.
+    #[error(transparent)]
+    UnsettledCapacityExceeded(#[from] super::UnsettledCapacityExceeded),
     /// ILlegal link state
     #[error("Illegal local state")]
     IllegalState,
@@ -776,6 +808,9 @@ pub enum RecvError {
 impl From<ReceiverTransferError> for RecvError {
     fn from(value: ReceiverTransferError) -> Self {
         match value {
+            ReceiverTransferError::UnsettledCapacityExceeded(error) => {
+                LinkStateError::UnsettledCapacityExceeded(error).into()
+            }
             ReceiverTransferError::MessageSizeExceeded => RecvError::MaterializationBoundExceeded,
             ReceiverTransferError::InvalidMessageEncoding(error) => {
                 RecvError::InvalidMessageEncoding(error)
@@ -826,6 +861,9 @@ pub type FlowError = IllegalLinkStateError;
 /// Errors associated with sending/handling Disposition
 #[derive(Debug, thiserror::Error)]
 pub enum IllegalLinkStateError {
+    /// The configured unsettled retention bound ended this native owner.
+    #[error(transparent)]
+    UnsettledCapacityExceeded(#[from] super::UnsettledCapacityExceeded),
     /// ILlegal link state
     #[error("Illegal local state")]
     IllegalState,
@@ -840,6 +878,9 @@ pub(crate) type SendAttachErrorKind = IllegalLinkStateError;
 impl From<IllegalLinkStateError> for LinkStateError {
     fn from(value: IllegalLinkStateError) -> Self {
         match value {
+            IllegalLinkStateError::UnsettledCapacityExceeded(error) => {
+                LinkStateError::UnsettledCapacityExceeded(error)
+            }
             IllegalLinkStateError::IllegalState => LinkStateError::IllegalState,
             IllegalLinkStateError::SessionStopped(reason) => LinkStateError::SessionStopped(reason),
         }
@@ -849,6 +890,9 @@ impl From<IllegalLinkStateError> for LinkStateError {
 impl From<IllegalLinkStateError> for ReceiverAttachError {
     fn from(value: IllegalLinkStateError) -> Self {
         match value {
+            IllegalLinkStateError::UnsettledCapacityExceeded(error) => {
+                ReceiverAttachError::UnsettledCapacityExceeded(error)
+            }
             IllegalLinkStateError::IllegalState => ReceiverAttachError::IllegalState,
             IllegalLinkStateError::SessionStopped(reason) => {
                 ReceiverAttachError::SessionStopped(reason)
@@ -860,6 +904,9 @@ impl From<IllegalLinkStateError> for ReceiverAttachError {
 impl From<IllegalLinkStateError> for SenderAttachError {
     fn from(value: IllegalLinkStateError) -> Self {
         match value {
+            IllegalLinkStateError::UnsettledCapacityExceeded(error) => {
+                SenderAttachError::UnsettledCapacityExceeded(error)
+            }
             IllegalLinkStateError::IllegalState => SenderAttachError::IllegalState,
             IllegalLinkStateError::SessionStopped(reason) => {
                 SenderAttachError::SessionStopped(reason)
@@ -871,6 +918,9 @@ impl From<IllegalLinkStateError> for SenderAttachError {
 impl From<IllegalLinkStateError> for SendError {
     fn from(value: IllegalLinkStateError) -> Self {
         match value {
+            IllegalLinkStateError::UnsettledCapacityExceeded(error) => {
+                LinkStateError::UnsettledCapacityExceeded(error).into()
+            }
             IllegalLinkStateError::IllegalState => LinkStateError::IllegalState.into(),
             IllegalLinkStateError::SessionStopped(reason) => {
                 LinkStateError::SessionStopped(reason).into()
@@ -882,6 +932,9 @@ impl From<IllegalLinkStateError> for SendError {
 impl From<IllegalLinkStateError> for DetachError {
     fn from(value: IllegalLinkStateError) -> Self {
         match value {
+            IllegalLinkStateError::UnsettledCapacityExceeded(error) => {
+                DetachError::UnsettledCapacityExceeded(error)
+            }
             IllegalLinkStateError::IllegalState => Self::IllegalState,
             IllegalLinkStateError::SessionStopped(reason) => Self::SessionStopped(reason),
         }
@@ -984,6 +1037,9 @@ impl std::error::Error for ReceiverResumeError {}
 /// Error with link relay
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum LinkRelayError {
+    /// The configured unsettled retention bound ended this native owner.
+    #[error(transparent)]
+    UnsettledCapacityExceeded(#[from] super::UnsettledCapacityExceeded),
     #[error("Invalid or duplicate transfer identity")]
     InvalidTransfer,
     /// Link is not attached
@@ -998,6 +1054,9 @@ pub(crate) enum LinkRelayError {
 impl From<LinkRelayError> for definitions::Error {
     fn from(error: LinkRelayError) -> Self {
         match error {
+            LinkRelayError::UnsettledCapacityExceeded(_) => {
+                definitions::Error::new(AmqpError::ResourceLimitExceeded, None, None)
+            }
             LinkRelayError::InvalidTransfer => {
                 definitions::Error::new(AmqpError::InvalidField, None, None)
             }

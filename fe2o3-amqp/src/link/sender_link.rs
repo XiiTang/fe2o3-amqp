@@ -49,6 +49,7 @@ where
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
     {
+        self.unsettled.check()?;
         let attachment = self
             .output_handle
             .clone()
@@ -247,6 +248,7 @@ where
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
     {
+        self.unsettled.check()?;
         let attachment = self
             .output_handle
             .clone()
@@ -260,6 +262,16 @@ where
         tokio::pin!(detached);
         let registered = !matches!(registration, Registration::None);
         let moved = matches!(registration, Registration::Move(_));
+        // A known exhausted retention owner must not wait for unrelated link
+        // credit or queue room. Recheck at the actual handoff under its lock.
+        if registered {
+            let mut open = self.unsettled.open()?;
+            match &registration {
+                Registration::New(message) => open.check_registration(4, message, None)?,
+                Registration::Move(old) => open.check_move(old, 4)?,
+                Registration::None => {}
+            }
+        }
         let delivery_tag = loop {
             self.credit_or_detached(&mut detached).await?;
             // The detach branch is polled first, as for credit.
@@ -284,6 +296,13 @@ where
                     return Ok(None);
                 }
             }
+            if let Some(open) = open.as_mut() {
+                match &registration {
+                    Registration::New(message) => open.check_registration(4, message, None)?,
+                    Registration::Move(old) => open.check_move(old, 4)?,
+                    Registration::None => {}
+                }
+            }
             let Some(tag) = self.flow_state.try_consume(1) else {
                 // A drain took the credit while the frame waited for room.
                 continue;
@@ -298,7 +317,7 @@ where
             if let (Some(open), Some(unsettled)) = (open.as_mut(), unsettled) {
                 // Registered before the hand-over: the session may settle the
                 // delivery before this task resumes.
-                open.register(delivery_tag.clone(), unsettled);
+                open.register(delivery_tag.clone(), unsettled)?;
             }
             room.send(LinkFrame::Transfer {
                 window_slot: None,
@@ -679,7 +698,8 @@ where
                 let _ = msg.settle();
             }
         } else {
-            self.unsettled.set_state(&delivery_tag, Some(state.clone()));
+            self.unsettled
+                .set_state(&delivery_tag, Some(state.clone()))?;
         }
 
         send_disposition(
@@ -718,7 +738,8 @@ where
                     let _ = msg.settle();
                 }
             } else {
-                self.unsettled.set_state(&delivery_tag, Some(state.clone()));
+                self.unsettled
+                    .set_state(&delivery_tag, Some(state.clone()))?;
             }
 
             match (first, last) {
@@ -1021,7 +1042,8 @@ where
         session: &mpsc::Sender<SessionControl>,
     ) -> SenderAttachError {
         match attach_error {
-            SenderAttachError::NativeBufferTooLarge
+            SenderAttachError::UnsettledCapacityExceeded(_)
+            | SenderAttachError::NativeBufferTooLarge
             | SenderAttachError::SessionStopped(_)
             | SenderAttachError::SessionNotMapped
             | SenderAttachError::IllegalState

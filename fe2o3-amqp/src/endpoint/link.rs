@@ -229,7 +229,7 @@ pub(crate) trait ReceiverLink: Link + LinkExt {
         delivery_tag: DeliveryTag,
         section_number: u32,
         section_offset: u64,
-    );
+    ) -> Result<(), Self::TransferError>;
 
     // More than one transfer frames should be hanlded by the
     // `Receiver`

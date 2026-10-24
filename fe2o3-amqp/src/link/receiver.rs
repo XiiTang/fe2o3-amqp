@@ -1237,29 +1237,10 @@ impl ReceiverDisposer {
             ReceiverSettleMode::Second => false,
         };
 
-        let unsettled_state = {
-            let mut lock = self.unsettled.write();
-            let Some(map) = lock.as_mut() else {
-                return Ok(());
-            };
-            let Some(entry) = map.get(&delivery_info.delivery_tag) else {
-                return Ok(());
-            };
-            if !entry
-                .info
-                .as_ref()
-                .is_some_and(|current| current.same_delivery(&delivery_info))
-            {
-                return Err(DispositionError::IllegalState);
-            }
-            if settled {
-                map.swap_remove(&delivery_info.delivery_tag)
-            } else {
-                let entry = map.get_mut(&delivery_info.delivery_tag).unwrap();
-                entry.local_state(state.clone());
-                Some(entry.clone())
-            }
-        };
+        let unsettled_state = self.unsettled.dispose(&delivery_info, settled, &state)?;
+        if unsettled_state.is_none() {
+            return Ok(());
+        }
 
         if unsettled_state.is_some() {
             let disposition = Disposition {
@@ -1671,6 +1652,7 @@ where
         O: ReceiverTransferObserver + ?Sized,
     {
         loop {
+            self.link.unsettled().check()?;
             match self.recv_inner(ReceiveContext::Live, observer).await {
                 Ok(Some(delivery)) => return Ok(ReceiverReadStep::Delivery(delivery)),
                 Ok(None) => {}
@@ -1924,7 +1906,7 @@ where
                         delivery_tag,
                         incomplete.section_number.unwrap_or(0),
                         incomplete.section_offset,
-                    );
+                    )?;
                 }
             }
             None => {
@@ -1943,7 +1925,7 @@ where
                         delivery_tag,
                         incomplete.section_number.unwrap_or(0),
                         incomplete.section_offset,
-                    );
+                    )?;
                 }
                 self.incomplete_transfer = Some(Box::new(incomplete));
             }
@@ -2130,9 +2112,7 @@ where
             });
             self.incomplete_transfer.take();
             if let Some(tag) = tag {
-                if let Some(map) = self.link.unsettled().write().as_mut() {
-                    map.swap_remove(&tag);
-                }
+                self.link.unsettled().remove(&tag);
             }
             commit.commit(ReceiverTransferEffect::Aborted, observer);
             return Ok(None);
@@ -2201,31 +2181,23 @@ where
         if kind == Some(Kind::StateOnly) {
             let mut info = None;
             if continuation.is_none() {
-                if let Some(entry) = self.link.unsettled().write().as_mut().and_then(|map| {
-                    transfer
-                        .delivery_tag
-                        .as_ref()
-                        .and_then(|tag| map.get_mut(tag))
-                }) {
-                    entry.resumed = true;
-                    entry.info = Some(DeliveryInfo {
-                        identity: std::sync::Arc::new(()),
-                        delivery_id: transfer.delivery_id.ok_or(RecvError::DeliveryIdIsNone)?,
-                        delivery_tag: transfer
-                            .delivery_tag
-                            .clone()
-                            .ok_or(RecvError::DeliveryTagIsNone)?,
-                        rcv_settle_mode: transfer.rcv_settle_mode.clone(),
-                        _sealed: crate::util::Sealed {},
-                    });
-                    info = entry.info.clone();
+                if let Some(tag) = &transfer.delivery_tag {
+                    let delivery_id = transfer.delivery_id.ok_or(RecvError::DeliveryIdIsNone)?;
+                    info = self.link.unsettled().update(tag, |entry| {
+                        entry.resumed = true;
+                        entry.info = Some(DeliveryInfo {
+                            identity: std::sync::Arc::new(()),
+                            delivery_id,
+                            delivery_tag: tag.clone(),
+                            rcv_settle_mode: transfer.rcv_settle_mode.clone(),
+                            _sealed: crate::util::Sealed {},
+                        });
+                    })?.and_then(|entry| entry.info);
                 }
             }
             if transfer.aborted || transfer.settled == Some(true) {
-                if let Some(map) = self.link.unsettled().write().as_mut() {
-                    if let Some(tag) = &transfer.delivery_tag {
-                        map.swap_remove(tag);
-                    }
+                if let Some(tag) = &transfer.delivery_tag {
+                    self.link.unsettled().remove(tag);
                 }
             } else if let Some(state) = transfer.state {
                 self.on_transfer_state(
@@ -2441,12 +2413,13 @@ impl ReceiverInner<ReceiverLink<Target>> {
         mut initial_remote_attach: Option<Attach>,
         is_reattaching: bool,
     ) -> Result<ReceiverAttachExchange, ReceiverResumeErrorKind> {
-        if let Some(map) = self.link.unsettled.write().as_mut() {
-            for entry in map.values_mut() {
+        self.link
+            .unsettled
+            .update_all(|_, entry| {
                 entry.info = None;
                 entry.resumed = false;
-            }
-        }
+            })
+            .map_err(ReceiverAttachError::from)?;
         self.reallocate_output_handle().await?;
 
         let exchange = match initial_remote_attach.take() {
@@ -4016,13 +3989,13 @@ mod tests {
         unsettled: ArcReceiverUnsettledMap,
         credit_mode: CreditMode,
     ) -> ReceiverDisposer {
-        if let Some(map) = unsettled.write().as_mut() {
-            for (tag, entry) in map.as_inner_mut().iter_mut() {
+        unsettled
+            .update_all(|tag, entry| {
                 if entry.info.is_none() {
                     entry.info = Some(make_delivery_info(tag[0] as u32, tag.to_vec()));
                 }
-            }
-        }
+            })
+            .unwrap();
         ReceiverDisposer {
             outgoing: tx.into(),
             unsettled,
@@ -4062,13 +4035,12 @@ mod tests {
     }
 
     fn seed_unsettled(map: &ArcReceiverUnsettledMap, tags: &[Vec<u8>]) {
-        let mut lock = map.write();
-        let m = lock.get_or_insert_with(Default::default);
         for tag in tags {
-            m.insert(
+            map.insert(
                 DeliveryTag::from(tag.clone()),
                 crate::link::receiver_delivery::ReceiverDelivery::new(None),
-            );
+            )
+            .unwrap();
         }
     }
 
@@ -4076,7 +4048,7 @@ mod tests {
     async fn explicit_detach_delivers_inflight_message_and_retains_partial_without_extra_detach() {
         use super::super::{state::LinkState, unsettled_store::Store};
         use fe2o3_amqp_types::messaging::Body;
-        let map = Arc::new(Store::new(None));
+        let map = Arc::new(Store::new(None, None).unwrap());
         seed_unsettled(&map, &[vec![0x42], vec![0x43]]);
         let mut link = Receiver::builder()
             .name("detach")
@@ -4235,7 +4207,7 @@ mod tests {
     #[tokio::test]
     async fn settled_partial_is_released_without_discarding_a_retained_delivery() {
         use super::super::{state::LinkState, unsettled_store::Store};
-        let map = Arc::new(Store::new(None));
+        let map = Arc::new(Store::new(None, None).unwrap());
         seed_unsettled(&map, &[vec![0x42]]);
         let tag: DeliveryTag = vec![0x42].into();
         let mut link = Receiver::builder()
@@ -4290,7 +4262,7 @@ mod tests {
         );
         assert_eq!(budget.retained_bytes(), prefix.len());
         // A complete peer unsettled map without this tag removes its entry.
-        map.write().as_mut().unwrap().swap_remove(&tag);
+        map.remove(&tag);
         receiver.discard_settled_partial();
         assert!(receiver.incomplete_transfer.is_none());
         assert_eq!(budget.retained_bytes(), 0);
@@ -4317,11 +4289,17 @@ mod tests {
         );
         // No identity is carried across Attach. Only the resumed Transfer can
         // assign this delivery a new session delivery-id.
-        let map = Arc::new(Store::new(Some(
-            [(tag.clone(), retained)]
-                .into_iter()
-                .collect::<OrderedMap<_, _>>(),
-        )));
+        let map = Arc::new(
+            Store::new(
+                Some(
+                    [(tag.clone(), retained)]
+                        .into_iter()
+                        .collect::<OrderedMap<_, _>>(),
+                ),
+                None,
+            )
+            .unwrap(),
+        );
         let mut link = Receiver::builder()
             .name("resume")
             .source("source")
@@ -4396,7 +4374,7 @@ mod tests {
     async fn accept_sends_disposition_frame() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(16);
         let unsettled: ArcReceiverUnsettledMap =
-            Arc::new(crate::link::unsettled_store::Store::new(None));
+            Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         seed_unsettled(&unsettled, &[vec![0x01]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -4420,7 +4398,7 @@ mod tests {
     async fn release_sends_released_disposition() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(16);
         let unsettled: ArcReceiverUnsettledMap =
-            Arc::new(crate::link::unsettled_store::Store::new(None));
+            Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         seed_unsettled(&unsettled, &[vec![0x02]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -4443,7 +4421,7 @@ mod tests {
     async fn accept_removes_from_unsettled_map() {
         let (tx, _rx) = mpsc::channel::<LinkFrame>(16);
         let unsettled: ArcReceiverUnsettledMap =
-            Arc::new(crate::link::unsettled_store::Store::new(None));
+            Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         seed_unsettled(&unsettled, &[vec![0x0A], vec![0x0B]]);
 
         let disposer = make_disposer(tx, unsettled.clone(), CreditMode::Manual);
@@ -4461,7 +4439,7 @@ mod tests {
     async fn processed_counter_increments() {
         let (tx, _rx) = mpsc::channel::<LinkFrame>(16);
         let unsettled: ArcReceiverUnsettledMap =
-            Arc::new(crate::link::unsettled_store::Store::new(None));
+            Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         seed_unsettled(&unsettled, &[vec![1], vec![2], vec![3]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -4488,7 +4466,7 @@ mod tests {
         let max_credit = 10u32;
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(32);
         let unsettled: ArcReceiverUnsettledMap =
-            Arc::new(crate::link::unsettled_store::Store::new(None));
+            Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         let tags: Vec<Vec<u8>> = (1..=5).map(|i| vec![i]).collect();
         seed_unsettled(&unsettled, &tags);
 
@@ -4524,7 +4502,7 @@ mod tests {
     #[tokio::test]
     async fn second_mode_unknown_receipt_does_not_create_phantom_unsettled_state() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(8);
-        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         let mut disposer = make_disposer(tx, unsettled.clone(), CreditMode::Manual);
         disposer.rcv_settle_mode = ReceiverSettleMode::Second;
         disposer
@@ -4539,7 +4517,7 @@ mod tests {
     async fn no_disposition_for_unknown_delivery_tag() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(16);
         let unsettled: ArcReceiverUnsettledMap =
-            Arc::new(crate::link::unsettled_store::Store::new(None));
+            Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         seed_unsettled(&unsettled, &[vec![0x01]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -4557,18 +4535,16 @@ mod tests {
     #[tokio::test]
     async fn stale_identity_cannot_settle_reused_tag_and_id() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(8);
-        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None));
+        let unsettled = Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         seed_unsettled(&unsettled, &[vec![1]]);
         let disposer = make_disposer(tx, unsettled.clone(), CreditMode::Manual);
         let old = current_delivery_info(&disposer, 1, vec![1]);
         let fresh = make_delivery_info(1, vec![1]);
         unsettled
-            .write()
-            .as_mut()
-            .unwrap()
-            .get_mut(&fresh.delivery_tag)
-            .unwrap()
-            .info = Some(fresh.clone());
+            .update(&fresh.delivery_tag, |entry| {
+                entry.info = Some(fresh.clone())
+            })
+            .unwrap();
         assert!(disposer.accept(old).await.is_err());
         assert!(rx.try_recv().is_err());
         assert!(unsettled
@@ -4584,7 +4560,7 @@ mod tests {
     async fn clone_shares_state() {
         let (tx, _rx) = mpsc::channel::<LinkFrame>(16);
         let unsettled: ArcReceiverUnsettledMap =
-            Arc::new(crate::link::unsettled_store::Store::new(None));
+            Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         seed_unsettled(&unsettled, &[vec![1], vec![2]]);
 
         let disposer = make_disposer(tx, unsettled, CreditMode::Manual);
@@ -4610,7 +4586,7 @@ mod tests {
     async fn concurrent_accepts_are_safe() {
         let (tx, mut rx) = mpsc::channel::<LinkFrame>(1024);
         let unsettled: ArcReceiverUnsettledMap =
-            Arc::new(crate::link::unsettled_store::Store::new(None));
+            Arc::new(crate::link::unsettled_store::Store::new(None, None).unwrap());
         let tags: Vec<Vec<u8>> = (0..100u8).map(|i| vec![i]).collect();
         seed_unsettled(&unsettled, &tags);
 
@@ -4651,7 +4627,7 @@ mod tests {
         let (outgoing_tx, outgoing_rx) = mpsc::channel::<LinkFrame>(16);
         let (incoming_tx, incoming_rx) = mpsc::channel::<LinkFrame>(16);
         let unsettled: ArcReceiverUnsettledMap =
-            Arc::new(super::super::unsettled_store::Store::new(None));
+            Arc::new(super::super::unsettled_store::Store::new(None, None).unwrap());
         let link = ReceiverLink::<Target> {
             operation_dispatch: None,
             role: std::marker::PhantomData,

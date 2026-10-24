@@ -36,6 +36,7 @@ where
         echo: bool,
         include_properties: bool,
     ) -> Result<(), Self::FlowError> {
+        self.unsettled.check()?;
         let attachment = self
             .output_handle
             .clone()
@@ -66,16 +67,11 @@ where
         let delivery_tag = delivery_tag
             .as_ref()
             .ok_or(Self::TransferError::DeliveryTagIsNone)?;
-        let mut guard = self.unsettled.write();
-        let map = guard.get_or_insert(OrderedMap::new());
-
         if matches!(settled, Some(true)) {
-            // FIXME: Simply remove from the unsettled map?
-            let _ = map.swap_remove(delivery_tag);
+            self.unsettled.remove(delivery_tag);
         } else {
-            if let Some(value) = map.get_mut(delivery_tag) {
-                value.remote_state(Some(state));
-            }
+            self.unsettled
+                .update(delivery_tag, |entry| entry.remote_state(Some(state)))?;
         }
         Ok(())
     }
@@ -85,7 +81,7 @@ where
         delivery_tag: DeliveryTag,
         section_number: u32,
         section_offset: u64,
-    ) {
+    ) -> Result<(), Self::TransferError> {
         // link-credit is defined as
         // "The current maximum number of messages that can be handled
         // at the receiver endpoint of the link"
@@ -96,12 +92,9 @@ where
             section_offset,
         });
 
-        {
-            let mut guard = self.unsettled.write();
-            if let Some(current) = guard.as_mut().and_then(|map| map.get_mut(&delivery_tag)) {
-                current.received(state, false);
-            }
-        }
+        self.unsettled
+            .update(&delivery_tag, |entry| entry.received(state, false))?;
+        Ok(())
     }
 
     fn on_complete_transfer<T, P>(
@@ -187,20 +180,17 @@ where
             // Mode Second doesn't automatically send back a disposition
             // (ie. thus doesn't call `link.dispose()`) and thus need to manually
             // set the delivery state
-            {
-                let mut lock = self.unsettled.write();
-                if let Some(current) = lock.as_mut().and_then(|map| map.get_mut(&delivery_tag)) {
-                    current.received(state, result.is_ok());
-                    current.resumed = false;
-                    current.info = Some(DeliveryInfo {
-                        identity: identity.clone(),
-                        delivery_id,
-                        delivery_tag: delivery_tag.clone(),
-                        rcv_settle_mode: mode.clone(),
-                        _sealed: Sealed {},
-                    });
-                }
-            }
+            self.unsettled.update(&delivery_tag, |current| {
+                current.received(state, result.is_ok());
+                current.resumed = false;
+                current.info = Some(DeliveryInfo {
+                    identity: identity.clone(),
+                    delivery_id,
+                    delivery_tag: delivery_tag.clone(),
+                    rcv_settle_mode: mode.clone(),
+                    _sealed: Sealed {},
+                });
+            })?;
             (result, mode)
         };
 
@@ -269,29 +259,7 @@ where
             }
         });
 
-        let unsettled_state = {
-            let mut lock = self.unsettled.write();
-            let Some(map) = lock.as_mut() else {
-                return Ok(());
-            };
-            let Some(entry) = map.get(&delivery_info.delivery_tag) else {
-                return Ok(());
-            };
-            if !entry
-                .info
-                .as_ref()
-                .is_some_and(|current| current.same_delivery(&delivery_info))
-            {
-                return Err(Self::DispositionError::IllegalState);
-            }
-            if settled {
-                map.swap_remove(&delivery_info.delivery_tag)
-            } else {
-                let entry = map.get_mut(&delivery_info.delivery_tag).unwrap();
-                entry.local_state(state.clone());
-                Some(entry.clone())
-            }
-        };
+        let unsettled_state = self.unsettled.dispose(&delivery_info, settled, &state)?;
 
         // Only dispose if message is found in unsettled map
         if unsettled_state.is_some() {
@@ -325,6 +293,7 @@ where
         state: DeliveryState,
         batchable: bool,
     ) -> Result<(), Self::DispositionError> {
+        self.unsettled.check()?;
         // sorting before filtering may be more cache/branch-prediction friendly?
         delivery_infos.sort_by_key(|left| left.delivery_id);
         {
@@ -385,35 +354,35 @@ impl<T> ReceiverLink<T> {
         &mut self,
         remote_unsettled: Option<OrderedMap<DeliveryTag, Option<DeliveryState>>>,
         remote_incomplete: bool,
-    ) -> ReceiverAttachExchange {
+    ) -> Result<ReceiverAttachExchange, UnsettledCapacityExceeded> {
         let remote_is_empty = remote_unsettled.as_ref().is_none_or(|map| map.is_empty());
-        {
-            let mut guard = self.unsettled.write();
-            if let Some(local) = guard.as_mut() {
-                local.as_inner_mut().retain(|tag, entry| {
-                    if let Some(remote) = remote_unsettled.as_ref().and_then(|map| map.get(tag)) {
-                        entry.remote_state(remote.clone());
-                        true
-                    } else {
-                        remote_incomplete
-                    }
-                });
+        self.unsettled.retain(|tag, _| {
+            remote_incomplete
+                || remote_unsettled
+                    .as_ref()
+                    .is_some_and(|map| map.contains_key(tag))
+        });
+        self.unsettled.update_all(|tag, entry| {
+            if let Some(remote) = remote_unsettled.as_ref().and_then(|map| map.get(tag)) {
+                entry.remote_state(remote.clone());
             }
-        }
-        if remote_incomplete
-            || matches!(
-                self.local_state,
-                LinkState::IncompleteAttachReceived
-                    | LinkState::IncompleteAttachSent
-                    | LinkState::IncompleteAttachExchanged
-            )
-        {
-            ReceiverAttachExchange::IncompleteUnsettled
-        } else if remote_is_empty {
-            ReceiverAttachExchange::Complete
-        } else {
-            ReceiverAttachExchange::Resume
-        }
+        })?;
+        Ok(
+            if remote_incomplete
+                || matches!(
+                    self.local_state,
+                    LinkState::IncompleteAttachReceived
+                        | LinkState::IncompleteAttachSent
+                        | LinkState::IncompleteAttachExchanged
+                )
+            {
+                ReceiverAttachExchange::IncompleteUnsettled
+            } else if remote_is_empty {
+                ReceiverAttachExchange::Complete
+            } else {
+                ReceiverAttachExchange::Resume
+            },
+        )
     }
 
     /// This is cancel safe because it only `.await` on sending over a `tokio::mpsc::Sender`
@@ -441,27 +410,8 @@ impl<T> ReceiverLink<T> {
             }
         });
 
-        // Validate every identity before changing the range, under one lock.
-        {
-            let mut lock = self.unsettled.write();
-            let map = lock.as_mut().ok_or(DispositionError::IllegalState)?;
-            if consecutive_infos.iter().any(|info| {
-                !map.get(&info.delivery_tag)
-                    .and_then(|entry| entry.info.as_ref())
-                    .is_some_and(|current| current.same_delivery(info))
-            }) {
-                return Err(DispositionError::IllegalState);
-            }
-            for info in consecutive_infos {
-                if settled {
-                    map.swap_remove(&info.delivery_tag);
-                } else {
-                    map.get_mut(&info.delivery_tag)
-                        .unwrap()
-                        .local_state(state.clone());
-                }
-            }
-        }
+        self.unsettled
+            .dispose_many(consecutive_infos, settled, &state)?;
 
         let disposition = Disposition {
             role: Role::Receiver,
@@ -954,10 +904,8 @@ where
         }
 
         // Ok(Self::AttachExchange::Complete)
-        Ok(self.handle_unsettled_in_attach(
-            remote_attach.unsettled,
-            remote_attach.incomplete_unsettled,
-        ))
+        self.handle_unsettled_in_attach(remote_attach.unsettled, remote_attach.incomplete_unsettled)
+            .map_err(Into::into)
     }
 
     async fn exchange_attach_inner(
@@ -1030,7 +978,7 @@ mod tests {
                 );
                 local.insert(tag.clone(), entry);
             }
-            let map = Arc::new(unsettled_store::Store::new(Some(local)));
+            let map = Arc::new(unsettled_store::Store::new(Some(local), None).unwrap());
             let flow = Arc::new(LinkFlowState::receiver(state::LinkFlowStateInner {
                 initial_delivery_count: 0,
                 delivery_count: 0,
@@ -1057,7 +1005,9 @@ mod tests {
                 Some(fe2o3_amqp_types::messaging::Accepted {}.into()),
             );
             peer.insert(unknown.clone(), None);
-            let result = link.handle_unsettled_in_attach(Some(peer), incomplete);
+            let result = link
+                .handle_unsettled_in_attach(Some(peer), incomplete)
+                .unwrap();
             assert_eq!(
                 matches!(result, ReceiverAttachExchange::IncompleteUnsettled),
                 incomplete
@@ -1076,6 +1026,49 @@ mod tests {
                 Some(DeliveryState::Accepted(_))
             ));
         }
+    }
+
+    #[test]
+    fn unsettled_recovery_reconciliation_refuses_state_growth() {
+        use super::*;
+        let tag: DeliveryTag = vec![1].into();
+        let mut local = OrderedMap::new();
+        local.insert(tag.clone(), receiver_delivery::ReceiverDelivery::new(None));
+        let store = Arc::new(
+            unsettled_store::Store::new(Some(local), Some(UnsettledLimits::new(2, 32))).unwrap(),
+        );
+        let flow = Arc::new(LinkFlowState::receiver(state::LinkFlowStateInner {
+            initial_delivery_count: 0,
+            delivery_count: 0,
+            link_credit: 1,
+            available: 0,
+            drain: false,
+            properties: None,
+        }));
+        let mut link = Receiver::builder()
+            .name("resume-cap")
+            .source("source")
+            .target("target")
+            .create_link(
+                store.clone(),
+                crate::endpoint::OutputAttachment::for_tests(0),
+                flow,
+                Arc::new(OnceLock::new()),
+                65532,
+            );
+        let state = fe2o3_amqp_types::messaging::Rejected {
+            error: Some(fe2o3_amqp_types::definitions::Error::new(
+                fe2o3_amqp_types::definitions::AmqpError::InternalError,
+                Some("x".repeat(1024)),
+                None,
+            )),
+        };
+        let mut peer = OrderedMap::new();
+        peer.insert(tag, Some(state.into()));
+        assert!(link.handle_unsettled_in_attach(Some(peer), true).is_err());
+        assert_eq!(store.usage(), (0, 0));
+        store.clear_for_reattach();
+        assert!(store.check().is_err());
     }
 
     #[test]

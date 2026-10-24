@@ -1645,7 +1645,7 @@ mod tests {
             offered_capabilities: None,
             desired_capabilities: None,
             flow_state: consumer,
-            unsettled: Arc::new(super::super::unsettled_store::Store::new(None)),
+            unsettled: Arc::new(super::super::unsettled_store::Store::new(None, None).unwrap()),
             session_stop_reason: Arc::new(OnceLock::new()),
             max_frame_size,
             verify_incoming_source: true,
@@ -2053,6 +2053,91 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(credit(&inner.link), (1, 0));
         assert!(!is_registered(&inner.link, &DeliveryTag::from([0; 4])));
+    }
+
+    #[tokio::test]
+    async fn unsettled_exhaustion_is_known_even_without_peer_credit() {
+        use crate::link::{unsettled_store::Store, UnsettledLimits};
+        let mut inner = credited_sender(4096);
+        inner.link.flow_state.state().lock.write().link_credit = 0;
+        inner.link.unsettled =
+            Arc::new(Store::new(None, Some(UnsettledLimits::new(0, 0))).unwrap());
+        let (writer, _frames) = mpsc::channel::<LinkFrame>(1);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
+        let send = inner.link.send_payload(
+            &writer,
+            std::future::pending(),
+            Payload::from_static(b"m"),
+            0,
+            Some(false),
+            None,
+            false,
+        );
+        assert!(matches!(
+            futures_util::poll!(std::pin::pin!(send)),
+            std::task::Poll::Ready(Err(LinkStateError::UnsettledCapacityExceeded(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn unsettled_sender_caps_precede_credit_and_dispatch_and_fail_pending_outcomes() {
+        use crate::link::{unsettled_store::Store, UnsettledLimits};
+        for limits in [UnsettledLimits::new(1, 32), UnsettledLimits::new(10, 5)] {
+            let mut inner = credited_sender(4096);
+            inner.link.unsettled = Arc::new(Store::new(None, Some(limits)).unwrap());
+            let (writer, mut frames) = mpsc::channel::<LinkFrame>(8);
+            let writer = crate::session::transfer_queue::Sender::from(writer);
+            let first = inner
+                .link
+                .send_payload(
+                    &writer,
+                    std::future::pending(),
+                    Payload::from_static(b"m"),
+                    0,
+                    Some(false),
+                    None,
+                    false,
+                )
+                .await;
+            if limits.max_bytes == 5 {
+                assert!(matches!(
+                    first,
+                    Err(LinkStateError::UnsettledCapacityExceeded(_))
+                ));
+                assert_eq!(credit(&inner.link), (1, 0));
+                assert!(frames.try_recv().is_err());
+                continue;
+            }
+            let Settlement::Unsettled { outcome, .. } = first.unwrap() else {
+                panic!("unsettled")
+            };
+            frames.try_recv().unwrap();
+            // Replenished credit does not replenish the retained-state cap.
+            inner.link.flow_state.state().lock.write().link_credit = 1;
+            let result = inner
+                .link
+                .send_payload(
+                    &writer,
+                    std::future::pending(),
+                    Payload::from_static(b"m"),
+                    0,
+                    Some(false),
+                    None,
+                    false,
+                )
+                .await;
+            assert!(matches!(
+                result,
+                Err(LinkStateError::UnsettledCapacityExceeded(_))
+            ));
+            assert!(matches!(
+                outcome.await.unwrap(),
+                Err(LinkStateError::UnsettledCapacityExceeded(_))
+            ));
+            assert_eq!(credit(&inner.link), (1, 1));
+            assert!(frames.try_recv().is_err());
+            assert_eq!(inner.link.unsettled.usage(), (0, 0));
+        }
     }
 
     #[tokio::test]

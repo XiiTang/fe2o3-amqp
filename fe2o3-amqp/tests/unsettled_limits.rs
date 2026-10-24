@@ -86,12 +86,12 @@ async fn configured_unsettled_limits_survive_replenished_windows_for_both_roles(
             }
             assert!(!client.is_closed());
             assert!(!server.is_closed());
+            // Stop the transports before aborting their session readers: queued
+            // peer frames can otherwise reach an already stopped session. A
+            // natural EOF can win either connection's local stop during cleanup.
+            let _ = tokio::join!(client.stop_and_join(), server.stop_and_join());
             let _ = outgoing.stop_and_join().await;
             let _ = incoming.stop_and_join().await;
-            client.stop_and_join().await.unwrap();
-            // Stopping the client can let the server observe EOF before its
-            // local stop. That native result is unrelated to the cap assertions.
-            let _ = server.stop_and_join().await;
         }
     })
     .await

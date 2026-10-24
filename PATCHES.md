@@ -897,7 +897,8 @@ Regression evidence: the existing `detached_link_frames` cases
 `a_delivery_the_peer_holds_is_resumed_under_its_tag_without_new_credit` all fail
 on the first W4e implementation. They exercise the native effect; the allocation
 checkpoint tests also require an abandoned incoming allocation's relay to be
-removed. The final rerun is a required verification of this correction.
+removed. On 198d6552 all six `detached_link_frames` tests pass (exit 0),
+on macOS arm64 / Rust 1.98.1, including those three regressions.
 
 ## W17c: configured bounds at the unsettled owner
 
@@ -947,3 +948,19 @@ The new typed native error variants require corresponding consumer match arms
 when integrating this pin. The fork does not classify them by diagnostic text
 or manufacture a peer close. Boundless's W17c integration owns that mapping and
 selects measured constructor values later.
+
+## W17c: keep the portable cap regression's cleanup separate
+
+The first final portable run on 198d6552 passed the cap assertions but failed
+at tests/unsettled_limits.rs:91: cleanup aborted the session readers before
+stopping their connections, then required a clean client connection result.
+A queued frame forwarded to an aborted reader produces the baseline
+connection/error.rs:183-189 `NotFound("Session is not found")`; either peer can
+also observe EOF during local transport shutdown. Neither is a cap assertion.
+
+The same regression now stops both connections concurrently before aborting
+and joining their session readers. Its configured sender/receiver, replenished
+window, typed exhaustion, pending outcome and connection-alive assertions stay
+unchanged. The failing run is exit 101; five focused reruns of that same test
+pass after the cleanup correction (one test each, exit 0), on macOS arm64 /
+Rust 1.98.1. No production code or public API changes.

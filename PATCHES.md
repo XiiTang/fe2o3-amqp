@@ -822,3 +822,21 @@ With the patch the all-feature library suite passes (150 tests, exit 0), on
 macOS arm64 / Rust 1.97.0. The fork's existing untracked Cargo.lock is used;
 a fresh resolution upgrades tokio-util and fails untouched transport sink
 type inference, outside this patch.
+
+## W4e: settle every delivery through its captured disposition
+
+At 44afcb79, link/delivery.rs:315-352 returns failed oneshot sends to
+callers that discard them; Tokio also drops a successfully sent but unread
+settlement. `send_new_payload` now captures the scoped
+`CompletionSink<Result<Option<DeliveryState>, LinkStateError>>` in the native
+channel. `UnsettledMessage::{settle,settle_with_state,fail}` all use the same
+completion checkpoint. The receiver stays wrapped through `Settlement`,
+`DeliveryFut`, and transaction controller Declare/Discharge, including tracked
+control sends. Recovery keeps the original unsettled message and its sink.
+
+`native_settlement_hands_every_untaken_outcome_to_its_sink` sends through the
+actual sender admission path and exercises all three completion methods in
+both handoff orders, retaining the Accepted outcome or the actual failure.
+With the preceding raw oneshot handoff restored in `send_new_payload`, it
+fails (exit 101); the all-feature library suite passes with the patch
+(151 tests, exit 0), on macOS arm64 / Rust 1.97.0.

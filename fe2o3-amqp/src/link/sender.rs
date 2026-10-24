@@ -2055,6 +2055,67 @@ mod tests {
         assert!(!is_registered(&inner.link, &DeliveryTag::from([0; 4])));
     }
 
+    #[tokio::test]
+    async fn native_settlement_hands_every_untaken_outcome_to_its_sink() {
+        use fe2o3_amqp_types::messaging::Accepted;
+        for sent_first in [false, true] {
+            for completion in 0..3 {
+                let mut inner = credited_sender(4096);
+                let (writer, mut frames) = mpsc::channel::<LinkFrame>(1);
+                let writer = crate::session::transfer_queue::Sender::from(writer);
+                let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let output = seen.clone();
+                let sink = crate::completion::CompletionSink::new(
+                    move |value: Result<Option<DeliveryState>, LinkStateError>| {
+                        output.lock().push(value)
+                    },
+                );
+                let settlement = sink
+                    .scope(inner.link.send_payload(
+                        &writer,
+                        std::future::pending(),
+                        Payload::from_static(b"m"),
+                        0,
+                        Some(false),
+                        None,
+                        false,
+                    ))
+                    .await
+                    .unwrap();
+                let Settlement::Unsettled {
+                    delivery_tag,
+                    outcome,
+                } = settlement
+                else {
+                    panic!("unsettled send")
+                };
+                assert!(frames.try_recv().is_ok());
+                let outcome = if sent_first {
+                    Some(outcome)
+                } else {
+                    drop(outcome);
+                    None
+                };
+                let mut message = inner.link.unsettled.withdraw(&delivery_tag).unwrap();
+                match completion {
+                    0 => {
+                        message.state = Some(Accepted {}.into());
+                        message.settle().unwrap();
+                    }
+                    1 => message.settle_with_state(Some(Accepted {}.into())).unwrap(),
+                    _ => message.fail(LinkStateError::RemoteClosed).unwrap(),
+                }
+                drop(outcome);
+                let seen = seen.lock();
+                assert_eq!(seen.len(), 1);
+                match completion {
+                    0 | 1 => assert!(matches!(&seen[0], Ok(Some(DeliveryState::Accepted(_))))),
+                    _ => assert!(matches!(&seen[0], Err(LinkStateError::RemoteClosed))),
+                }
+            }
+        }
+    }
+
     /// Aborting a delivery sends a resuming, aborted transfer; the delivery is
     /// implicitly settled, so the application future resolves and nothing is
     /// registered in the unsettled map.

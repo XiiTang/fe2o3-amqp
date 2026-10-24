@@ -25,7 +25,6 @@ use fe2o3_amqp_types::{
     performatives::Flow,
     primitives::{Boolean, Uint},
 };
-use tokio::sync::oneshot;
 
 use crate::link::LinkStateError;
 
@@ -188,6 +187,6 @@ pub(crate) enum Settlement {
     Settled(DeliveryTag),
     Unsettled {
         delivery_tag: DeliveryTag,
-        outcome: oneshot::Receiver<Result<Option<DeliveryState>, LinkStateError>>,
+        outcome: crate::completion::Receiver<Result<Option<DeliveryState>, LinkStateError>>,
     },
 }

@@ -7,7 +7,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::Mutex;
 
 use crate::{
     endpoint::Settlement,
@@ -188,7 +188,10 @@ pub struct Controller {
 async fn send_on_control_link<T>(
     sender: &mut SenderInner<ControlLink>,
     sendable: Sendable<T>,
-) -> Result<oneshot::Receiver<Result<Option<DeliveryState>, LinkStateError>>, link::SendError>
+) -> Result<
+    crate::completion::Receiver<Result<Option<DeliveryState>, LinkStateError>>,
+    link::SendError,
+>
 where
     T: SerializableBody,
 {

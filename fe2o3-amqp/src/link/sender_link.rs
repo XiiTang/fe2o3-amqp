@@ -400,7 +400,7 @@ where
                 .await?;
             return Ok(Settlement::Settled(delivery_tag));
         }
-        let (tx, rx) = oneshot::channel();
+        let (tx, rx) = crate::completion::channel();
         #[cfg(feature = "transaction")]
         let unsettled = match tracking {
             Some(tracking) => UnsettledMessage::new_tracked(

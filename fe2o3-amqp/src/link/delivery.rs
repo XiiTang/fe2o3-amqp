@@ -13,7 +13,7 @@ use std::{
     sync::{Arc, OnceLock},
     task::Poll,
 };
-use tokio::sync::oneshot::{self, error::RecvError};
+use tokio::sync::oneshot::error::RecvError;
 
 use crate::{
     endpoint::Settlement,
@@ -314,7 +314,7 @@ pub(crate) struct UnsettledMessage {
     pub(crate) payload: Payload,
     pub(crate) state: Option<DeliveryState>,
     pub(crate) message_format: u32,
-    sender: oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>,
+    sender: crate::completion::Sender<Result<Option<DeliveryState>, LinkStateError>>,
     #[cfg(feature = "transaction")]
     tracking: Option<crate::transaction::ControlTracker>,
 }
@@ -324,13 +324,13 @@ impl UnsettledMessage {
         payload: Payload,
         state: Option<DeliveryState>,
         message_format: u32,
-        sender: oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>,
+        sender: impl Into<crate::completion::Sender<Result<Option<DeliveryState>, LinkStateError>>>,
     ) -> Self {
         Self {
             payload,
             state,
             message_format,
-            sender,
+            sender: sender.into(),
             #[cfg(feature = "transaction")]
             tracking: None,
         }
@@ -341,14 +341,14 @@ impl UnsettledMessage {
         payload: Payload,
         state: Option<DeliveryState>,
         message_format: u32,
-        sender: oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>,
+        sender: impl Into<crate::completion::Sender<Result<Option<DeliveryState>, LinkStateError>>>,
         tracking: crate::transaction::ControlTracker,
     ) -> Self {
         Self {
             payload,
             state,
             message_format,
-            sender,
+            sender: sender.into(),
             tracking: Some(tracking),
         }
     }
@@ -638,7 +638,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let settlement = Settlement::Unsettled {
             delivery_tag: DeliveryTag::from(b"tag".to_vec()),
-            outcome: rx,
+            outcome: rx.into(),
         };
         let session_stop_reason = Arc::new(OnceLock::new());
         session_stop_reason
@@ -667,7 +667,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let settlement = Settlement::Unsettled {
             delivery_tag: DeliveryTag::from(b"tag".to_vec()),
-            outcome: rx,
+            outcome: rx.into(),
         };
         let fut = DeliveryFut::new(settlement, Arc::new(OnceLock::new()));
         drop(tx);
@@ -712,7 +712,7 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         let settlement = Settlement::Unsettled {
             delivery_tag: DeliveryTag::from(b"tag".to_vec()),
-            outcome: rx,
+            outcome: rx.into(),
         };
         let fut = DeliveryFut::new(settlement, Arc::new(OnceLock::new()));
 

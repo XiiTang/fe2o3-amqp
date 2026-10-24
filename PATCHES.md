@@ -964,3 +964,27 @@ window, typed exhaustion, pending outcome and connection-alive assertions stay
 unchanged. The failing run is exit 101; five focused reruns of that same test
 pass after the cleanup correction (one test each, exit 0), on macOS arm64 /
 Rust 1.98.1. No production code or public API changes.
+
+## W17c review F1: interrupt sends when their unsettled owner ends
+
+On d494f0b6, sender_link.rs:264-275 waits for link credit and queue room
+without observing a capacity failure published after admission. The continuation
+and resuming handoffs at :71 and :340 have the same uninterruptible queue wait.
+Rule 11 requires terminal exhaustion to return its retained typed cause without
+waiting for unrelated peer progress.
+
+`Store::until_terminated` is the shared wait checkpoint: subscribe to the
+existing coalescing revision before checking the retained cause, race the native
+operation against changes, and recheck before returning its result. It follows
+Tokio 1.53.3 sync/watch.rs:983-1001's notification-before-version-check pattern.
+Sender `deliver` and `send_resuming_transfer` guard their entire native operation;
+only their private inner implementations can reach the credit/queue waits.
+Admission and registration still check under the Store mutation lock. No extra
+error ledger, peer progress requirement, or completion owner is introduced.
+
+`review_cap_exhaustion_interrupts_inflight_credit_and_room_waits` fails on the
+preceding branch (both waits remain Pending, exit 101), and passes here (exit 0).
+`cap_termination_interrupts_fragment_and_resuming_handoffs` covers continuation
+and resuming transfers. Both tests pass (2 tests, exit 0).
+`terminal_wait_wakes_and_retains_capacity_metadata` checks the single checkpoint's
+actual wake and exact retained metadata (1 test, exit 0). macOS arm64 / Rust 1.98.1.

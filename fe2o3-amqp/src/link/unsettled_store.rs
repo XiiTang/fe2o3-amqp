@@ -135,6 +135,30 @@ impl<T> Store<T> {
     pub fn subscribe(&self) -> watch::Receiver<u64> {
         self.revision.subscribe()
     }
+    /// Keep a native wait tied to this owner's retained terminal cause.
+    /// Subscribe before checking, and recheck when the operation completes so
+    /// an input/queue closure cannot replace a concurrently published cap error.
+    pub async fn until_terminated<F>(
+        &self,
+        operation: F,
+    ) -> Result<F::Output, UnsettledCapacityExceeded>
+    where
+        F: std::future::Future,
+    {
+        let mut changed = self.subscribe();
+        tokio::pin!(operation);
+        loop {
+            self.check()?;
+            tokio::select! {
+                biased;
+                _ = changed.changed() => {},
+                value = &mut operation => {
+                    self.check()?;
+                    return Ok(value);
+                }
+            }
+        }
+    }
     pub fn check(&self) -> Result<(), UnsettledCapacityExceeded> {
         match &self.entries.read().closed {
             Some(LinkStateError::UnsettledCapacityExceeded(error)) => Err(error.clone()),
@@ -652,5 +676,37 @@ mod tests {
         observer.changed().await.unwrap();
         assert_eq!(store.usage(), (0, 0));
         assert!(!observer.has_changed().unwrap());
+    }
+    #[tokio::test]
+    async fn terminal_wait_wakes_and_retains_capacity_metadata() {
+        use std::{
+            future::Future,
+            sync::{
+                atomic::{AtomicUsize, Ordering},
+                Arc,
+            },
+            task::{Context, Poll, Wake, Waker},
+        };
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let store = Store::new(None, Some(UnsettledLimits::new(0, 32))).unwrap();
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut waiting = Box::pin(store.until_terminated(std::future::pending::<()>()));
+        assert!(waiting.as_mut().poll(&mut context).is_pending());
+        let error = store
+            .insert(vec![1].into(), ReceiverDelivery::new(None))
+            .unwrap_err();
+        assert!(wakes.0.load(Ordering::Relaxed) > 0);
+        assert_eq!(
+            waiting.as_mut().poll(&mut context),
+            Poll::Ready(Err(error.clone()))
+        );
+        assert_eq!(store.until_terminated(async {}).await, Err(error));
     }
 }

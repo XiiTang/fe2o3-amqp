@@ -49,6 +49,24 @@ where
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
     {
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(
+                self.send_resuming_transfer_inner(writer, detached, transfer, payload),
+            )
+            .await?
+    }
+
+    async fn send_resuming_transfer_inner<Fut>(
+        &mut self,
+        writer: &crate::session::transfer_queue::Sender,
+        detached: Fut,
+        transfer: Transfer,
+        payload: Payload,
+    ) -> Result<(), LinkStateError>
+    where
+        Fut: Future<Output = Option<LinkFrame>> + Send,
+    {
         self.unsettled.check()?;
         let attachment = self
             .output_handle
@@ -236,6 +254,31 @@ where
         reason = "keep native admission and optional control provenance in the same checked send entry"
     )]
     async fn deliver<Fut>(
+        &mut self,
+        writer: &crate::session::transfer_queue::Sender,
+        detached: Fut,
+        transfer: Transfer,
+        payload: Payload,
+        registration: Registration,
+        dispatched: Option<&AtomicBool>,
+    ) -> Result<Option<DeliveryTag>, LinkStateError>
+    where
+        Fut: Future<Output = Option<LinkFrame>> + Send,
+    {
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(self.deliver_inner(
+                writer,
+                detached,
+                transfer,
+                payload,
+                registration,
+                dispatched,
+            ))
+            .await?
+    }
+
+    async fn deliver_inner<Fut>(
         &mut self,
         writer: &crate::session::transfer_queue::Sender,
         detached: Fut,

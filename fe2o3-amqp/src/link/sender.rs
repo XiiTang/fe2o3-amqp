@@ -2692,4 +2692,165 @@ mod tests {
         assert_eq!(delivery_tag, DeliveryTag::from([0, 0, 0, 1]));
         assert!(matches!(session.try_recv(), Ok(LinkFrame::Transfer { .. })));
     }
+
+    #[tokio::test]
+    async fn review_cap_exhaustion_interrupts_inflight_credit_and_room_waits() {
+        use crate::link::{unsettled_store::Store, UnsettledLimits};
+        let mut observed = Vec::new();
+        for waiting_on_credit in [true, false] {
+            let mut inner = credited_sender(4096);
+            inner.link.unsettled =
+                Arc::new(Store::new(None, Some(UnsettledLimits::new(2, 128))).unwrap());
+            let store = inner.link.unsettled.clone();
+            let (writer, mut frames) = mpsc::channel::<LinkFrame>(1);
+            let writer = crate::session::transfer_queue::Sender::from(writer);
+            let Settlement::Unsettled {
+                delivery_tag,
+                outcome,
+            } = inner
+                .link
+                .send_payload(
+                    &writer,
+                    std::future::pending(),
+                    Payload::from_static(b"m"),
+                    0,
+                    Some(false),
+                    None,
+                    false,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!("unsettled")
+            };
+            if waiting_on_credit {
+                frames.try_recv().unwrap();
+            } else {
+                inner.link.flow_state.state().lock.write().link_credit = 1;
+            }
+            let send = inner.link.send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from_static(b"m"),
+                0,
+                Some(false),
+                None,
+                false,
+            );
+            let mut send = Box::pin(send);
+            assert!(futures_util::poll!(&mut send).is_pending());
+            // This is the same state-growth checkpoint used by the session relay.
+            // Force exhaustion after the operation has entered its wait.
+            let state = fe2o3_amqp_types::messaging::Rejected {
+                error: Some(fe2o3_amqp_types::definitions::Error::new(
+                    fe2o3_amqp_types::definitions::AmqpError::InternalError,
+                    Some("x".repeat(256)),
+                    None,
+                )),
+            };
+            assert!(store.set_state(&delivery_tag, Some(state.into())).is_err());
+            assert!(matches!(
+                outcome.await.unwrap(),
+                Err(LinkStateError::UnsettledCapacityExceeded(_))
+            ));
+            let typed = matches!(
+                futures_util::poll!(&mut send),
+                std::task::Poll::Ready(Err(LinkStateError::UnsettledCapacityExceeded(_)))
+            );
+            observed.push((
+                if waiting_on_credit {
+                    "credit"
+                } else {
+                    "queue room"
+                },
+                typed,
+            ));
+        }
+        assert_eq!(
+            observed,
+            [("credit", true), ("queue room", true)],
+            "an exhausted owner must interrupt its already waiting sends"
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_termination_interrupts_fragment_and_resuming_handoffs() {
+        use crate::link::{unsettled_store::Store, UnsettledLimits};
+        for resuming in [false, true] {
+            let mut inner = credited_sender(512);
+            let store = Arc::new(Store::new(None, Some(UnsettledLimits::new(4, 4096))).unwrap());
+            inner.link.unsettled = store.clone();
+            let (writer, _frames) = mpsc::channel::<LinkFrame>(1);
+            let writer = crate::session::transfer_queue::Sender::from(writer);
+            let transfer = inner
+                .link
+                .generate_non_resuming_transfer_performative(
+                    vec![1].into(),
+                    0,
+                    Some(false),
+                    None,
+                    false,
+                )
+                .unwrap();
+            if resuming {
+                let (tx, _outcome) = crate::completion::channel();
+                let message = super::super::delivery::UnsettledMessage::new(
+                    Payload::from_static(b"m"),
+                    None,
+                    0,
+                    tx,
+                );
+                store.register(vec![1].into(), message).unwrap();
+                let mut transfer = transfer;
+                transfer.resume = true;
+                let send = inner.link.send_resuming_transfer(
+                    &writer,
+                    std::future::pending(),
+                    transfer,
+                    Payload::from(vec![0; 1024]),
+                );
+                assert_cap_interrupts_handoff(store, send).await;
+            } else {
+                let send = inner.link.send_new_payload(
+                    &writer,
+                    std::future::pending(),
+                    0,
+                    transfer,
+                    Payload::from(vec![0; 1024]),
+                    None,
+                );
+                assert_cap_interrupts_handoff(store, send).await;
+            }
+        }
+    }
+
+    async fn assert_cap_interrupts_handoff<T>(
+        store: Arc<crate::link::unsettled_store::Store<super::super::delivery::UnsettledMessage>>,
+        send: impl std::future::Future<Output = Result<T, LinkStateError>>,
+    ) {
+        let mut send = Box::pin(send);
+        assert!(futures_util::poll!(&mut send).is_pending());
+        let tag = store
+            .read()
+            .as_ref()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let state = fe2o3_amqp_types::messaging::Rejected {
+            error: Some(fe2o3_amqp_types::definitions::Error::new(
+                fe2o3_amqp_types::definitions::AmqpError::InternalError,
+                Some("x".repeat(8192)),
+                None,
+            )),
+        };
+        let cause = store.set_state(&tag, Some(state.into())).unwrap_err();
+        match futures_util::poll!(&mut send) {
+            std::task::Poll::Ready(Err(LinkStateError::UnsettledCapacityExceeded(error))) => {
+                assert_eq!(error, cause)
+            }
+            _ => panic!("fragment/resume handoff must return retained capacity cause"),
+        }
+    }
 }

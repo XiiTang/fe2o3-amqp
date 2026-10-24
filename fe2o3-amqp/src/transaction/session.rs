@@ -8,7 +8,7 @@ use fe2o3_amqp_types::{
     performatives::{Attach, Begin, Detach, Disposition, End, Flow, Transfer},
     transaction::{TransactionError, TransactionId},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::{
@@ -35,7 +35,7 @@ use super::{
 pub(crate) async fn allocate_transaction_id(
     control: &mpsc::Sender<SessionControl>,
 ) -> Result<TransactionId, AllocTxnIdError> {
-    let (resp, result) = oneshot::channel();
+    let (resp, result) = crate::completion::channel();
 
     control
         .send(SessionControl::AllocateTransactionId { resp })
@@ -50,7 +50,7 @@ pub(crate) async fn rollback_transaction(
     control: &mpsc::Sender<SessionControl>,
     txn_id: TransactionId,
 ) -> Result<Accepted, DischargeError> {
-    let (resp, result) = oneshot::channel();
+    let (resp, result) = crate::completion::channel();
 
     control
         .send(SessionControl::RollbackTransaction { txn_id, resp })
@@ -66,7 +66,7 @@ pub(crate) async fn commit_transaction(
     control: &mpsc::Sender<SessionControl>,
     txn_id: TransactionId,
 ) -> Result<Accepted, DischargeError> {
-    let (resp, result) = oneshot::channel();
+    let (resp, result) = crate::completion::channel();
 
     control
         .send(SessionControl::CommitTransaction { txn_id, resp })

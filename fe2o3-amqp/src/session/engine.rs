@@ -396,20 +396,17 @@ where
             #[cfg(feature = "transaction")]
             SessionControl::AllocateTransactionId { resp } => {
                 let result = self.session.allocate_transaction_id();
-                resp.send(result)
-                    .map_err(|_| SessionInnerError::UnattachedHandle)?;
+                let _ = resp.send(result);
             }
             #[cfg(feature = "transaction")]
             SessionControl::CommitTransaction { txn_id, resp } => {
                 let result = self.session.commit_transaction(txn_id).await?;
-                resp.send(result)
-                    .map_err(|_| SessionInnerError::UnattachedHandle)?;
+                let _ = resp.send(result);
             }
             #[cfg(feature = "transaction")]
             SessionControl::RollbackTransaction { txn_id, resp } => {
                 let result = self.session.rollback_transaction(txn_id)?;
-                resp.send(result)
-                    .map_err(|_| SessionInnerError::UnattachedHandle)?;
+                let _ = resp.send(result);
             }
             #[cfg(feature = "transaction")]
             SessionControl::AbortTransaction(txn_id) => {
@@ -915,6 +912,92 @@ mod allocation_cancel_tests {
                 assert!(engine.session.link_by_input_handle.is_empty());
                 assert!(matches!(engine.session.local_state, SessionState::Mapped));
             }
+        }
+    }
+
+    #[cfg(all(feature = "transaction", feature = "acceptor"))]
+    #[tokio::test]
+    async fn late_transaction_control_replies_do_not_end_the_engine() {
+        use crate::{
+            endpoint::HandleDeclare,
+            transaction::{
+                coordinator::ControlLinkAcceptor, manager::TransactionManager, session::TxnSession,
+                AllocTxnIdError,
+            },
+        };
+        use fe2o3_amqp_types::{
+            messaging::Accepted,
+            transaction::{TransactionError, TransactionId},
+        };
+        for sent_first in [false, true] {
+            let base = engine();
+            let (control, _) = mpsc::channel(1);
+            let (writer, _frames) = mpsc::channel(8);
+            let session = TxnSession {
+                control,
+                session: base.session,
+                txn_manager: TransactionManager::new(writer.into(), ControlLinkAcceptor::default()),
+                max_frame_size: 4096,
+            };
+            let mut engine = SessionEngine {
+                session,
+                conn_control: base.conn_control,
+                control: base.control,
+                incoming: base.incoming,
+                outgoing: base.outgoing,
+                outgoing_link_frames: base.outgoing_link_frames,
+                retired_allocations: base.retired_allocations,
+            };
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let output = seen.clone();
+            let (resp, waiter) =
+                crate::completion::channel_with(Some(crate::completion::CompletionSink::new(
+                    move |result: Result<TransactionId, AllocTxnIdError>| {
+                        output.lock().push(result.unwrap())
+                    },
+                )));
+            let waiter = if sent_first {
+                Some(waiter)
+            } else {
+                drop(waiter);
+                None
+            };
+            engine
+                .on_control(SessionControl::AllocateTransactionId { resp })
+                .await
+                .unwrap();
+            drop(waiter);
+            assert_eq!(seen.lock().len(), 1);
+            for commit in [false, true] {
+                let id = engine.session.allocate_transaction_id().unwrap();
+                let completed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let output = completed.clone();
+                let (resp, waiter) =
+                    crate::completion::channel_with(Some(crate::completion::CompletionSink::new(
+                        move |result: Result<Accepted, TransactionError>| {
+                            output.lock().push(result)
+                        },
+                    )));
+                let waiter = if sent_first {
+                    Some(waiter)
+                } else {
+                    drop(waiter);
+                    None
+                };
+                let control = if commit {
+                    SessionControl::CommitTransaction { txn_id: id, resp }
+                } else {
+                    SessionControl::RollbackTransaction { txn_id: id, resp }
+                };
+                engine.on_control(control).await.unwrap();
+                drop(waiter);
+                assert_eq!(completed.lock().len(), 1);
+                assert!(completed.lock()[0].is_ok());
+            }
+            assert!(matches!(
+                engine.session.session.local_state,
+                SessionState::Mapped
+            ));
         }
     }
 

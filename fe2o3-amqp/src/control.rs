@@ -67,17 +67,17 @@ pub(crate) enum SessionControl {
     // Transaction related controls
     #[cfg(feature = "transaction")]
     AllocateTransactionId {
-        resp: oneshot::Sender<Result<TransactionId, AllocTxnIdError>>,
+        resp: crate::completion::Sender<Result<TransactionId, AllocTxnIdError>>,
     },
     #[cfg(feature = "transaction")]
     CommitTransaction {
         txn_id: TransactionId,
-        resp: oneshot::Sender<Result<Accepted, TransactionError>>,
+        resp: crate::completion::Sender<Result<Accepted, TransactionError>>,
     },
     #[cfg(feature = "transaction")]
     RollbackTransaction {
         txn_id: TransactionId,
-        resp: oneshot::Sender<Result<Accepted, TransactionError>>,
+        resp: crate::completion::Sender<Result<Accepted, TransactionError>>,
     },
     #[cfg(feature = "transaction")]
     AbortTransaction(TransactionId),

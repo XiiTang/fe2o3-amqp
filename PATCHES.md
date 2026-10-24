@@ -840,3 +840,19 @@ both handoff orders, retaining the Accepted outcome or the actual failure.
 With the preceding raw oneshot handoff restored in `send_new_payload`, it
 fails (exit 101); the all-feature library suite passes with the patch
 (151 tests, exit 0), on macOS arm64 / Rust 1.97.0.
+
+## W4e: keep resource-side transaction reply ownership
+
+At 44afcb79, session/engine.rs:382-408 converts a failed transaction-control
+reply send into UnattachedHandle, ending an otherwise usable session. The
+AllocateTransactionId, CommitTransaction and RollbackTransaction reply channels
+now use the same per-operation completion disposition as allocation and
+settlement; abandoning a reply is no engine error. The sink receives the native
+`Result<TransactionId, AllocTxnIdError>` or `Result<Accepted, TransactionError>`.
+No Discharge or rollback is introduced by cancellation.
+
+`late_transaction_control_replies_do_not_end_the_engine` exercises the actual
+transaction session's three controls in both handoff orders, checks exactly one
+native answer and verifies the session remains mapped. Restoring original
+failed-send ownership at the shared native checkpoint makes it fail (exit 101).
+The regression passes with the patch (exit 0), on macOS arm64 / Rust 1.97.0.

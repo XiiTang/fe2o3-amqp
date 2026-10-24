@@ -153,73 +153,76 @@ where
         &mut self,
         error: Option<definitions::Error>,
     ) -> Result<(), <Self::Link as LinkDetach>::DetachError> {
-        match self.link().local_state() {
-            LinkState::Unattached
-            | LinkState::AttachSent
-            | LinkState::IncompleteAttachSent
-            | LinkState::IncompleteAttachReceived
-            | LinkState::IncompleteAttachExchanged
-            | LinkState::AttachReceived
-            | LinkState::Attached => {
-                // Send a non-closing detach
-                self.send_detach(false, error).await?;
+        let unsettled = self.link().unsettled().clone();
+        unsettled.until_terminated(async {
+            match self.link().local_state() {
+                LinkState::Unattached
+                | LinkState::AttachSent
+                | LinkState::IncompleteAttachSent
+                | LinkState::IncompleteAttachReceived
+                | LinkState::IncompleteAttachExchanged
+                | LinkState::AttachReceived
+                | LinkState::Attached => {
+                    // Send a non-closing detach
+                    self.send_detach(false, error).await?;
 
-                let remote_detach = recv_remote_detach(self).await?;
-                if remote_detach.closed {
-                    // AMQP 1.0 §2.6.6: the peer sent a closing detach while we
-                    // were sending a non-closing detach, so we must reattach
-                    // and then send a closing detach.
-                    reattach_then_close(self).await?;
-                    Err(DetachError::ClosedByRemote)
-                } else {
-                    self.link_mut().on_detach_reply(remote_detach)
+                    let remote_detach = recv_remote_detach(self).await?;
+                    if remote_detach.closed {
+                        // AMQP 1.0 §2.6.6: the peer sent a closing detach while we
+                        // were sending a non-closing detach, so we must reattach
+                        // and then send a closing detach.
+                        reattach_then_close(self).await?;
+                        Err(DetachError::ClosedByRemote)
+                    } else {
+                        self.link_mut().on_detach_reply(remote_detach)
+                    }
                 }
-            }
-            LinkState::DetachSent => {
-                let remote_detach = recv_remote_detach(self).await?;
-                if remote_detach.closed {
-                    reattach_then_close(self).await?;
-                    Err(DetachError::ClosedByRemote)
-                } else {
-                    self.link_mut().on_detach_reply(remote_detach)
+                LinkState::DetachSent => {
+                    let remote_detach = recv_remote_detach(self).await?;
+                    if remote_detach.closed {
+                        reattach_then_close(self).await?;
+                        Err(DetachError::ClosedByRemote)
+                    } else {
+                        self.link_mut().on_detach_reply(remote_detach)
+                    }
                 }
-            }
-            LinkState::Detached => Ok(()),
-            LinkState::CloseSent => {
-                // A live handle is not normally left in `CloseSent` (the
-                // public close paths consume it, and dropping the close
-                // future drops it too). It can happen when
-                // `reattach_then_close` is cancelled after sending the
-                // closing detach but before its reply arrives, while the
-                // session is still alive; the handle survives because
-                // `detach_then_resume_on_session` takes `&mut self`. (If the
-                // session stopped instead, `recv_remote_detach` fails
-                // immediately and there is no reply to consume.)
-                #[cfg(feature = "tracing")]
-                tracing::warn!(
-                    "detach_with_error called on a link in CloseSent; completing the closing handshake"
-                );
-                #[cfg(feature = "log")]
-                log::warn!(
-                    "detach_with_error called on a link in CloseSent; completing the closing handshake"
-                );
+                LinkState::Detached => Ok(()),
+                LinkState::CloseSent => {
+                    // A live handle is not normally left in `CloseSent` (the
+                    // public close paths consume it, and dropping the close
+                    // future drops it too). It can happen when
+                    // `reattach_then_close` is cancelled after sending the
+                    // closing detach but before its reply arrives, while the
+                    // session is still alive; the handle survives because
+                    // `detach_then_resume_on_session` takes `&mut self`. (If the
+                    // session stopped instead, `recv_remote_detach` fails
+                    // immediately and there is no reply to consume.)
+                    #[cfg(feature = "tracing")]
+                    tracing::warn!(
+                        "detach_with_error called on a link in CloseSent; completing the closing handshake"
+                    );
+                    #[cfg(feature = "log")]
+                    log::warn!(
+                        "detach_with_error called on a link in CloseSent; completing the closing handshake"
+                    );
 
-                // The link is already closing, so a detach cannot suspend
-                // it: consume the pending reply, if any, and complete the
-                // closing handshake.
-                let remote_detach = recv_remote_detach(self).await?;
-                if remote_detach.closed {
-                    self.link_mut().on_detach_reply(remote_detach)?;
-                } else {
-                    // The peer suspended: reattach and close so the link ends
-                    // `Closed` (AMQP 1.0 §2.6.6).
-                    let _ = self.link_mut().apply_remote_detach_outcome(remote_detach);
-                    reattach_then_close(self).await?;
+                    // The link is already closing, so a detach cannot suspend
+                    // it: consume the pending reply, if any, and complete the
+                    // closing handshake.
+                    let remote_detach = recv_remote_detach(self).await?;
+                    if remote_detach.closed {
+                        self.link_mut().on_detach_reply(remote_detach)?;
+                    } else {
+                        // The peer suspended: reattach and close so the link ends
+                        // `Closed` (AMQP 1.0 §2.6.6).
+                        let _ = self.link_mut().apply_remote_detach_outcome(remote_detach);
+                        reattach_then_close(self).await?;
+                    }
+                    Err(DetachError::ClosedByRemote)
                 }
-                Err(DetachError::ClosedByRemote)
+                LinkState::Closed => Err(DetachError::ClosedByRemote),
             }
-            LinkState::Closed => Err(DetachError::ClosedByRemote),
-        }
+        }).await?
     }
 
     /// # Cancel safety
@@ -229,66 +232,71 @@ where
         &mut self,
         error: Option<definitions::Error>,
     ) -> Result<(), <Self::Link as LinkDetach>::DetachError> {
-        match self.link().local_state() {
-            LinkState::Unattached
-            | LinkState::AttachSent
-            | LinkState::IncompleteAttachSent
-            | LinkState::IncompleteAttachReceived
-            | LinkState::IncompleteAttachExchanged
-            | LinkState::AttachReceived
-            | LinkState::Attached => {
-                // Send detach with closed=true and wait for remote closing detach
-                // The sender will be dropped after close
-                self.send_detach(true, error)
-                    .await // cancel safe
-                    .map_err(|_| detach_error_from_stop_reason(self))?;
+        let unsettled = self.link().unsettled().clone();
+        unsettled
+            .until_terminated(async {
+                match self.link().local_state() {
+                    LinkState::Unattached
+                    | LinkState::AttachSent
+                    | LinkState::IncompleteAttachSent
+                    | LinkState::IncompleteAttachReceived
+                    | LinkState::IncompleteAttachExchanged
+                    | LinkState::AttachReceived
+                    | LinkState::Attached => {
+                        // Send detach with closed=true and wait for remote closing detach
+                        // The sender will be dropped after close
+                        self.send_detach(true, error)
+                            .await // cancel safe
+                            .map_err(|_| detach_error_from_stop_reason(self))?;
 
-                // Wait for remote detach
-                let remote_detach = recv_remote_detach(self).await?; // cancel safe
-                if remote_detach.closed {
-                    // If the remote detach contains an error, the error will be propagated
-                    // back by `on_detach_reply`
-                    self.link_mut().on_detach_reply(remote_detach)
-                } else {
-                    // Peer suspended while we were closing: record it, then
-                    // reattach (re-registers the link) and close (§2.6.6).
-                    // The close completes, so this is not an error.
-                    let _ = self.link_mut().apply_remote_detach_outcome(remote_detach);
-                    reattach_then_close(self).await?;
-                    Ok(())
+                        // Wait for remote detach
+                        let remote_detach = recv_remote_detach(self).await?; // cancel safe
+                        if remote_detach.closed {
+                            // If the remote detach contains an error, the error will be propagated
+                            // back by `on_detach_reply`
+                            self.link_mut().on_detach_reply(remote_detach)
+                        } else {
+                            // Peer suspended while we were closing: record it, then
+                            // reattach (re-registers the link) and close (§2.6.6).
+                            // The close completes, so this is not an error.
+                            let _ = self.link_mut().apply_remote_detach_outcome(remote_detach);
+                            reattach_then_close(self).await?;
+                            Ok(())
+                        }
+                    }
+                    LinkState::DetachSent => {
+                        // We already sent a non-closing detach and `close()` is now
+                        // called. Wait for the reply.
+                        let remote_detach = recv_remote_detach(self).await?; // cancel safe
+                        if remote_detach.closed {
+                            // §2.6.6: reattach and then send a closing detach.
+                            reattach_then_close(self).await?;
+                            Err(DetachError::ClosedByRemote)
+                        } else {
+                            self.link_mut()
+                                .apply_remote_detach_outcome(remote_detach)
+                                .map_err(DetachError::from)
+                        }
+                    }
+                    LinkState::Detached => Ok(()),
+                    LinkState::CloseSent => {
+                        // Wait for remote detach
+                        let remote_detach = recv_remote_detach(self).await?; // cancel safe
+                        if remote_detach.closed {
+                            self.link_mut().on_detach_reply(remote_detach)
+                        } else {
+                            // Peer suspended while we were closing: reattach
+                            // (re-registers the link) and close (§2.6.6).
+                            // The close completes, so this is not an error.
+                            let _ = self.link_mut().apply_remote_detach_outcome(remote_detach);
+                            reattach_then_close(self).await?;
+                            Ok(())
+                        }
+                    }
+                    LinkState::Closed => Ok(()),
                 }
-            }
-            LinkState::DetachSent => {
-                // We already sent a non-closing detach and `close()` is now
-                // called. Wait for the reply.
-                let remote_detach = recv_remote_detach(self).await?; // cancel safe
-                if remote_detach.closed {
-                    // §2.6.6: reattach and then send a closing detach.
-                    reattach_then_close(self).await?;
-                    Err(DetachError::ClosedByRemote)
-                } else {
-                    self.link_mut()
-                        .apply_remote_detach_outcome(remote_detach)
-                        .map_err(DetachError::from)
-                }
-            }
-            LinkState::Detached => Ok(()),
-            LinkState::CloseSent => {
-                // Wait for remote detach
-                let remote_detach = recv_remote_detach(self).await?; // cancel safe
-                if remote_detach.closed {
-                    self.link_mut().on_detach_reply(remote_detach)
-                } else {
-                    // Peer suspended while we were closing: reattach
-                    // (re-registers the link) and close (§2.6.6).
-                    // The close completes, so this is not an error.
-                    let _ = self.link_mut().apply_remote_detach_outcome(remote_detach);
-                    reattach_then_close(self).await?;
-                    Ok(())
-                }
-            }
-            LinkState::Closed => Ok(()),
-        }
+            })
+            .await?
     }
 }
 
@@ -342,6 +350,9 @@ fn detach_error_from_stop_reason<T>(inner: &T) -> DetachError
 where
     T: LinkEndpointInner + ?Sized,
 {
+    if let Err(error) = inner.link().unsettled().check() {
+        return error.into();
+    }
     match inner.session_stop_reason().get() {
         Some(reason) => DetachError::SessionStopped(reason.clone()),
         None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
@@ -357,25 +368,30 @@ where
     T::Link: LinkDetach<DetachError = DetachError>,
     <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
 {
-    loop {
-        match link_inner
-            .reader_mut()
-            .recv()
-            .await // cancel safe
-            .ok_or_else(|| detach_error_from_stop_reason(link_inner))?
-        {
-            LinkFrame::Detach(detach, _) => return Ok(detach),
-            _frame => {
-                // The only other frames should be Attach or Detach, (or Transfer if receiver).
-                // Ignore all other frames
-                #[cfg(feature = "tracing")]
-                tracing::debug!("Non-detach frame received: {:?}", _frame);
-                #[cfg(feature = "log")]
-                log::debug!("Non-detach frame received: {:?}", _frame);
-                continue;
+    let unsettled = link_inner.link().unsettled().clone();
+    unsettled
+        .until_terminated(async {
+            loop {
+                match link_inner
+                    .reader_mut()
+                    .recv()
+                    .await // cancel safe
+                    .ok_or_else(|| detach_error_from_stop_reason(link_inner))?
+                {
+                    LinkFrame::Detach(detach, _) => return Ok(detach),
+                    _frame => {
+                        // The only other frames should be Attach or Detach, (or Transfer if receiver).
+                        // Ignore all other frames
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("Non-detach frame received: {:?}", _frame);
+                        #[cfg(feature = "log")]
+                        log::debug!("Non-detach frame received: {:?}", _frame);
+                        continue;
+                    }
+                }
             }
-        }
-    }
+        })
+        .await?
 }
 
 /// Reallocate and validate an Attach without reconciling unsettled deliveries.

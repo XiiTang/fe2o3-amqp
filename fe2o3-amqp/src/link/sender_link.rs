@@ -733,29 +733,34 @@ where
         state: DeliveryState,
         batchable: bool,
     ) -> Result<(), Self::DispositionError> {
-        if let SenderSettleMode::Settled = self.snd_settle_mode {
-            return Ok(());
-        }
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                if let SenderSettleMode::Settled = self.snd_settle_mode {
+                    return Ok(());
+                }
 
-        if settled {
-            if let Some(msg) = self.unsettled.withdraw(&delivery_tag) {
-                let _ = msg.settle();
-            }
-        } else {
-            self.unsettled
-                .set_state(&delivery_tag, Some(state.clone()))?;
-        }
+                if settled {
+                    if let Some(msg) = self.unsettled.withdraw(&delivery_tag) {
+                        let _ = msg.settle();
+                    }
+                } else {
+                    self.unsettled
+                        .set_state(&delivery_tag, Some(state.clone()))?;
+                }
 
-        send_disposition(
-            writer,
-            delivery_id,
-            None,
-            settled,
-            Some(state),
-            batchable,
-            &self.session_stop_reason,
-        )
-        .await
+                send_disposition(
+                    writer,
+                    delivery_id,
+                    None,
+                    settled,
+                    Some(state),
+                    batchable,
+                    &self.session_stop_reason,
+                )
+                .await
+            })
+            .await?
     }
 
     async fn batch_dispose(
@@ -766,80 +771,85 @@ where
         state: DeliveryState,
         batchable: bool,
     ) -> Result<(), Self::DispositionError> {
-        if let SenderSettleMode::Settled = self.snd_settle_mode {
-            return Ok(());
-        }
-
-        let mut first = None;
-        let mut last = None;
-
-        ids_and_tags.sort_by_key(|left| left.0);
-
-        // Find continuous ranges
-        for (delivery_id, delivery_tag) in ids_and_tags {
-            if settled {
-                if let Some(msg) = self.unsettled.withdraw(&delivery_tag) {
-                    let _ = msg.settle();
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                if let SenderSettleMode::Settled = self.snd_settle_mode {
+                    return Ok(());
                 }
-            } else {
-                self.unsettled
-                    .set_state(&delivery_tag, Some(state.clone()))?;
-            }
 
-            match (first, last) {
-                // First pair
-                (None, _) => first = Some(delivery_id),
-                // Second pair
-                (Some(first_id), None) => {
-                    // Find discontinuity
-                    if delivery_id - first_id > 1 {
-                        send_disposition(
-                            writer,
-                            first_id,
-                            None,
-                            settled,
-                            Some(state.clone()),
-                            batchable,
-                            &self.session_stop_reason,
-                        )
-                        .await?;
+                let mut first = None;
+                let mut last = None;
+
+                ids_and_tags.sort_by_key(|left| left.0);
+
+                // Find continuous ranges
+                for (delivery_id, delivery_tag) in ids_and_tags {
+                    if settled {
+                        if let Some(msg) = self.unsettled.withdraw(&delivery_tag) {
+                            let _ = msg.settle();
+                        }
+                    } else {
+                        self.unsettled
+                            .set_state(&delivery_tag, Some(state.clone()))?;
                     }
-                    last = Some(delivery_id);
-                }
-                // Third and more
-                (Some(first_id), Some(last_id)) => {
-                    // Find discontinuity
-                    if delivery_id - last_id > 1 {
-                        send_disposition(
-                            writer,
-                            first_id,
-                            Some(last_id),
-                            settled,
-                            Some(state.clone()),
-                            batchable,
-                            &self.session_stop_reason,
-                        )
-                        .await?;
-                    }
-                    last = Some(delivery_id);
-                }
-            }
-        }
 
-        // if there is only one message to dispose
-        if let (Some(first_id), None) = (first, last) {
-            send_disposition(
-                writer,
-                first_id,
-                None,
-                settled,
-                Some(state),
-                batchable,
-                &self.session_stop_reason,
-            )
-            .await?;
-        }
-        Ok(())
+                    match (first, last) {
+                        // First pair
+                        (None, _) => first = Some(delivery_id),
+                        // Second pair
+                        (Some(first_id), None) => {
+                            // Find discontinuity
+                            if delivery_id - first_id > 1 {
+                                send_disposition(
+                                    writer,
+                                    first_id,
+                                    None,
+                                    settled,
+                                    Some(state.clone()),
+                                    batchable,
+                                    &self.session_stop_reason,
+                                )
+                                .await?;
+                            }
+                            last = Some(delivery_id);
+                        }
+                        // Third and more
+                        (Some(first_id), Some(last_id)) => {
+                            // Find discontinuity
+                            if delivery_id - last_id > 1 {
+                                send_disposition(
+                                    writer,
+                                    first_id,
+                                    Some(last_id),
+                                    settled,
+                                    Some(state.clone()),
+                                    batchable,
+                                    &self.session_stop_reason,
+                                )
+                                .await?;
+                            }
+                            last = Some(delivery_id);
+                        }
+                    }
+                }
+
+                // if there is only one message to dispose
+                if let (Some(first_id), None) = (first, last) {
+                    send_disposition(
+                        writer,
+                        first_id,
+                        None,
+                        settled,
+                        Some(state),
+                        batchable,
+                        &self.session_stop_reason,
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+            .await?
     }
 }
 
@@ -1090,57 +1100,63 @@ where
         reader: &mut mpsc::Receiver<LinkFrame>,
         session: &mpsc::Sender<SessionControl>,
     ) -> SenderAttachError {
-        match attach_error {
-            SenderAttachError::UnsettledCapacityExceeded(_)
-            | SenderAttachError::NativeBufferTooLarge
-            | SenderAttachError::SessionStopped(_)
-            | SenderAttachError::SessionNotMapped
-            | SenderAttachError::IllegalState
-            | SenderAttachError::NonAttachFrameReceived
-            | SenderAttachError::ExpectImmediateDetach
-            | SenderAttachError::RemoteClosedWithError(_) => attach_error,
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                match attach_error {
+                    SenderAttachError::UnsettledCapacityExceeded(_)
+                    | SenderAttachError::NativeBufferTooLarge
+                    | SenderAttachError::SessionStopped(_)
+                    | SenderAttachError::SessionNotMapped
+                    | SenderAttachError::IllegalState
+                    | SenderAttachError::NonAttachFrameReceived
+                    | SenderAttachError::ExpectImmediateDetach
+                    | SenderAttachError::RemoteClosedWithError(_) => attach_error,
 
-            SenderAttachError::DuplicatedLinkName => {
-                let error = definitions::Error::new(
-                    SessionError::HandleInUse,
-                    "Link name is in use".to_string(),
-                    None,
-                );
-                session
-                    .send(SessionControl::End(Some(error)))
-                    .await
-                    .map(|_| attach_error)
-                    .unwrap_or(match self.session_stop_reason.get() {
-                        Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
-                        None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                    })
-            }
+                    SenderAttachError::DuplicatedLinkName => {
+                        let error = definitions::Error::new(
+                            SessionError::HandleInUse,
+                            "Link name is in use".to_string(),
+                            None,
+                        );
+                        session
+                            .send(SessionControl::End(Some(error)))
+                            .await
+                            .map(|_| attach_error)
+                            .unwrap_or(match self.session_stop_reason.get() {
+                                Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
+                                None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                            })
+                    }
 
-            SenderAttachError::SndSettleModeNotSupported
-            | SenderAttachError::IncomingTargetIsNone => {
-                // Just send detach immediately
-                let err = self
-                    .send_detach(writer, true, None)
-                    .await
-                    .map(|_| attach_error)
-                    .unwrap_or(match self.session_stop_reason.get() {
-                        Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
-                        None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                    });
-                recv_detach(self, reader, err).await
-            }
+                    SenderAttachError::SndSettleModeNotSupported
+                    | SenderAttachError::IncomingTargetIsNone => {
+                        // Just send detach immediately
+                        let err = self
+                            .send_detach(writer, true, None)
+                            .await
+                            .map(|_| attach_error)
+                            .unwrap_or(match self.session_stop_reason.get() {
+                                Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
+                                None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                            });
+                        recv_detach(self, reader, err).await
+                    }
 
-            SenderAttachError::CoordinatorIsNotImplemented
-            | SenderAttachError::SourceAddressIsSomeWhenDynamicIsTrue
-            | SenderAttachError::TargetAddressIsNoneWhenDynamicIsTrue
-            | SenderAttachError::DynamicNodePropertiesIsSomeWhenDynamicIsFalse => {
-                try_detach_with_error(self, attach_error, writer, reader).await
-            }
-            #[cfg(feature = "transaction")]
-            SenderAttachError::DesireTxnCapabilitiesNotSupported => {
-                try_detach_with_error(self, attach_error, writer, reader).await
-            }
-        }
+                    SenderAttachError::CoordinatorIsNotImplemented
+                    | SenderAttachError::SourceAddressIsSomeWhenDynamicIsTrue
+                    | SenderAttachError::TargetAddressIsNoneWhenDynamicIsTrue
+                    | SenderAttachError::DynamicNodePropertiesIsSomeWhenDynamicIsFalse => {
+                        try_detach_with_error(self, attach_error, writer, reader).await
+                    }
+                    #[cfg(feature = "transaction")]
+                    SenderAttachError::DesireTxnCapabilitiesNotSupported => {
+                        try_detach_with_error(self, attach_error, writer, reader).await
+                    }
+                }
+            })
+            .await
+            .unwrap_or_else(SenderAttachError::from)
     }
 }
 

@@ -465,6 +465,7 @@ where
         closed: bool,
         error: Option<definitions::Error>,
     ) -> Result<(), Self::DetachError> {
+<<<<<<< HEAD
         // Preserve the attached state if queuing is cancelled or refused before dispatch.
         let next_state = match (&self.local_state, closed) {
             (
@@ -481,26 +482,54 @@ where
                     handle: handle.handle.clone().into(),
                     closed,
                     error,
+=======
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                // Preserve the attached state if queuing is cancelled or refused before dispatch.
+                let next_state = match (&self.local_state, closed) {
+                    (LinkState::Attached, false) => LinkState::DetachSent,
+                    (LinkState::Attached, true) => LinkState::CloseSent,
+                    _ => return Err(DetachError::IllegalState),
+>>>>>>> 6ad35fee (Propagate unsettled termination through control and settlement waits)
                 };
 
-                #[cfg(feature = "tracing")]
-                tracing::debug!("Sending detach: {:?}", detach);
-                #[cfg(feature = "log")]
-                log::debug!("Sending detach: {:?}", detach);
+                match self.output_handle.clone() {
+                    Some(handle) => {
+                        let detach = Detach {
+                            handle: handle.handle.clone().into(),
+                            closed,
+                            error,
+                        };
 
-                // An error here means the session is already closed, so we can't send a detach
-                writer
-                    .send(LinkFrame::Detach(detach, handle.id))
-                    .await // cancel safe
-                    .map_err(|_| match self.session_stop_reason.get() {
-                        Some(reason) => DetachError::SessionStopped(reason.clone()),
-                        None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                    })?;
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("Sending detach: {:?}", detach);
+                        #[cfg(feature = "log")]
+                        log::debug!("Sending detach: {:?}", detach);
 
-                self.local_state = next_state;
-                if let Some(flag) = &self.operation_dispatch {
-                    flag.store(true, std::sync::atomic::Ordering::Release);
+                        // An error here means the session is already closed, so we can't send a detach
+                        writer
+                            .send(LinkFrame::Detach(detach, handle.id))
+                            .await // cancel safe
+                            .map_err(|_| match self.session_stop_reason.get() {
+                                Some(reason) => DetachError::SessionStopped(reason.clone()),
+                                None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                            })?;
+
+                        self.local_state = next_state;
+                        if let Some(flag) = &self.operation_dispatch {
+                            flag.store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        // Retain the identity while a non-closing Detach is in flight:
+                        // preceding Transfer frames still belong to this endpoint.
+                        if !matches!(self.local_state, LinkState::DetachSent) {
+                            self.output_handle.take();
+                        }
+                        Ok(())
+                    }
+                    None => Err(DetachError::IllegalState),
                 }
+<<<<<<< HEAD
                 // The receiver must parse the original attachment's admitted
                 // prefix until its first native Detach, including after Close.
                 // Sender/controller close retain their existing release rule.
@@ -513,6 +542,10 @@ where
             }
             None => Err(DetachError::IllegalState),
         }
+=======
+            })
+            .await?
+>>>>>>> 6ad35fee (Propagate unsettled termination through control and settlement waits)
     }
 
     /// See [`endpoint::LinkDetach::apply_remote_detach_outcome`] for the
@@ -646,15 +679,16 @@ impl LinkRelay<()> {
 }
 
 impl LinkRelay<OutputAttachment> {
-    pub(crate) async fn send(
-        &mut self,
-        frame: LinkFrame,
-    ) -> Result<(), Box<mpsc::error::SendError<LinkFrame>>> {
+    pub(crate) async fn send(&mut self, frame: LinkFrame) -> Result<(), LinkRelayError> {
         match self {
-            LinkRelay::Sender { tx, .. } => tx.send(frame).await,
-            LinkRelay::Receiver { tx, .. } => tx.send(frame).await,
+            LinkRelay::Sender { tx, unsettled, .. } => {
+                unsettled.until_terminated(tx.send(frame)).await?
+            }
+            LinkRelay::Receiver { tx, unsettled, .. } => {
+                unsettled.until_terminated(tx.send(frame)).await?
+            }
         }
-        .map_err(Box::new)
+        .map_err(|_| LinkRelayError::UnattachedHandle)
     }
 
     #[allow(unused_variables)]
@@ -669,8 +703,10 @@ impl LinkRelay<OutputAttachment> {
                 flow_state,
                 output_handle,
                 tx,
+                unsettled,
                 ..
             } => {
+                unsettled.check()?;
                 #[cfg(feature = "transaction")]
                 {
                     use serde_amqp::Value;
@@ -678,8 +714,9 @@ impl LinkRelay<OutputAttachment> {
                         flow.properties.as_ref().and_then(|m| m.get(TXN_ID_KEY))
                     {
                         let frame = LinkFrame::Acquisition(txn_id.clone());
-                        tx.send(frame)
-                            .await
+                        unsettled
+                            .until_terminated(tx.send(frame))
+                            .await?
                             .map_err(|_| LinkRelayError::UnattachedHandle)?;
                     }
                 }
@@ -692,8 +729,10 @@ impl LinkRelay<OutputAttachment> {
             LinkRelay::Receiver {
                 flow_state,
                 output_handle,
+                unsettled,
                 ..
             } => {
+                unsettled.check()?;
                 let ret = flow_state.on_incoming_flow(flow, output_handle.handle.clone());
                 Ok(ret.map(|flow| (flow, output_handle.id)))
             }
@@ -815,16 +854,17 @@ impl LinkRelay<OutputAttachment> {
                 };
                 *more = transfer.more && !transfer.aborted;
                 *current_tag = if *more { tag.clone() } else { None };
-                tx.send(LinkFrame::Transfer {
-                    input_handle: InputHandle::from(transfer.handle.clone()),
-                    attachment: output_handle.id,
-                    performative: transfer,
-                    payload,
-                    window_slot,
-                    queue_slot: None,
-                })
-                .await
-                .map_err(|_| LinkRelayError::UnattachedHandle)?;
+                unsettled
+                    .until_terminated(tx.send(LinkFrame::Transfer {
+                        input_handle: InputHandle::from(transfer.handle.clone()),
+                        attachment: output_handle.id,
+                        performative: transfer,
+                        payload,
+                        window_slot,
+                        queue_slot: None,
+                    }))
+                    .await?
+                    .map_err(|_| LinkRelayError::UnattachedHandle)?;
                 if first && known {
                     return Ok(delivery_id.zip(tag));
                 }
@@ -833,8 +873,8 @@ impl LinkRelay<OutputAttachment> {
         }
     }
 
-    /// Forward an incoming detach into the link engine's channel. A failure
-    /// to send only means the link endpoint was dropped.
+    /// Forward an incoming detach into the link engine's channel. A dropped
+    /// or exhausted reader cannot delay the required peer reply.
     ///
     /// If the peer detached the link on its own, also returns the reply
     /// detach for the session to send back, and fails the still-pending
@@ -867,9 +907,10 @@ impl LinkRelay<OutputAttachment> {
                 if remote_initiated && detach.closed {
                     unsettled.close(remote_close_error(&detach));
                 }
-                // A send failure means the link endpoint was dropped; the
-                // response (if any) must still go out.
-                let forward_result = tx.send(frame).await;
+                // A dropped or exhausted reader cannot consume the frame;
+                // the response (if any) must still go out.
+                let forwarded =
+                    matches!(unsettled.until_terminated(tx.send(frame)).await, Ok(Ok(())));
 
                 if !remote_initiated {
                     // The detach is the response to our own detach/close. The
@@ -877,7 +918,7 @@ impl LinkRelay<OutputAttachment> {
                     // frame — unless the endpoint was dropped, in which case
                     // the forward fails and nothing else would fail the
                     // deliveries that are still pending on the closed link.
-                    if forward_result.is_err() && detach.closed {
+                    if !forwarded && detach.closed {
                         unsettled.close(remote_close_error(&detach));
                     }
                     return None;
@@ -890,9 +931,12 @@ impl LinkRelay<OutputAttachment> {
                 })
             }
             LinkRelay::Receiver {
-                tx, output_handle, ..
+                tx,
+                output_handle,
+                unsettled,
+                ..
             } => {
-                let _ = tx.send(frame).await;
+                let _ = unsettled.until_terminated(tx.send(frame)).await;
                 if !remote_initiated {
                     return None;
                 }
@@ -1438,5 +1482,136 @@ mod detach_admission_tests {
             ));
             assert_eq!(link.output_handle.as_ref().unwrap().handle.0, 7);
         }
+    }
+    fn cap_control_relay_store() -> ArcReceiverUnsettledMap {
+        Arc::new(unsettled_store::Store::new(None, Some(UnsettledLimits::new(1, 4096))).unwrap())
+    }
+    fn cap_control_exhaust_relay(
+        store: &unsettled_store::Store<receiver_delivery::ReceiverDelivery>,
+    ) -> UnsettledCapacityExceeded {
+        let tag = store
+            .read()
+            .as_ref()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let state = fe2o3_amqp_types::messaging::Rejected {
+            error: Some(definitions::Error::new(
+                definitions::AmqpError::InternalError,
+                Some("x".repeat(8192)),
+                None,
+            )),
+        };
+        store
+            .update(&tag, |entry| entry.remote_state(Some(state.into())))
+            .unwrap_err()
+    }
+    #[tokio::test]
+    async fn cap_control_relay_attach_and_transfer_waits_keep_capacity_cause() {
+        let mut observed = Vec::new();
+        for transfer_wait in [false, true] {
+            let store = cap_control_relay_store();
+            let link = attached_link();
+            let attachment = crate::endpoint::OutputAttachment::for_tests(0);
+            let (tx, _frames) = mpsc::channel(1);
+            tx.try_send(LinkFrame::Flow(LinkFlow::default(), attachment.id))
+                .unwrap();
+            let mut relay = LinkRelay::new_receiver(
+                tx,
+                link.flow_state.clone(),
+                store.clone(),
+                ReceiverSettleMode::Second,
+            )
+            .with_output_handle(attachment);
+            if transfer_wait {
+                let performative = Transfer {
+                    handle: definitions::Handle(0),
+                    delivery_id: Some(0),
+                    delivery_tag: Some(vec![1].into()),
+                    message_format: Some(0),
+                    settled: Some(false),
+                    more: false,
+                    rcv_settle_mode: None,
+                    state: None,
+                    resume: false,
+                    aborted: false,
+                    batchable: false,
+                };
+                observed.push(
+                    cap_control_observe_relay(
+                        &store,
+                        relay.on_incoming_transfer(performative, Payload::new(), None),
+                    )
+                    .await,
+                );
+            } else {
+                store
+                    .insert(
+                        vec![1].into(),
+                        receiver_delivery::ReceiverDelivery::new(None),
+                    )
+                    .unwrap();
+                let attach = link.as_complete_attach(endpoint::OutputHandle(0), false);
+                observed.push(
+                    cap_control_observe_relay(&store, relay.send(LinkFrame::Attach(attach))).await,
+                );
+            }
+        }
+        assert_eq!(
+            observed,
+            [true, true],
+            "relay forwards must retain typed termination"
+        );
+    }
+    async fn cap_control_observe_relay<T, E: std::error::Error + 'static>(
+        store: &unsettled_store::Store<receiver_delivery::ReceiverDelivery>,
+        operation: impl std::future::Future<Output = Result<T, E>>,
+    ) -> bool {
+        let mut waiting = Box::pin(operation);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let cause = cap_control_exhaust_relay(store);
+        match futures_util::poll!(&mut waiting) {
+            std::task::Poll::Ready(Err(error)) => {
+                matches!((&error as &dyn std::error::Error).downcast_ref::<LinkRelayError>(), Some(LinkRelayError::UnsettledCapacityExceeded(error)) if *error == cause)
+            }
+            _ => false,
+        }
+    }
+    #[tokio::test]
+    async fn cap_control_relay_detach_does_not_wait_for_ended_reader() {
+        let store = cap_control_relay_store();
+        store
+            .insert(
+                vec![1].into(),
+                receiver_delivery::ReceiverDelivery::new(None),
+            )
+            .unwrap();
+        let link = attached_link();
+        let attachment = crate::endpoint::OutputAttachment::for_tests(0);
+        let (tx, _frames) = mpsc::channel(1);
+        tx.try_send(LinkFrame::Flow(LinkFlow::default(), attachment.id))
+            .unwrap();
+        let mut relay = LinkRelay::new_receiver(
+            tx,
+            link.flow_state.clone(),
+            store.clone(),
+            ReceiverSettleMode::Second,
+        )
+        .with_output_handle(attachment);
+        let detach = Detach {
+            handle: definitions::Handle(0),
+            closed: true,
+            error: None,
+        };
+        let mut waiting = Box::pin(relay.on_incoming_detach(detach, true));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let cause = cap_control_exhaust_relay(&store);
+        assert!(matches!(
+            futures_util::poll!(&mut waiting),
+            std::task::Poll::Ready(Some(Detach { closed: true, .. }))
+        ));
+        assert_eq!(store.check(), Err(cause));
     }
 }

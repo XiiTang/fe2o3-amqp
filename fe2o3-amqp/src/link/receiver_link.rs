@@ -36,26 +36,31 @@ where
         echo: bool,
         include_properties: bool,
     ) -> Result<(), Self::FlowError> {
-        self.unsettled.check()?;
-        let attachment = self
-            .output_handle
-            .clone()
-            .ok_or(Self::FlowError::IllegalState)?;
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                self.unsettled.check()?;
+                let attachment = self
+                    .output_handle
+                    .clone()
+                    .ok_or(Self::FlowError::IllegalState)?;
 
-        let flow = self.get_link_flow(
-            attachment.handle.into(),
-            link_credit,
-            drain,
-            echo,
-            include_properties,
-        );
-        writer
-            .send(LinkFrame::Flow(flow, attachment.id))
-            .await // cancel safe
-            .map_err(|_| match self.session_stop_reason.get() {
-                Some(reason) => Self::FlowError::SessionStopped(reason.clone()),
-                None => Self::FlowError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                let flow = self.get_link_flow(
+                    attachment.handle.into(),
+                    link_credit,
+                    drain,
+                    echo,
+                    include_properties,
+                );
+                writer
+                    .send(LinkFrame::Flow(flow, attachment.id))
+                    .await // cancel safe
+                    .map_err(|_| match self.session_stop_reason.get() {
+                        Some(reason) => Self::FlowError::SessionStopped(reason.clone()),
+                        None => Self::FlowError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                    })
             })
+            .await?
     }
 
     fn on_transfer_state(
@@ -236,52 +241,57 @@ where
         state: DeliveryState,
         batchable: bool,
     ) -> Result<(), Self::DispositionError> {
-        let settled = settled.unwrap_or({
-            match delivery_info
-                .rcv_settle_mode
-                .as_ref()
-                .unwrap_or(&self.rcv_settle_mode)
-            {
-                ReceiverSettleMode::First => {
-                    // If first, this indicates that the receiver MUST settle
-                    // the delivery once it has arrived without waiting
-                    // for the sender to settle first.
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                let settled = settled.unwrap_or({
+                    match delivery_info
+                        .rcv_settle_mode
+                        .as_ref()
+                        .unwrap_or(&self.rcv_settle_mode)
+                    {
+                        ReceiverSettleMode::First => {
+                            // If first, this indicates that the receiver MUST settle
+                            // the delivery once it has arrived without waiting
+                            // for the sender to settle first.
 
-                    // The delivery is not inserted into unsettled map if in First mode
-                    true
+                            // The delivery is not inserted into unsettled map if in First mode
+                            true
+                        }
+                        ReceiverSettleMode::Second => {
+                            // If second, this indicates that the receiver MUST NOT settle until sending
+                            // its disposition to the sender and receiving a settled disposition from
+                            // the sender.
+                            false
+                        }
+                    }
+                });
+
+                let unsettled_state = self.unsettled.dispose(&delivery_info, settled, &state)?;
+
+                // Only dispose if message is found in unsettled map
+                if unsettled_state.is_some() {
+                    let disposition = Disposition {
+                        role: Role::Receiver,
+                        first: delivery_info.delivery_id,
+                        last: None,
+                        settled,
+                        state: Some(state),
+                        batchable,
+                    };
+                    let frame = LinkFrame::Disposition(disposition);
+                    writer
+                        .send(frame)
+                        .await // cancel safe
+                        .map_err(|_| match self.session_stop_reason.get() {
+                            Some(reason) => Self::DispositionError::SessionStopped(reason.clone()),
+                            None => Self::DispositionError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                        })?;
                 }
-                ReceiverSettleMode::Second => {
-                    // If second, this indicates that the receiver MUST NOT settle until sending
-                    // its disposition to the sender and receiving a settled disposition from
-                    // the sender.
-                    false
-                }
-            }
-        });
 
-        let unsettled_state = self.unsettled.dispose(&delivery_info, settled, &state)?;
-
-        // Only dispose if message is found in unsettled map
-        if unsettled_state.is_some() {
-            let disposition = Disposition {
-                role: Role::Receiver,
-                first: delivery_info.delivery_id,
-                last: None,
-                settled,
-                state: Some(state),
-                batchable,
-            };
-            let frame = LinkFrame::Disposition(disposition);
-            writer
-                .send(frame)
-                .await // cancel safe
-                .map_err(|_| match self.session_stop_reason.get() {
-                    Some(reason) => Self::DispositionError::SessionStopped(reason.clone()),
-                    None => Self::DispositionError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                })?;
-        }
-
-        Ok(())
+                Ok(())
+            })
+            .await?
     }
 
     /// This is cancel safe because all internal `.await` points are cancel safe
@@ -293,34 +303,39 @@ where
         state: DeliveryState,
         batchable: bool,
     ) -> Result<(), Self::DispositionError> {
-        self.unsettled.check()?;
-        // sorting before filtering may be more cache/branch-prediction friendly?
-        delivery_infos.sort_by_key(|left| left.delivery_id);
-        {
-            let reader = self.unsettled.read();
-            delivery_infos.retain(|info| {
-                reader
-                    .as_ref()
-                    .map(|m| {
-                        m.get(&info.delivery_tag)
-                            .and_then(|entry| entry.info.as_ref())
-                            .is_some_and(|current| current.same_delivery(info))
-                    })
-                    .unwrap_or(false)
-            });
-        }
-        let chunk_inds = consecutive_chunk_indices(&delivery_infos);
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                self.unsettled.check()?;
+                // sorting before filtering may be more cache/branch-prediction friendly?
+                delivery_infos.sort_by_key(|left| left.delivery_id);
+                {
+                    let reader = self.unsettled.read();
+                    delivery_infos.retain(|info| {
+                        reader
+                            .as_ref()
+                            .map(|m| {
+                                m.get(&info.delivery_tag)
+                                    .and_then(|entry| entry.info.as_ref())
+                                    .is_some_and(|current| current.same_delivery(info))
+                            })
+                            .unwrap_or(false)
+                    });
+                }
+                let chunk_inds = consecutive_chunk_indices(&delivery_infos);
 
-        let mut prev_ind = 0;
-        for ind in chunk_inds {
-            let slice = &delivery_infos[prev_ind..ind];
-            self.dispose_consecutive(writer, slice, settled, state.clone(), batchable)
-                .await?; // cancel safe
-            prev_ind = ind;
-        }
-        let final_slice = &delivery_infos[prev_ind..];
-        self.dispose_consecutive(writer, final_slice, settled, state, batchable)
-            .await // cancel safe
+                let mut prev_ind = 0;
+                for ind in chunk_inds {
+                    let slice = &delivery_infos[prev_ind..ind];
+                    self.dispose_consecutive(writer, slice, settled, state.clone(), batchable)
+                        .await?; // cancel safe
+                    prev_ind = ind;
+                }
+                let final_slice = &delivery_infos[prev_ind..];
+                self.dispose_consecutive(writer, final_slice, settled, state, batchable)
+                    .await // cancel safe
+            })
+            .await?
     }
 }
 
@@ -935,6 +950,7 @@ where
                     _ => return Err(ReceiverAttachError::NonAttachFrameReceived),
                 };
 
+<<<<<<< HEAD
         match purpose {
             AttachPurpose::Ordinary => {
                 endpoint::LinkAttach::on_incoming_attach(self, remote_attach)
@@ -944,6 +960,84 @@ where
                 Ok(ReceiverAttachExchange::Complete)
             }
         }
+=======
+                self.on_incoming_attach(remote_attach)
+            })
+            .await?
+    }
+
+    async fn handle_attach_error(
+        &mut self,
+        attach_error: ReceiverAttachError,
+        writer: &crate::session::transfer_queue::Sender,
+        reader: &mut mpsc::Receiver<LinkFrame>,
+        session: &mpsc::Sender<SessionControl>,
+    ) -> ReceiverAttachError {
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                match attach_error {
+                    // Errors that indicate failed attachment
+                    ReceiverAttachError::SessionStopped(_)
+                    | ReceiverAttachError::IllegalState
+                    | ReceiverAttachError::NonAttachFrameReceived
+                    | ReceiverAttachError::ExpectImmediateDetach
+                    | ReceiverAttachError::RemoteClosedWithError(_) => attach_error,
+
+                    ReceiverAttachError::DuplicatedLinkName => {
+                        let error = definitions::Error::new(
+                            SessionError::HandleInUse,
+                            "Link name is in use".to_string(),
+                            None,
+                        );
+                        session
+                            .send(SessionControl::End(Some(error)))
+                            .await
+                            .map(|_| attach_error)
+                            .unwrap_or(match self.session_stop_reason.get() {
+                                Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
+                                None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                            })
+                    }
+
+                    // ReceiverAttachError::SndSettleModeNotSupported
+                    ReceiverAttachError::IncomingSourceIsNone => {
+                        // Just send detach immediately
+                        let err = self
+                            .send_detach(writer, true, None)
+                            .await
+                            .map(|_| attach_error)
+                            .unwrap_or(match self.session_stop_reason.get() {
+                                Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
+                                None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                            });
+                        recv_detach(self, reader, err).await
+                    }
+
+                    ReceiverAttachError::CoordinatorIsNotImplemented
+                    | ReceiverAttachError::InitialDeliveryCountIsNone
+                    | ReceiverAttachError::SourceAddressIsNoneWhenDynamicIsTrue
+                    | ReceiverAttachError::TargetAddressIsSomeWhenDynamicIsTrue
+                    | ReceiverAttachError::DynamicNodePropertiesIsSomeWhenDynamicIsFalse => {
+                        match (&attach_error).try_into() {
+                            Ok(error) => match self.send_detach(writer, true, Some(error)).await {
+                                Ok(_) => recv_detach(self, reader, attach_error).await,
+                                Err(_) => match self.session_stop_reason.get() {
+                                    Some(reason) => {
+                                        ReceiverAttachError::SessionStopped(reason.clone())
+                                    }
+                                    None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                                },
+                            },
+                            Err(_) => attach_error,
+                        }
+                    }
+                    _ => attach_error,
+                }
+            })
+            .await
+            .unwrap_or_else(ReceiverAttachError::from)
+>>>>>>> 6ad35fee (Propagate unsettled termination through control and settlement waits)
     }
 }
 

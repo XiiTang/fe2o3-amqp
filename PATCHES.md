@@ -1028,3 +1028,42 @@ and reattach, and `cap_recovery_interrupts_attach_queue_and_reply_waits` covers
 both queue admission and waiting for Attach. All nine cap wait/recovery tests
 pass (exit 0), on macOS arm64 / Rust 1.98.1. Their errors compare complete retained
 limits and proposed usage, including the empty-map probe.
+
+## W17c review same class: control, relay and settlement waits retain termination
+
+At d494f0b6 the raw waits are receiver_link.rs:31-57,230-282;
+receiver.rs:742-805,920-921,1772-1783; sender_link.rs:614-724;
+shared_inner.rs:334-371; and link/mod.rs:633-640,665-668,802-811,856-879.
+
+The same failure occurs beyond sends/recv/recovery: receiver flow/drain,
+ordinary and batched dispositions on both roles, ReceiverDisposer's disposition
+and automatic credit refresh, and local/remote detach waits can wait on unrelated
+queue room or input. An already-draining receiver also returned Ok after its
+Store ended. Relay Attach/Transfer and transaction-acquisition forwards could
+remain blocked after the native reader observed exhaustion and stopped polling.
+The receiver settlement view woke with Ok on a cap-purged map, exposing only
+absence, which could be mistaken for peer settlement.
+
+These paths now use the same `Store::until_terminated` checkpoint. The drain
+short circuit checks the retained cause. Relay Attach forwarding propagates the
+typed error through both ordinary and acceptor sessions; ordinary dropped-reader
+errors remain UnattachedHandle. A detach relay still emits the peer's required
+reply while skipping a forward to an exhausted reader, retaining the original
+local Store cause. Existing sender pending outcomes already fail through Store
+outside its lock, preserving W4e's exactly-once handoff.
+
+Public `ReceiverSettlementView::changed` now returns `Result<(), LinkStateError>`
+with the retained capacity error. Its new `check()` reports that same cause for
+synchronous binding queries. After observing absence, consumers must check this
+status before classifying a purge as peer settlement. No new terminal ledger or
+error variant is added; the existing LinkStateError mapper can carry the cause.
+
+`cap_control_*` regressions reproduce eight failures before this patch (one
+pending DeliveryFut check already passes, exit 101). All nine pass after (exit 0).
+They compare exact typed limits/usage across receiver flow, drain, single/batched
+and cloned-disposer settlement, both automatic-flow paths, sender dispositions,
+both-role detach waits, receiver settlement view in both orders, and relay
+Attach/Transfer/Detach forwarding. The native pending DeliveryFut regression
+continues to pass. Tests use explicit Pending/Ready checkpoints, not elapsed time.
+macOS arm64 / Rust 1.98.1. The full library and portable reruns are recorded in the
+final verification evidence. Boundless semantic integration remains with W4e/W17c.

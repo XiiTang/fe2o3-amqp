@@ -2988,5 +2988,102 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn cap_control_sender_disposition_waits_return_retained_cause() {
+        let mut observed = Vec::new();
+        for batch in [false, true] {
+            let (mut inner, _session, _original, _incoming) = make_sender_inner_with_channels(4096);
+            let store = capped_recovery_store();
+            inner.link.unsettled = store.clone();
+            let (tx, _frames) = mpsc::channel(1);
+            tx.try_send(LinkFrame::Attach(peer_receiver_attach()))
+                .unwrap();
+            let writer = tx.into();
+            let mut waiting: std::pin::Pin<
+                Box<
+                    dyn std::future::Future<Output = Result<(), crate::link::IllegalLinkStateError>>
+                        + '_,
+                >,
+            > = if batch {
+                Box::pin(inner.link.batch_dispose(
+                    &writer,
+                    vec![(1, vec![1].into())],
+                    false,
+                    Accepted {}.into(),
+                    false,
+                ))
+            } else {
+                Box::pin(inner.link.dispose(
+                    &writer,
+                    1,
+                    vec![1].into(),
+                    false,
+                    Accepted {}.into(),
+                    false,
+                ))
+            };
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            let cause = exhaust_recovery_store(&store);
+            observed.push(matches!(futures_util::poll!(&mut waiting), std::task::Poll::Ready(Err(crate::link::IllegalLinkStateError::UnsettledCapacityExceeded(error))) if error == cause));
+            drop(waiting);
+            assert!(
+                matches!(inner.link.dispose(&writer, 1, vec![1].into(), true, Accepted {}.into(), false).await,
+                Err(crate::link::IllegalLinkStateError::UnsettledCapacityExceeded(error)) if error == cause)
+            );
+            assert!(
+                matches!(inner.link.batch_dispose(&writer, vec![], true, Accepted {}.into(), false).await,
+                Err(crate::link::IllegalLinkStateError::UnsettledCapacityExceeded(error)) if error == cause)
+            );
+        }
+        assert_eq!(
+            observed,
+            [true, true],
+            "sender dispositions must observe termination"
+        );
+    }
 
+    #[tokio::test]
+    async fn cap_control_pending_delivery_future_keeps_typed_metadata() {
+        let store = Arc::new(
+            super::super::unsettled_store::Store::new(
+                None,
+                Some(crate::link::UnsettledLimits::new(1, 4096)),
+            )
+            .unwrap(),
+        );
+        let (tx, outcome) = crate::completion::channel();
+        let tag: DeliveryTag = vec![1].into();
+        store
+            .register(
+                tag.clone(),
+                UnsettledMessage::new(Payload::from_static(b"m"), None, 0, tx),
+            )
+            .unwrap();
+        let settlement = Settlement::Unsettled {
+            delivery_tag: tag,
+            outcome,
+        };
+        let mut waiting = Box::pin(DeliveryFut::<super::super::delivery::SendResult>::new(
+            settlement,
+            Arc::new(OnceLock::new()),
+        ));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let cause = exhaust_recovery_store(&store);
+        assert!(
+            matches!(futures_util::poll!(&mut waiting), std::task::Poll::Ready(Err(SendError::LinkStateError(LinkStateError::UnsettledCapacityExceeded(error)))) if error == cause)
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_control_detach_wait_returns_retained_cause() {
+        let (mut inner, _session, _frames, _incoming) = make_sender_inner_with_channels(4096);
+        let store = capped_recovery_store();
+        inner.link.unsettled = store.clone();
+        let mut waiting = Box::pin(inner.detach_with_error(None));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let cause = exhaust_recovery_store(&store);
+        assert!(
+            matches!(futures_util::poll!(&mut waiting), std::task::Poll::Ready(Err(DetachError::UnsettledCapacityExceeded(error))) if error == cause)
+        );
+    }
 }

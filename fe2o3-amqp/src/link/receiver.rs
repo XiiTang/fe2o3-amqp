@@ -1228,40 +1228,45 @@ impl ReceiverDisposer {
         delivery_info: DeliveryInfo,
         state: DeliveryState,
     ) -> Result<(), DispositionError> {
-        let settled = match delivery_info
-            .rcv_settle_mode
-            .as_ref()
-            .unwrap_or(&self.rcv_settle_mode)
-        {
-            ReceiverSettleMode::First => true,
-            ReceiverSettleMode::Second => false,
-        };
+        let unsettled = self.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                let settled = match delivery_info
+                    .rcv_settle_mode
+                    .as_ref()
+                    .unwrap_or(&self.rcv_settle_mode)
+                {
+                    ReceiverSettleMode::First => true,
+                    ReceiverSettleMode::Second => false,
+                };
 
-        let unsettled_state = self.unsettled.dispose(&delivery_info, settled, &state)?;
-        if unsettled_state.is_none() {
-            return Ok(());
-        }
+                let unsettled_state = self.unsettled.dispose(&delivery_info, settled, &state)?;
+                if unsettled_state.is_none() {
+                    return Ok(());
+                }
 
-        if unsettled_state.is_some() {
-            let disposition = Disposition {
-                role: Role::Receiver,
-                first: delivery_info.delivery_id,
-                last: None,
-                settled,
-                state: Some(state),
-                batchable: false,
-            };
-            self.outgoing
-                .send(LinkFrame::Disposition(disposition))
-                .await
-                .map_err(|_| match self.session_stop_reason.get() {
-                    Some(reason) => DispositionError::SessionStopped(reason.clone()),
-                    None => DispositionError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                })?;
-        }
+                if unsettled_state.is_some() {
+                    let disposition = Disposition {
+                        role: Role::Receiver,
+                        first: delivery_info.delivery_id,
+                        last: None,
+                        settled,
+                        state: Some(state),
+                        batchable: false,
+                    };
+                    self.outgoing
+                        .send(LinkFrame::Disposition(disposition))
+                        .await
+                        .map_err(|_| match self.session_stop_reason.get() {
+                            Some(reason) => DispositionError::SessionStopped(reason.clone()),
+                            None => DispositionError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                        })?;
+                }
 
-        let prev = self.processed.fetch_add(1, Ordering::Release);
-        self.refresh_credit_if_needed(prev + 1).await
+                let prev = self.processed.fetch_add(1, Ordering::Release);
+                self.refresh_credit_if_needed(prev + 1).await
+            })
+            .await?
     }
 
     async fn refresh_credit_if_needed(&self, processed: u32) -> Result<(), DispositionError> {
@@ -1367,12 +1372,19 @@ impl From<Modified> for TerminalDeliveryState {
 }
 
 /// A read-only view of the receiver engine's unsettled delivery state.
+/// Capacity termination is returned by [`Self::changed`] and [`Self::check`];
+/// an absent binding alone does not prove peer settlement.
 #[derive(Debug)]
 pub struct ReceiverSettlementView {
     unsettled: ArcReceiverUnsettledMap,
     changed: tokio::sync::watch::Receiver<u64>,
 }
 impl ReceiverSettlementView {
+    /// Return the retained terminal cause. After finding a missing binding,
+    /// check this before interpreting its disappearance as peer settlement.
+    pub fn check(&self) -> Result<(), LinkStateError> {
+        self.unsettled.check().map_err(Into::into)
+    }
     /// Whether this exact tag remains unsettled in the engine.
     pub fn contains(&self, tag: &DeliveryTag) -> bool {
         self.unsettled
@@ -1407,9 +1419,14 @@ impl ReceiverSettlementView {
         self.delivery_info(info.delivery_tag())
             .is_some_and(|current| current.same_delivery(info))
     }
-    /// Wait for any map change. Updates coalesce and never form a frame queue.
-    pub async fn changed(&mut self) -> Result<(), tokio::sync::watch::error::RecvError> {
-        self.changed.changed().await
+    /// Wait for a map change or return the retained capacity termination.
+    /// Updates coalesce and never form a frame queue. A purged terminal map
+    /// must not be interpreted as ordinary peer settlement; see [`Self::check`].
+    pub async fn changed(&mut self) -> Result<(), LinkStateError> {
+        self.unsettled
+            .until_terminated(self.changed.changed())
+            .await?
+            .map_err(|_| LinkStateError::IllegalState)
     }
 }
 
@@ -2375,6 +2392,7 @@ where
     /// Setting the credit will set the `drain` field to false and stop draining
     #[inline]
     pub async fn drain(&mut self) -> Result<(), DispositionError> {
+        self.link.unsettled().check()?;
         self.processed.store(0, Ordering::Release);
 
         // Return if already draining
@@ -5919,5 +5937,125 @@ mod tests {
             }
         }
     }
+    #[tokio::test]
+    async fn cap_control_receiver_flow_drain_and_settlement_waits() {
+        let mut observed = Vec::new();
+        for mode in [
+            "flow",
+            "drain",
+            "dispose",
+            "batch",
+            "disposer",
+            "auto flow",
+            "disposer auto flow",
+        ] {
+            let (mut inner, _session, _original, _incoming) =
+                make_receiver_inner_with_channels(4096);
+            let store = capped_recovery_store();
+            let info = make_delivery_info(1, vec![1]);
+            store
+                .update(&vec![1].into(), |entry| {
+                    entry.info = Some(info.clone());
+                    entry.received = true;
+                })
+                .unwrap();
+            inner.link.unsettled = store.clone();
+            inner.link.rcv_settle_mode = ReceiverSettleMode::Second;
+            inner.credit_mode = CreditMode::Auto(2);
+            let (tx, _frames) = mpsc::channel(1);
+            if !mode.contains("auto flow") {
+                tx.try_send(LinkFrame::Attach(peer_sender_attach()))
+                    .unwrap();
+            }
+            let mut disposer = make_disposer(tx.clone(), store.clone(), CreditMode::Auto(2));
+            disposer.rcv_settle_mode = ReceiverSettleMode::Second;
+            inner.outgoing = tx.into();
+            let mut waiting: std::pin::Pin<
+                Box<dyn std::future::Future<Output = Result<(), IllegalLinkStateError>> + '_>,
+            > = match mode {
+                "flow" => Box::pin(inner.set_credit(1)),
+                "drain" => Box::pin(inner.drain()),
+                "dispose" | "auto flow" => {
+                    Box::pin(inner.dispose(info.clone(), Some(false), Accepted {}.into()))
+                }
+                "batch" => {
+                    Box::pin(inner.dispose_all(vec![info.clone()], Some(false), Accepted {}.into()))
+                }
+                _ => Box::pin(disposer.accept(info)),
+            };
+            assert!(
+                futures_util::poll!(&mut waiting).is_pending(),
+                "fixture must wait at {mode}"
+            );
+            let cause = exhaust_recovery_store(&store);
+            let typed = matches!(futures_util::poll!(&mut waiting), std::task::Poll::Ready(Err(IllegalLinkStateError::UnsettledCapacityExceeded(error))) if error == cause);
+            observed.push((mode, typed));
+        }
+        assert!(
+            observed.iter().all(|(_, typed)| *typed),
+            "control waits lost capacity cause: {observed:?}"
+        );
+    }
 
+    #[tokio::test]
+    async fn cap_control_already_draining_is_terminal() {
+        let (mut inner, _session, _frames, _incoming) = make_receiver_inner_with_channels(4096);
+        let store = capped_recovery_store();
+        inner.link.unsettled = store.clone();
+        inner.link.flow_state.lock.write().drain = true;
+        let cause = exhaust_recovery_store(&store);
+        assert!(
+            matches!(inner.drain().await, Err(IllegalLinkStateError::UnsettledCapacityExceeded(error)) if error == cause)
+        );
+    }
+
+    #[tokio::test]
+    async fn cap_control_settlement_view_wait_returns_typed_termination() {
+        for already_ended in [false, true] {
+            let store = capped_recovery_store();
+            let mut view = ReceiverSettlementView {
+                changed: store.subscribe(),
+                unsettled: store.clone(),
+            };
+            if already_ended {
+                let cause = exhaust_recovery_store(&store);
+                let result = view.changed().await;
+                assert_view_capacity(result, &cause);
+            } else {
+                let mut waiting = Box::pin(view.changed());
+                assert!(futures_util::poll!(&mut waiting).is_pending());
+                let cause = exhaust_recovery_store(&store);
+                match futures_util::poll!(&mut waiting) {
+                    std::task::Poll::Ready(result) => assert_view_capacity(result, &cause),
+                    _ => panic!("settlement view did not wake"),
+                }
+            }
+            let cause = store.check().unwrap_err();
+            assert_view_capacity(view.check(), &cause);
+        }
+    }
+
+    fn assert_view_capacity<E: std::error::Error + 'static>(
+        result: Result<(), E>,
+        cause: &crate::link::UnsettledCapacityExceeded,
+    ) {
+        let error = result.expect_err("termination must not look like ordinary settlement");
+        match (&error as &dyn std::error::Error).downcast_ref::<LinkStateError>() {
+            Some(LinkStateError::UnsettledCapacityExceeded(error)) => assert_eq!(error, cause),
+            _ => panic!("settlement view lost native capacity cause: {error:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_control_detach_wait_returns_retained_cause() {
+        let (mut inner, _session, _frames, _incoming) = make_receiver_inner_with_channels(4096);
+        let store = capped_recovery_store();
+        inner.link.unsettled = store.clone();
+        let mut waiting = Box::pin(inner.detach_with_error(None));
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let cause = exhaust_recovery_store(&store);
+        assert!(
+            matches!(futures_util::poll!(&mut waiting), std::task::Poll::Ready(Err(DetachError::UnsettledCapacityExceeded(error))) if error == cause)
+        );
+    }
 }

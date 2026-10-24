@@ -866,10 +866,7 @@ impl endpoint::Session for Session {
                     }
 
                     let input_handle = InputHandle::from(attach.handle.clone()); // handle is just a wrapper around u32
-                    relay
-                        .send(LinkFrame::Attach(attach))
-                        .await
-                        .map_err(|_| SessionInnerError::UnattachedHandle)?;
+                    relay.send(LinkFrame::Attach(attach)).await?;
                     self.link_by_input_handle.insert(input_handle, relay);
 
                     Ok(())

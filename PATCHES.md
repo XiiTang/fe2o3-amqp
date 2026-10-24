@@ -1026,8 +1026,9 @@ Ok(Complete) (exit 101), and passes after (exit 0). For both roles,
 `cap_recovery_rejects_before_allocation_and_interrupts_allocation` covers resume
 and reattach, and `cap_recovery_interrupts_attach_queue_and_reply_waits` covers
 both queue admission and waiting for Attach. All nine cap wait/recovery tests
-pass (exit 0), on macOS arm64 / Rust 1.98.1. Their errors compare complete retained
-limits and proposed usage, including the empty-map probe.
+pass (exit 0), on macOS arm64 / Rust 1.98.1. The recovery-wait regressions compare
+complete retained limits and proposed usage; the empty-map probe requires the
+retained typed termination.
 
 ## W17c review same class: control, relay and settlement waits retain termination
 
@@ -1067,3 +1068,23 @@ Attach/Transfer/Detach forwarding. The native pending DeliveryFut regression
 continues to pass. Tests use explicit Pending/Ready checkpoints, not elapsed time.
 macOS arm64 / Rust 1.98.1. The full library and portable reruns are recorded in the
 final verification evidence. Boundless semantic integration remains with W4e/W17c.
+
+## W17c: keep terminal guards from growing the caller's recovery stack
+
+The first broad portable rerun on 6ad35fee failed with a native stack overflow
+in `a_paused_delivery_never_written_is_sent_again_whole_once`, before a test
+assertion. `Store::until_terminated` kept each guarded operation inline in its
+async state (unsettled_store.rs:128-150); nesting recovery, Attach, detach and
+control guards multiplied the caller's future layout and move stack.
+
+The same checkpoint now pins the operation on the heap synchronously before
+constructing its small guard future. This follows Tokio 1.53.3 task/spawn.rs:
+175-185's boxing of large futures, with no new task or semantic limit. Wake,
+retained-cause and native completion ownership are unchanged. It adds one fixed
+future allocation per guard, not a growing state queue or a deployment cap.
+
+The existing portable `detached_link_frames` target fails before (exit 101,
+SIGABRT from stack overflow) and passes all six tests after (exit 0), using the
+same test stack configuration. No test assertion or stack setting was changed.
+macOS arm64 / Rust 1.98.1. This is a regression of the new terminal guard;
+W4e's commits and detach routing remain unchanged.

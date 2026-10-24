@@ -138,23 +138,27 @@ impl<T> Store<T> {
     /// Keep a native wait tied to this owner's retained terminal cause.
     /// Subscribe before checking, and recheck when the operation completes so
     /// an input/queue closure cannot replace a concurrently published cap error.
-    pub async fn until_terminated<F>(
-        &self,
+    pub fn until_terminated<'a, F>(
+        &'a self,
         operation: F,
-    ) -> Result<F::Output, UnsettledCapacityExceeded>
+    ) -> impl std::future::Future<Output = Result<F::Output, UnsettledCapacityExceeded>> + 'a
     where
-        F: std::future::Future,
+        F: std::future::Future + 'a,
     {
-        let mut changed = self.subscribe();
-        tokio::pin!(operation);
-        loop {
-            self.check()?;
-            tokio::select! {
-                biased;
-                _ = changed.changed() => {},
-                value = &mut operation => {
-                    self.check()?;
-                    return Ok(value);
+        // Pin before constructing the guard future. Keeping the operation
+        // inline multiplies the stack size of nested recovery/control futures.
+        let mut operation = Box::pin(operation);
+        async move {
+            let mut changed = self.subscribe();
+            loop {
+                self.check()?;
+                tokio::select! {
+                    biased;
+                    _ = changed.changed() => {},
+                    value = &mut operation => {
+                        self.check()?;
+                        return Ok(value);
+                    }
                 }
             }
         }

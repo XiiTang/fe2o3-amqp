@@ -988,3 +988,20 @@ preceding branch (both waits remain Pending, exit 101), and passes here (exit 0)
 and resuming transfers. Both tests pass (2 tests, exit 0).
 `terminal_wait_wakes_and_retains_capacity_metadata` checks the single checkpoint's
 actual wake and exact retained metadata (1 test, exit 0). macOS arm64 / Rust 1.98.1.
+
+## W17c review F2: retain capacity termination for an already waiting receive
+
+On d494f0b6 receiver.rs:1167 waits only on its input. Exhaustion during that
+wait is later reported as generic SessionStopped(ResourceLimitExceeded), while
+a receive begun afterwards reports the Store's typed limits and usage.
+`recv_inner` now runs through `Store::until_terminated`; its private implementation
+contains every receive, partial-transfer, automatic disposition/flow and self-close
+await it can start. The closed-input fallback also checks the retained Store
+cause before deriving a generic session stop. W5-D1's stop-reason shape is untouched.
+
+`review_cap_exhaustion_preserves_typed_cause_for_already_waiting_receiver` fails
+before (exit 101), and passes after (exit 0). It now compares the exact retained
+metadata for waiting and subsequent receives. `cap_termination_wakes_receiver_before_input_closes`
+also requires the same result while the input sender remains alive. Both receiver
+tests and the two sender wait regressions pass (4 tests, exit 0), on macOS arm64 /
+Rust 1.98.1. All paths use the same Store checkpoint, with no copied terminal ledger.

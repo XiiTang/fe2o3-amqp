@@ -1652,8 +1652,8 @@ where
         O: ReceiverTransferObserver + ?Sized,
     {
         loop {
-            self.link.unsettled().check()?;
-            match self.recv_inner(ReceiveContext::Live, observer).await {
+            let unsettled = self.link.unsettled().clone();
+            match unsettled.until_terminated(self.recv_inner(ReceiveContext::Live, observer)).await? {
                 Ok(Some(delivery)) => return Ok(ReceiverReadStep::Delivery(delivery)),
                 Ok(None) => {}
                 Err(ReceiveFault::Error(error)) => return Err(error),
@@ -1821,6 +1821,9 @@ where
 
     /// Why the link's channel closed: its session or connection stopped.
     fn stopped(&self) -> RecvError {
+        if let Err(error) = self.link.unsettled().check() {
+            return LinkStateError::from(error).into();
+        }
         match self.link().session_stop_reason().get() {
             Some(reason) => {
                 RecvError::LinkStateError(LinkStateError::SessionStopped(reason.clone()))
@@ -5730,5 +5733,69 @@ mod tests {
         assert_eq!(budget.retained_bytes(), 20);
         drop(inner);
         assert_eq!(budget.retained_bytes(), 0);
+    }
+    #[tokio::test]
+    async fn review_cap_exhaustion_preserves_typed_cause_for_already_waiting_receiver() {
+        use crate::link::{unsettled_store::Store, UnsettledLimits};
+        let (mut inner, _session, _outgoing, incoming) = make_receiver_inner_with_channels(4096);
+        let store = Arc::new(Store::new(None, Some(UnsettledLimits::new(1, 32))).unwrap());
+        inner.link.unsettled = store.clone();
+        store
+            .insert(
+                vec![1].into(),
+                super::super::receiver_delivery::ReceiverDelivery::new(None),
+            )
+            .unwrap();
+        let stop = inner.link.session_stop_reason.clone();
+        let receive = inner.recv_inner::<String>();
+        let mut receive = Box::pin(receive);
+        assert!(futures_util::poll!(&mut receive).is_pending());
+        // Force the relay's insertion failure and its subsequent normal session end.
+        let cause = store
+            .insert(
+                vec![2].into(),
+                super::super::receiver_delivery::ReceiverDelivery::new(None),
+            )
+            .unwrap_err();
+        stop.set(SessionStopReason::EndedWithError(
+            fe2o3_amqp_types::definitions::Error::new(
+                fe2o3_amqp_types::definitions::AmqpError::ResourceLimitExceeded,
+                None,
+                None,
+            ),
+        ))
+        .unwrap();
+        drop(incoming);
+        let result = receive.await;
+        assert_recv_capacity(result.unwrap_err(), &cause);
+        assert_recv_capacity(inner.recv_inner::<String>().await.unwrap_err(), &cause);
+    }
+
+    #[tokio::test]
+    async fn cap_termination_wakes_receiver_before_input_closes() {
+        use crate::link::{
+            receiver_delivery::ReceiverDelivery, unsettled_store::Store, UnsettledLimits,
+        };
+        let (mut inner, _session, _outgoing, _incoming) = make_receiver_inner_with_channels(4096);
+        let store = Arc::new(Store::new(None, Some(UnsettledLimits::new(0, 32))).unwrap());
+        inner.link.unsettled = store.clone();
+        let mut waiting = Box::pin(inner.recv_inner::<String>());
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let cause = store
+            .insert(vec![1].into(), ReceiverDelivery::new(None))
+            .unwrap_err();
+        match futures_util::poll!(&mut waiting) {
+            std::task::Poll::Ready(Err(error)) => assert_recv_capacity(error, &cause),
+            result => panic!("receiver must observe exhaustion before input closes: {result:?}"),
+        }
+    }
+
+    fn assert_recv_capacity(error: RecvError, expected: &crate::link::UnsettledCapacityExceeded) {
+        match error {
+            RecvError::LinkStateError(LinkStateError::UnsettledCapacityExceeded(cause)) => {
+                assert_eq!(&cause, expected)
+            }
+            error => panic!("receiver lost the retained capacity metadata: {error:?}"),
+        }
     }
 }

@@ -795,3 +795,30 @@ cargo fmt --all --check
 Only this validation note changed after those checks. The consuming change
 records its independent Artemis and Boundless checks; no local lock, temporary
 diagnostic or dependency override is committed.
+## W4e: retain allocation answers after cancellation
+
+At 44afcb79, connection/engine.rs:418-422 and session/engine.rs:337-346
+turn an abandoned allocation reply into an engine error. The local-link
+allocator at :323-333 releases an allocation only if send itself fails; a
+successful but unread reply can still lose its slot. Both races belong to
+one native reply checkpoint, `completion::{Sender,Receiver}`. Its disposition
+is installed before handoff, and receiver Drop closes then takes, following
+Tokio oneshot's close/try_recv ownership ordering (Tokio 1.52.3,
+src/sync/oneshot.rs:947,1171,1246). No callback runs under a channel lock.
+
+`CompletionSink<T>::scope(operation)` supplies a per-operation sink before
+polling. Allocation sinks receive `Result<u16, AllocSessionError>` or
+`Result<u32, AllocLinkError>`. Engines also retire untaken local allocations;
+retirement is bounded by the allocated population, wakes the engine, and is
+drained before another allocation can reuse a slot. Incoming-link retirement
+also removes that attachment's input relay. Cancellation never ends siblings.
+
+Regressions: `late_session_allocation_retires_without_ending_connection`,
+`abandoned_allocation_answers_reach_sink_and_release_both_roles`, and
+`completion::tests` cover both handoff orders, normal consumption, and concurrent
+send/drop. Restoring original native oneshot disposition behavior (no handoff
+on failed send or unread receiver Drop) fails the allocation tests (exit 101).
+With the patch the all-feature library suite passes (150 tests, exit 0), on
+macOS arm64 / Rust 1.97.0. The fork's existing untracked Cargo.lock is used;
+a fresh resolution upgrades tokio-util and fails untouched transport sink
+type inference, outside this patch.

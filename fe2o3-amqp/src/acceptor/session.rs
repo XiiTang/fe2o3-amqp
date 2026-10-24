@@ -8,7 +8,7 @@ use fe2o3_amqp_types::{
     performatives::{Attach, Begin, Detach, Disposition, End, Flow, Transfer},
     states::SessionState,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -68,7 +68,13 @@ pub(crate) async fn allocate_incoming_link(
     input_handle: InputHandle,
     session_stop_reason: &Arc<OnceLock<SessionStopReason>>,
 ) -> Result<OutputAttachment, AllocLinkError> {
-    let (responder, resp_rx) = oneshot::channel();
+    let sink =
+        crate::completion::CompletionSink::<Result<u32, AllocLinkError>>::current().map(|sink| {
+            sink.map_input(|result: Result<OutputAttachment, AllocLinkError>| {
+                result.map(|attachment| attachment.handle.0)
+            })
+        });
+    let (responder, resp_rx) = crate::completion::channel_with(sink);
 
     let reason = || match session_stop_reason.get() {
         Some(reason) => reason.clone(),
@@ -376,6 +382,7 @@ where
             control,
             incoming,
             outgoing,
+            retired_allocations: Default::default(),
             outgoing_link_frames,
         };
 

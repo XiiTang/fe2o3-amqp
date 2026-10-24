@@ -27,7 +27,7 @@ pub(crate) enum ConnectionControl {
     Close(Option<definitions::Error>),
     AllocateSession {
         tx: Sender<SessionIncomingItem>,
-        responder: oneshot::Sender<Result<OutgoingChannel, AllocSessionError>>,
+        responder: crate::completion::Sender<Result<OutgoingChannel, AllocSessionError>>,
     },
     DeallocateSession(OutgoingChannel),
 }
@@ -51,13 +51,13 @@ pub(crate) enum SessionControl {
     AllocateLink {
         link_name: String,
         link_relay: LinkRelay<()>,
-        responder: oneshot::Sender<Result<OutputAttachment, AllocLinkError>>,
+        responder: crate::completion::Sender<Result<OutputAttachment, AllocLinkError>>,
     },
     AllocateIncomingLink {
         link_name: String,
         link_relay: LinkRelay<()>,
         input_handle: InputHandle,
-        responder: oneshot::Sender<Result<OutputAttachment, AllocLinkError>>,
+        responder: crate::completion::Sender<Result<OutputAttachment, AllocLinkError>>,
     },
     DeallocateLink(OutputAttachment),
     Disposition(Disposition),

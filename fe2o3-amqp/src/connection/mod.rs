@@ -14,10 +14,7 @@ use fe2o3_amqp_types::{
 use futures_util::{Sink, SinkExt};
 use slab::Slab;
 use tokio::{
-    sync::{
-        mpsc::Sender,
-        oneshot::{self, error::TryRecvError},
-    },
+    sync::{mpsc::Sender, oneshot::error::TryRecvError},
     task::JoinHandle,
 };
 
@@ -265,7 +262,13 @@ impl<R> ConnectionHandle<R> {
         &mut self,
         tx: Sender<SessionIncomingItem>,
     ) -> Result<OutgoingChannel, AllocSessionError> {
-        let (responder, resp_rx) = oneshot::channel();
+        let sink = crate::completion::CompletionSink::<Result<u16, AllocSessionError>>::current()
+            .map(|sink| {
+                sink.map_input(|result: Result<OutgoingChannel, AllocSessionError>| {
+                    result.map(|channel| channel.0)
+                })
+            });
+        let (responder, resp_rx) = crate::completion::channel_with(sink);
         self.control
             .send(ConnectionControl::AllocateSession { tx, responder })
             .await

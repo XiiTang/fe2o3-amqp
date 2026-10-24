@@ -1,12 +1,9 @@
 use crate::util::engine_outcome::{EngineOutcome, EngineOutcomeSender};
-use std::sync::{Arc, OnceLock};
-#[cfg(test)]
-use tokio::sync::oneshot;
-
 use fe2o3_amqp_types::{
     definitions::{self, AmqpError, SessionError},
     performatives::End,
 };
+use std::sync::{Arc, OnceLock};
 use tokio::{sync::mpsc, task::JoinHandle};
 
 use crate::{
@@ -69,6 +66,7 @@ pub(crate) struct SessionEngine<S: Session> {
     pub incoming: mpsc::Receiver<SessionIncomingItem>,
     pub outgoing: mpsc::Sender<SessionFrame>,
 
+    pub(crate) retired_allocations: crate::completion::Retired<crate::endpoint::OutputAttachment>,
     pub outgoing_link_frames: mpsc::Receiver<LinkFrame>,
 }
 
@@ -91,6 +89,7 @@ where
             control,
             incoming,
             outgoing,
+            retired_allocations: Default::default(),
             outgoing_link_frames,
         };
 
@@ -309,6 +308,9 @@ where
         tracing::trace!("control: {}", control);
         #[cfg(feature = "log")]
         log::trace!("control: {}", control);
+        for attachment in self.retired_allocations.take() {
+            self.session.deallocate_link(&attachment);
+        }
         match control {
             SessionControl::End(error) => {
                 // Record the stop reason before the link channel is closed, so
@@ -331,8 +333,14 @@ where
                 responder,
             } => {
                 let result = self.session.allocate_link(link_name, Some(link_relay));
-                if let Err(Ok(attachment)) = responder.send(result.map_err(Into::into)) {
-                    // Cancelling a local allocator must not end sibling links.
+                let retired = self.retired_allocations.clone();
+                responder.on_untaken(move |result| {
+                    if let Ok(attachment) = result {
+                        retired.push(attachment.clone());
+                    }
+                });
+                let _ = responder.send(result.map_err(Into::into));
+                for attachment in self.retired_allocations.take() {
                     self.session.deallocate_link(&attachment);
                 }
             }
@@ -345,10 +353,16 @@ where
                 let result =
                     self.session
                         .allocate_incoming_link(link_name, link_relay, input_handle);
-                responder
-                    .send(result.map_err(Into::into))
-                    // The receiving end (ie. link) must have been stopped
-                    .map_err(|_| SessionInnerError::UnattachedHandle)?;
+                let retired = self.retired_allocations.clone();
+                responder.on_untaken(move |result| {
+                    if let Ok(attachment) = result {
+                        retired.push(attachment.clone());
+                    }
+                });
+                let _ = responder.send(result.map_err(Into::into));
+                for attachment in self.retired_allocations.take() {
+                    self.session.deallocate_link(&attachment);
+                }
             }
             SessionControl::DeallocateLink(attachment) => {
                 self.session.deallocate_link(&attachment);
@@ -627,6 +641,12 @@ where
         let receive_window = self.session.receive_window().clone();
         loop {
             let result = tokio::select! {
+                _ = self.retired_allocations.ready() => {
+                    for attachment in self.retired_allocations.take() {
+                        self.session.deallocate_link(&attachment);
+                    }
+                    Ok(Running::Continue)
+                },
                 _ = receive_window.changed.notified() => {
                     if let Some(item) = self.session.maybe_outgoing_session_flow() {
                         send_outgoing_item(&self.outgoing, item, self.session.connection_stop_reason()).await.map(|_| Running::Continue)
@@ -795,6 +815,7 @@ mod allocation_cancel_tests {
             control,
             incoming,
             outgoing,
+            retired_allocations: Default::default(),
             outgoing_link_frames,
             session: Builder::new().into_session(
                 OutgoingChannel(0),
@@ -827,7 +848,7 @@ mod allocation_cancel_tests {
     async fn cancelled_allocator_releases_handle_without_ending_session() {
         let mut engine = engine();
         let (link_relay, _inbox) = relay();
-        let (responder, waiter) = oneshot::channel();
+        let (responder, waiter) = crate::completion::channel();
         drop(waiter);
         engine
             .on_control(SessionControl::AllocateLink {
@@ -842,10 +863,66 @@ mod allocation_cancel_tests {
         assert!(matches!(engine.session.local_state, SessionState::Mapped));
     }
     #[tokio::test]
+    async fn abandoned_allocation_answers_reach_sink_and_release_both_roles() {
+        for incoming in [false, true] {
+            for sent_first in [false, true] {
+                let mut engine = engine();
+                let (link_relay, _inbox) = relay();
+                let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let output = seen.clone();
+                let sink = crate::completion::CompletionSink::new(
+                    move |result: Result<crate::endpoint::OutputAttachment, AllocLinkError>| {
+                        output.lock().push(result.unwrap().handle.0);
+                    },
+                );
+                let (responder, waiter) = crate::completion::channel_with(Some(sink));
+                let waiter = if sent_first {
+                    Some(waiter)
+                } else {
+                    drop(waiter);
+                    None
+                };
+                let control = if incoming {
+                    SessionControl::AllocateIncomingLink {
+                        link_name: "late".into(),
+                        link_relay,
+                        input_handle: crate::endpoint::InputHandle(0),
+                        responder,
+                    }
+                } else {
+                    SessionControl::AllocateLink {
+                        link_name: "late".into(),
+                        link_relay,
+                        responder,
+                    }
+                };
+                engine.on_control(control).await.unwrap();
+                drop(waiter);
+                assert_eq!(*seen.lock(), [0]);
+                // Any next control drains retirement before allocating a sibling.
+                let (link_relay, _sibling) = relay();
+                let (responder, reply) = crate::completion::channel();
+                engine
+                    .on_control(SessionControl::AllocateLink {
+                        link_name: "sibling".into(),
+                        link_relay,
+                        responder,
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(reply.await.unwrap().unwrap().handle.0, 0);
+                assert_eq!(engine.session.link_name_by_output_handle.len(), 1);
+                assert!(engine.session.link_by_input_handle.is_empty());
+                assert!(matches!(engine.session.local_state, SessionState::Mapped));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn cancelled_unattached_endpoint_allows_same_name_reuse() {
         let mut engine = engine();
         let (link_relay, inbox) = relay();
-        let (responder, waiter) = oneshot::channel();
+        let (responder, waiter) = crate::completion::channel();
         engine
             .on_control(SessionControl::AllocateLink {
                 link_name: "reuse".into(),
@@ -857,7 +934,7 @@ mod allocation_cancel_tests {
         waiter.await.unwrap().unwrap();
         drop(inbox);
         let (link_relay, _inbox) = relay();
-        let (responder, waiter) = oneshot::channel();
+        let (responder, waiter) = crate::completion::channel();
         engine
             .on_control(SessionControl::AllocateLink {
                 link_name: "reuse".into(),
@@ -935,6 +1012,7 @@ mod detached_attachment_tests {
                 control,
                 incoming,
                 outgoing,
+                retired_allocations: Default::default(),
                 outgoing_link_frames,
                 session,
             },

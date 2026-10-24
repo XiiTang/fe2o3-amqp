@@ -35,6 +35,7 @@ pub(crate) struct ConnectionEngine<Io, C> {
     outgoing_session_frames: Receiver<SessionFrame>,
     heartbeat: HeartBeat,
     write_pending: bool,
+    retired_allocations: crate::completion::Retired<OutgoingChannel>,
 }
 
 impl<Io, C> ConnectionEngine<Io, C>
@@ -259,6 +260,7 @@ where
             outgoing_session_frames,
             heartbeat: HeartBeat::never(),
             write_pending: false,
+            retired_allocations: Default::default(),
         };
 
         match engine.open_inner().await {
@@ -411,6 +413,9 @@ where
         tracing::debug!("{}", control);
         #[cfg(feature = "log")]
         log::debug!("{}", control);
+        for channel in self.retired_allocations.take() {
+            self.connection.deallocate_session(channel);
+        }
         match control {
             ConnectionControl::Close(error) => {
                 // Record a locally initiated close with an error before the
@@ -432,9 +437,16 @@ where
             }
             ConnectionControl::AllocateSession { tx, responder } => {
                 let result = self.connection.allocate_session(tx).map_err(Into::into);
-                responder
-                    .send(result)
-                    .map_err(|_| ConnectionInnerError::IllegalState)?;
+                let retired = self.retired_allocations.clone();
+                responder.on_untaken(move |result| {
+                    if let Ok(channel) = result {
+                        retired.push(*channel);
+                    }
+                });
+                let _ = responder.send(result);
+                for channel in self.retired_allocations.take() {
+                    self.connection.deallocate_session(channel);
+                }
             }
             ConnectionControl::DeallocateSession(session_id) => {
                 self.connection.deallocate_session(session_id)
@@ -554,6 +566,12 @@ where
         let mut outcome = Ok(());
         loop {
             let result = tokio::select! {
+                _ = self.retired_allocations.ready() => {
+                    for channel in self.retired_allocations.take() {
+                        self.connection.deallocate_session(channel);
+                    }
+                    Ok(Running::Continue)
+                },
                 _ = self.heartbeat.next(), if !self.write_pending => self.on_heartbeat().await,
                 progress = self.transport.next_event(self.write_pending) => {
                     let incoming = match progress {
@@ -761,6 +779,7 @@ mod incoming_tests {
             outgoing_session_frames: outgoing,
             heartbeat: HeartBeat::never(),
             write_pending: false,
+            retired_allocations: Default::default(),
         };
         assert!(matches!(
             engine.on_incoming(refused()).await.unwrap(),
@@ -843,6 +862,7 @@ mod incoming_tests {
                 outgoing_session_frames: outgoing,
                 heartbeat: HeartBeat::never(),
                 write_pending: false,
+            retired_allocations: Default::default(),
             };
             assert!(matches!(
                 engine
@@ -954,6 +974,78 @@ mod incoming_tests {
                     matches!(result, Err(ConnectionInnerError::RemoteClosedWithError(actual)) if actual == expected)
                 ),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod allocation_completion_tests {
+    use super::*;
+    use crate::connection::Connection;
+    use fe2o3_amqp_types::performatives::Open;
+    use tokio::sync::mpsc;
+    #[tokio::test]
+    async fn late_session_allocation_retires_without_ending_connection() {
+        for sent_first in [false, true] {
+            let (io, _peer) = tokio::io::duplex(4096);
+            let (_, control) = mpsc::channel(1);
+            let (_, outgoing_session_frames) = mpsc::channel(1);
+            let mut engine = ConnectionEngine {
+                connection: Connection::new(
+                    ConnectionState::Opened,
+                    Open {
+                        container_id: "test".into(),
+                        hostname: None,
+                        max_frame_size: Default::default(),
+                        channel_max: Default::default(),
+                        idle_time_out: None,
+                        outgoing_locales: None,
+                        incoming_locales: None,
+                        offered_capabilities: None,
+                        desired_capabilities: None,
+                        properties: None,
+                    },
+                ),
+                transport: Transport::bind(io, 512, None),
+                control,
+                outgoing_session_frames,
+                heartbeat: HeartBeat::never(),
+                write_pending: false,
+                retired_allocations: Default::default(),
+            };
+            let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let output = seen.clone();
+            let (responder, waiter) =
+                crate::completion::channel_with(Some(crate::completion::CompletionSink::new(
+                    move |result: Result<OutgoingChannel, AllocSessionError>| {
+                        output.lock().push(result.unwrap().0)
+                    },
+                )));
+            let waiter = if sent_first {
+                Some(waiter)
+            } else {
+                drop(waiter);
+                None
+            };
+            let (tx, _incoming) = mpsc::channel(1);
+            engine
+                .on_control(ConnectionControl::AllocateSession { tx, responder })
+                .await
+                .unwrap();
+            drop(waiter);
+            assert_eq!(*seen.lock(), [0]);
+            let (tx, _incoming) = mpsc::channel(1);
+            let (responder, reply) = crate::completion::channel();
+            engine
+                .on_control(ConnectionControl::AllocateSession { tx, responder })
+                .await
+                .unwrap();
+            assert_eq!(reply.await.unwrap().unwrap().0, 0);
+            assert_eq!(engine.connection.session_by_outgoing_channel.len(), 1);
+            assert!(matches!(
+                engine.connection.local_state,
+                ConnectionState::Opened
+            ));
         }
     }
 }

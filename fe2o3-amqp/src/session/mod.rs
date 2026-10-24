@@ -287,7 +287,13 @@ pub(crate) async fn allocate_link(
     link_relay: LinkRelay<()>,
     session_stop_reason: &Arc<OnceLock<SessionStopReason>>,
 ) -> Result<OutputAttachment, AllocLinkError> {
-    let (responder, resp_rx) = oneshot::channel();
+    let sink =
+        crate::completion::CompletionSink::<Result<u32, AllocLinkError>>::current().map(|sink| {
+            sink.map_input(|result: Result<OutputAttachment, AllocLinkError>| {
+                result.map(|attachment| attachment.handle.0)
+            })
+        });
+    let (responder, resp_rx) = crate::completion::channel_with(sink);
 
     let reason = || match session_stop_reason.get() {
         Some(reason) => reason.clone(),
@@ -809,6 +815,11 @@ impl endpoint::Session for Session {
             .link_name_by_output_handle
             .remove(attachment.handle.0 as usize);
         let _ = self.link_by_name.remove(&name);
+        self.link_by_input_handle.retain(|_, relay| match relay {
+            LinkRelay::Sender { output_handle, .. } | LinkRelay::Receiver { output_handle, .. } => {
+                output_handle.id != attachment.id
+            }
+        });
         self.remote_incoming_window_exhausted_buffer
             .retain(|(_, id, ..)| *id != attachment.id);
         true

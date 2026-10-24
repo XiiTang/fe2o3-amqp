@@ -217,6 +217,7 @@
 #[macro_use]
 mod macros;
 
+pub mod completion;
 pub(crate) mod control;
 pub(crate) mod endpoint;
 pub(crate) mod util;

@@ -136,6 +136,42 @@ fn dispose<T>(disposition: &Disposition<T>, value: T) -> Result<(), T> {
     }
 }
 impl<T> Receiver<T> {
+    pub(crate) fn close_and_take(&mut self) {
+        self.inner.close();
+        if let Ok(value) = self.inner.try_recv() {
+            self.dispose(value);
+        }
+    }
+    pub(crate) fn has_sink(&self) -> bool {
+        self.disposition.lock().is_some()
+    }
+    pub(crate) async fn recv(&mut self) -> Result<T, oneshot::error::RecvError>
+    where
+        T: 'static,
+    {
+        if let Some(sink) = CompletionSink::current() {
+            self.set_sink(sink);
+        }
+        struct Waiting<'a, T> {
+            receiver: &'a mut Receiver<T>,
+            armed: bool,
+        }
+        impl<T> Drop for Waiting<'_, T> {
+            fn drop(&mut self) {
+                if self.armed {
+                    self.receiver.close_and_take();
+                }
+            }
+        }
+        let armed = self.has_sink();
+        let mut waiting = Waiting {
+            receiver: self,
+            armed,
+        };
+        let result = (&mut *waiting.receiver).await;
+        waiting.armed = false;
+        result
+    }
     pub(crate) fn try_recv(&mut self) -> Result<T, oneshot::error::TryRecvError> {
         self.inner.try_recv()
     }

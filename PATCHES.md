@@ -856,3 +856,23 @@ transaction session's three controls in both handoff orders, checks exactly one
 native answer and verifies the session remains mapped. Restoring original
 failed-send ownership at the shared native checkpoint makes it fail (exit 101).
 The regression passes with the patch (exit 0), on macOS arm64 / Rust 1.97.0.
+
+## W4e: preserve engine answers at the last native handoff
+
+At 44afcb79, util/engine_outcome.rs:16-32 ignores a failed terminal-result
+send, and its private receiver/buffer can drop an unread answer. The same
+completion channel now owns engine dispositions, including the result retained
+by `probe` while `stop_and_join` awaits the task. A scoped sink installed around
+an engine wait is captured before its await; cancelling that waiter closes then
+takes, and a result completed later goes to the sink. Without a supplied sink,
+the existing retained stop/join behavior stays. The atomic natural-end versus
+owner-stop arbitration and stop reasons are unchanged (W5-D1 is separate).
+
+The two `engine_outcome::completion_tests` cover sender-first, receiver-first,
+probed-buffer drop, and cancelling a borrowed engine wait before its result.
+Restoring the preceding raw oneshot handoff fails both regressions (exit 101).
+All 154 all-feature library tests pass, including the existing local-stop race,
+panic and repeated-stop tests (exit 0), on macOS arm64 / Rust 1.97.0.
+Production/integration compilation also keeps the session engine's protocol-type
+imports unconditional after retiring its test-only oneshot import; otherwise
+unit-test-only compilation masks the missing production imports.

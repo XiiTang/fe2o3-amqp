@@ -1005,3 +1005,26 @@ metadata for waiting and subsequent receives. `cap_termination_wakes_receiver_be
 also requires the same result while the input sender remains alive. Both receiver
 tests and the two sender wait regressions pass (4 tests, exit 0), on macOS arm64 /
 Rust 1.98.1. All paths use the same Store checkpoint, with no copied terminal ledger.
+
+## W17c review F3: reject recovery of a terminal unsettled owner
+
+On d494f0b6 sender_link.rs:770-781 treats a cap-cleared Store and empty peer
+map as Complete. sender.rs:1094 then reports successful recovery. Sender and
+receiver allocation, Attach admission and Attach-reply waits could also cross a
+new terminal transition and lose its cause.
+
+Both role Attach handlers check the retained Store before reconciliation.
+Both role send/exchange Attach methods, resume operations, and the shared
+reallocation/reattach helpers use `Store::until_terminated`. The private endpoint
+trait ties its unsettled associated type to that Store, so generic recovery
+cannot bypass the same checkpoint. Recovery on another session checks termination
+before altering the endpoint; sender resend also checks before an empty-map return.
+No allocator request or Attach is emitted for an already exhausted owner.
+
+`review_cap_exhaustion_cannot_resume_sender_as_complete` fails before with
+Ok(Complete) (exit 101), and passes after (exit 0). For both roles,
+`cap_recovery_rejects_before_allocation_and_interrupts_allocation` covers resume
+and reattach, and `cap_recovery_interrupts_attach_queue_and_reply_waits` covers
+both queue admission and waiting for Attach. All nine cap wait/recovery tests
+pass (exit 0), on macOS arm64 / Rust 1.98.1. Their errors compare complete retained
+limits and proposed usage, including the empty-map probe.

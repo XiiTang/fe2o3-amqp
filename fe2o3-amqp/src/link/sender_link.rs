@@ -507,6 +507,7 @@ where
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
     {
+        self.unsettled.check()?;
         let Some((payload, message_format)) = self.unsettled.read().as_ref().and_then(|map| {
             let local = map.get(&delivery_tag)?;
             Some((local.payload.clone(), local.message_format))
@@ -957,6 +958,7 @@ where
         &mut self,
         attach: Attach,
     ) -> Result<Self::AttachExchange, Self::AttachError> {
+        self.unsettled.check()?;
         self.accept_attach(attach, AttachPurpose::Ordinary)
     }
 
@@ -972,9 +974,11 @@ where
         writer: &crate::session::transfer_queue::Sender,
         is_reattaching: bool,
     ) -> Result<(), Self::AttachError> {
-        self.send_attach_inner(writer, is_reattaching, &AttachPurpose::Ordinary)
-            .await?;
-        Ok(())
+        let unsettled = self.unsettled.clone();
+        unsettled.until_terminated(async {
+            self.send_attach_inner(writer, is_reattaching, &AttachPurpose::Ordinary).await?;
+            Ok(())
+        }).await?
     }
 }
 
@@ -998,6 +1002,8 @@ where
         + Sync,
 {
     type FlowState = SenderFlowState;
+    type UnsettledEntry = UnsettledMessage;
+    type UnsettledEntry = UnsettledMessage;
     type Unsettled = ArcSenderUnsettledMap;
     type Target = T;
 
@@ -1058,8 +1064,8 @@ where
         reader: &mut mpsc::Receiver<LinkFrame>,
         is_reattaching: bool,
     ) -> Result<Self::AttachExchange, Self::AttachError> {
-        self.exchange_attach_inner(writer, reader, is_reattaching, AttachPurpose::Ordinary)
-            .await
+        let unsettled = self.unsettled.clone();
+        unsettled.until_terminated(self.exchange_attach_inner(writer, reader, is_reattaching, AttachPurpose::Ordinary)).await?
     }
 
     async fn exchange_attach_for_close(

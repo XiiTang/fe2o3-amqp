@@ -560,6 +560,7 @@ where
         &mut self,
         attach: Attach,
     ) -> Result<Self::AttachExchange, Self::AttachError> {
+        self.unsettled.check()?;
         self.accept_attach(attach, AttachPurpose::Ordinary)
     }
 
@@ -580,9 +581,11 @@ where
         writer: &crate::session::transfer_queue::Sender,
         is_reattaching: bool,
     ) -> Result<(), Self::AttachError> {
-        self.send_attach_inner(writer, is_reattaching, &AttachPurpose::Ordinary)
-            .await?;
-        Ok(())
+        let unsettled = self.unsettled.clone();
+        unsettled.until_terminated(async {
+            self.send_attach_inner(writer, is_reattaching, &AttachPurpose::Ordinary).await?;
+            Ok(())
+        }).await?
     }
 }
 
@@ -606,6 +609,7 @@ where
         + Sync,
 {
     type FlowState = ReceiverFlowState;
+    type UnsettledEntry = receiver_delivery::ReceiverDelivery;
     type Unsettled = ArcReceiverUnsettledMap;
     type Target = T;
 
@@ -670,8 +674,8 @@ where
         reader: &mut mpsc::Receiver<LinkFrame>,
         is_reattaching: bool,
     ) -> Result<Self::AttachExchange, Self::AttachError> {
-        self.exchange_attach_inner(writer, reader, is_reattaching, AttachPurpose::Ordinary)
-            .await
+        let unsettled = self.unsettled.clone();
+        unsettled.until_terminated(self.exchange_attach_inner(writer, reader, is_reattaching, AttachPurpose::Ordinary)).await?
     }
 
     async fn exchange_attach_for_close(
@@ -919,17 +923,17 @@ where
         self.send_attach_inner(writer, is_reattaching, &purpose)
             .await?;
 
-        // Wait for remote attach
-        let remote_attach = match reader
-            .recv()
-            .await // cancel safe
-            .ok_or_else(|| match self.session_stop_reason.get() {
-                Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
-                None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-            })? {
-            LinkFrame::Attach(attach) => attach,
-            _ => return Err(ReceiverAttachError::NonAttachFrameReceived),
-        };
+                // Wait for remote attach
+                let remote_attach = match reader
+                    .recv()
+                    .await // cancel safe
+                    .ok_or_else(|| match self.session_stop_reason.get() {
+                        Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
+                        None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                    })? {
+                    LinkFrame::Attach(attach) => attach,
+                    _ => return Err(ReceiverAttachError::NonAttachFrameReceived),
+                };
 
         match purpose {
             AttachPurpose::Ordinary => {

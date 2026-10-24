@@ -1126,41 +1126,47 @@ impl SenderInner<SenderLink<Target>> {
         mut initial_remote_attach: Option<Attach>,
         is_reattaching: bool,
     ) -> Result<(), SenderResumeErrorKind> {
-        self.reallocate_output_handle().await?;
-        let mut resend = Vec::new();
+        let unsettled = self.link.unsettled.clone();
+        unsettled
+            .until_terminated(async {
+                self.reallocate_output_handle().await?;
+                let mut resend = Vec::new();
 
-        loop {
-            let attach_exchange = match initial_remote_attach.take() {
-                Some(remote_attach) => {
-                    self.link
-                        .send_attach(&self.outgoing, is_reattaching)
-                        .await?;
-                    self.link.on_incoming_attach(remote_attach)?
+                loop {
+                    let attach_exchange = match initial_remote_attach.take() {
+                        Some(remote_attach) => {
+                            self.link
+                                .send_attach(&self.outgoing, is_reattaching)
+                                .await?;
+                            self.link.on_incoming_attach(remote_attach)?
+                        }
+                        None => self.exchange_attach(is_reattaching).await?,
+                    };
+
+                    match attach_exchange {
+                        SenderAttachExchange::Complete => break,
+                        SenderAttachExchange::IncompleteUnsettled(resuming_deliveries) => {
+                            self.resume_deliveries(resuming_deliveries, &mut resend, false)
+                                .await?;
+                        }
+                        SenderAttachExchange::Resume(resuming_deliveries) => {
+                            // Resend buffered payloads last
+                            self.resume_deliveries(resuming_deliveries, &mut resend, true)
+                                .await?;
+
+                            // Upon completion of this reduction of state, the two parties MUST suspend and
+                            // re-attempt to resume the link. The detach consumes the output handle,
+                            // so reallocate it for the retry.
+                            self.detach_with_error(None).await?;
+                            self.reallocate_output_handle().await?;
+                        }
+                    }
                 }
-                None => self.exchange_attach(is_reattaching).await?,
-            };
 
-            match attach_exchange {
-                SenderAttachExchange::Complete => break,
-                SenderAttachExchange::IncompleteUnsettled(resuming_deliveries) => {
-                    self.resume_deliveries(resuming_deliveries, &mut resend, false)
-                        .await?;
-                }
-                SenderAttachExchange::Resume(resuming_deliveries) => {
-                    // Resend buffered payloads last
-                    self.resume_deliveries(resuming_deliveries, &mut resend, true)
-                        .await?;
-
-                    // Upon completion of this reduction of state, the two parties MUST suspend and
-                    // re-attempt to resume the link. The detach consumes the output handle,
-                    // so reallocate it for the retry.
-                    self.detach_with_error(None).await?;
-                    self.reallocate_output_handle().await?;
-                }
-            }
-        }
-
-        Ok(())
+                Ok(())
+            })
+            .await
+            .map_err(SenderAttachError::from)?
     }
 }
 
@@ -1203,6 +1209,12 @@ impl DetachedSender {
         session: &SessionHandle<R>,
         interrupt: impl std::future::Future<Output = ()>,
     ) -> Result<Sender, SenderResumeError> {
+        if let Err(error) = self.inner.link.unsettled.check() {
+            return Err(SenderResumeError {
+                detached_sender: self,
+                kind: SenderAttachError::from(error).into(),
+            });
+        }
         if self.inner.link.session_stop_reason.get().is_some() {
             self = match (Sender { inner: *self.inner }).into_detached() {
                 Ok(endpoint) => endpoint,
@@ -2853,4 +2865,128 @@ mod tests {
             _ => panic!("fragment/resume handoff must return retained capacity cause"),
         }
     }
+    #[test]
+    fn review_cap_exhaustion_cannot_resume_sender_as_complete() {
+        use crate::link::{unsettled_store::Store, UnsettledLimits};
+        let mut inner = credited_sender(4096);
+        inner.link.unsettled =
+            Arc::new(Store::new(None, Some(UnsettledLimits::new(0, 0))).unwrap());
+        let store = inner.link.unsettled.clone();
+        let (tx, _rx) = crate::completion::channel();
+        let message =
+            super::super::delivery::UnsettledMessage::new(Payload::from_static(b"m"), None, 0, tx);
+        assert!(store.register(vec![1].into(), message).is_err());
+        inner.link.local_state = LinkState::AttachSent;
+        let result = inner.link.on_incoming_attach(peer_receiver_attach());
+        assert!(
+            matches!(result, Err(SenderAttachError::UnsettledCapacityExceeded(_))),
+            "sender Attach/recovery must retain its terminal cap cause: {result:?}"
+        );
+    }
+
+    fn capped_recovery_store() -> Arc<super::super::unsettled_store::Store<UnsettledMessage>> {
+        let store = Arc::new(
+            super::super::unsettled_store::Store::new(
+                None,
+                Some(crate::link::UnsettledLimits::new(1, 4096)),
+            )
+            .unwrap(),
+        );
+        let (tx, _outcome) = crate::completion::channel();
+        store
+            .register(
+                vec![1].into(),
+                UnsettledMessage::new(Payload::from_static(b"m"), None, 0, tx),
+            )
+            .unwrap();
+        store
+    }
+
+    fn exhaust_recovery_store(
+        store: &super::super::unsettled_store::Store<UnsettledMessage>,
+    ) -> crate::link::UnsettledCapacityExceeded {
+        let state = fe2o3_amqp_types::messaging::Rejected {
+            error: Some(fe2o3_amqp_types::definitions::Error::new(
+                fe2o3_amqp_types::definitions::AmqpError::InternalError,
+                Some("x".repeat(8192)),
+                None,
+            )),
+        };
+        store
+            .set_state(&vec![1].into(), Some(state.into()))
+            .unwrap_err()
+    }
+
+    #[tokio::test]
+    async fn cap_recovery_rejects_before_allocation_and_interrupts_allocation() {
+        for reattach in [false, true] {
+            for already_ended in [false, true] {
+                let (mut inner, mut session, _outgoing, _incoming) =
+                    make_sender_inner_with_channels(4096);
+                let store = capped_recovery_store();
+                inner.link.unsettled = store.clone();
+                inner.link.local_state = LinkState::Detached;
+                if already_ended {
+                    let cause = exhaust_recovery_store(&store);
+                    let result = inner.resume_incoming_attach(None, reattach).await;
+                    match result {
+                        Err(SenderResumeErrorKind::AttachError(
+                            SenderAttachError::UnsettledCapacityExceeded(error),
+                        )) => assert_eq!(error, cause),
+                        result => {
+                            panic!("terminal owner must reject before allocation: {result:?}")
+                        }
+                    }
+                    assert!(matches!(
+                        session.try_recv(),
+                        Err(mpsc::error::TryRecvError::Empty)
+                    ));
+                } else {
+                    let mut waiting = Box::pin(inner.resume_incoming_attach(None, reattach));
+                    assert!(futures_util::poll!(&mut waiting).is_pending());
+                    let _request = session.try_recv().expect("native allocation request");
+                    let cause = exhaust_recovery_store(&store);
+                    match futures_util::poll!(&mut waiting) {
+                        std::task::Poll::Ready(Err(SenderResumeErrorKind::AttachError(
+                            SenderAttachError::UnsettledCapacityExceeded(error),
+                        ))) => assert_eq!(error, cause),
+                        result => panic!(
+                            "allocation wait must return retained capacity cause: {result:?}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cap_recovery_interrupts_attach_queue_and_reply_waits() {
+        for queue_full in [false, true] {
+            let (mut inner, _session, _original_frames, _incoming) =
+                make_sender_inner_with_channels(4096);
+            let store = capped_recovery_store();
+            inner.link.unsettled = store.clone();
+            inner.link.local_state = LinkState::Detached;
+            let (tx, _frames) = mpsc::channel(1);
+            if queue_full {
+                tx.try_send(LinkFrame::Attach(peer_receiver_attach()))
+                    .unwrap();
+            }
+            inner.outgoing = tx.into();
+            let mut waiting = Box::pin(inner.link.exchange_attach(
+                &inner.outgoing,
+                &mut inner.incoming,
+                false,
+            ));
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            let cause = exhaust_recovery_store(&store);
+            match futures_util::poll!(&mut waiting) {
+                std::task::Poll::Ready(Err(SenderAttachError::UnsettledCapacityExceeded(
+                    error,
+                ))) => assert_eq!(error, cause),
+                result => panic!("Attach wait must return retained capacity cause: {result:?}"),
+            }
+        }
+    }
+
 }

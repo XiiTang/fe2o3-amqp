@@ -75,7 +75,7 @@ pub(crate) trait LinkDetach {
 
 pub(crate) trait LinkAttach {
     type AttachExchange: Send;
-    type AttachError: Send;
+    type AttachError: Send + From<crate::link::UnsettledCapacityExceeded>;
 
     fn on_incoming_attach(
         &mut self,
@@ -95,7 +95,9 @@ pub(crate) trait Link: LinkAttach + LinkDetach {}
 
 pub(crate) trait LinkExt: Link {
     type FlowState;
-    type Unsettled;
+    type UnsettledEntry: Send + Sync;
+    type Unsettled: Clone
+        + std::ops::Deref<Target = crate::link::unsettled_store::Store<Self::UnsettledEntry>>;
     type Target;
 
     fn local_state(&self) -> &LinkState;

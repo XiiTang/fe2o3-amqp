@@ -62,25 +62,30 @@ where
     async fn reallocate_output_handle(
         &mut self,
     ) -> Result<(), <Self::Link as LinkAttach>::AttachError> {
-        let capacity = session::link_incoming_capacity(
-            self.session_control(),
-            self.buffer_size(),
-            self.session_stop_reason(),
-        )
-        .await?;
-        let (tx, incoming) = mpsc::channel(capacity);
-        let link_relay = self.as_new_link_relay(tx);
-        *self.reader_mut() = incoming;
-        let link_name = self.link().name().to_string();
-        let handle = session::allocate_link(
-            self.session_control(),
-            link_name,
-            link_relay,
-            self.session_stop_reason(),
-        )
-        .await?; // FIXME: cancel safe?
-        *self.link_mut().output_handle_mut() = Some(handle);
-        Ok(())
+        let unsettled = self.link().unsettled().clone();
+        unsettled
+            .until_terminated(async {
+                let capacity = session::link_incoming_capacity(
+                    self.session_control(),
+                    self.buffer_size(),
+                    self.session_stop_reason(),
+                )
+                .await?;
+                let (tx, incoming) = mpsc::channel(capacity);
+                let link_relay = self.as_new_link_relay(tx);
+                *self.reader_mut() = incoming;
+                let link_name = self.link().name().to_string();
+                let handle = session::allocate_link(
+                    self.session_control(),
+                    link_name,
+                    link_relay,
+                    self.session_stop_reason(),
+                )
+                .await?; // FIXME: cancel safe?
+                *self.link_mut().output_handle_mut() = Some(handle);
+                Ok(())
+            })
+            .await?
     }
 }
 
@@ -100,12 +105,17 @@ where
     async fn reattach_inner(
         &mut self,
     ) -> Result<&mut Self, <Self::Link as LinkAttach>::AttachError> {
-        self.reallocate_output_handle().await?; // FIXME: cancel safe? if oneshot channel is cancel safe
-        match self.exchange_attach(true).await // cancel safe: the attach exchange only awaits on mpsc operations
-        {
-            Ok(attach_exchange) => self.handle_reattach_outcome(attach_exchange),
-            Err(attach_error) => Err(self.handle_attach_error(attach_error).await),
-        }
+        let unsettled = self.link().unsettled().clone();
+        unsettled
+            .until_terminated(async {
+                self.reallocate_output_handle().await?; // FIXME: cancel safe? if oneshot channel is cancel safe
+                                                        // Cancel safe: the exchange only awaits on mpsc operations.
+                match self.exchange_attach(true).await {
+                    Ok(attach_exchange) => self.handle_reattach_outcome(attach_exchange),
+                    Err(attach_error) => Err(self.handle_attach_error(attach_error).await),
+                }
+            })
+            .await?
     }
 }
 

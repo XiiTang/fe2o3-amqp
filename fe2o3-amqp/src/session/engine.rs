@@ -309,7 +309,7 @@ where
         #[cfg(feature = "log")]
         log::trace!("control: {}", control);
         for attachment in self.retired_allocations.take() {
-            self.session.deallocate_link(&attachment);
+            self.session.retire_link_allocation(&attachment);
         }
         match control {
             SessionControl::End(error) => {
@@ -341,7 +341,7 @@ where
                 });
                 let _ = responder.send(result.map_err(Into::into));
                 for attachment in self.retired_allocations.take() {
-                    self.session.deallocate_link(&attachment);
+                    self.session.retire_link_allocation(&attachment);
                 }
             }
             SessionControl::AllocateIncomingLink {
@@ -361,7 +361,7 @@ where
                 });
                 let _ = responder.send(result.map_err(Into::into));
                 for attachment in self.retired_allocations.take() {
-                    self.session.deallocate_link(&attachment);
+                    self.session.retire_link_allocation(&attachment);
                 }
             }
             SessionControl::DeallocateLink(attachment) => {
@@ -640,7 +640,7 @@ where
             let result = tokio::select! {
                 _ = self.retired_allocations.ready() => {
                     for attachment in self.retired_allocations.take() {
-                        self.session.deallocate_link(&attachment);
+                        self.session.retire_link_allocation(&attachment);
                     }
                     Ok(Running::Continue)
                 },

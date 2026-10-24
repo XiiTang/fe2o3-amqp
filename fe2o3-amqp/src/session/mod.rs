@@ -801,6 +801,17 @@ impl endpoint::Session for Session {
     /// attachment still waiting for the peer's window can no longer go out,
     /// so they are dropped and their queue room released; other links'
     /// keep their order.
+    fn retire_link_allocation(&mut self, attachment: &OutputAttachment) -> bool {
+        let removed = self.deallocate_link(attachment);
+        if removed {
+            self.link_by_input_handle.retain(|_, relay| match relay {
+                LinkRelay::Sender { output_handle, .. }
+                | LinkRelay::Receiver { output_handle, .. } => output_handle.id != attachment.id,
+            });
+        }
+        removed
+    }
+
     fn deallocate_link(&mut self, attachment: &OutputAttachment) -> bool {
         // A half-open detach retains its allocation until its late Attach and
         // Detach answer arrive, but close_pending already forbids output.
@@ -815,11 +826,6 @@ impl endpoint::Session for Session {
             .link_name_by_output_handle
             .remove(attachment.handle.0 as usize);
         let _ = self.link_by_name.remove(&name);
-        self.link_by_input_handle.retain(|_, relay| match relay {
-            LinkRelay::Sender { output_handle, .. } | LinkRelay::Receiver { output_handle, .. } => {
-                output_handle.id != attachment.id
-            }
-        });
         self.remote_incoming_window_exhausted_buffer
             .retain(|(_, id, ..)| *id != attachment.id);
         true

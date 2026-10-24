@@ -488,6 +488,10 @@ impl endpoint::Session for ListenerSession {
         self.session.deallocate_link(attachment)
     }
 
+    fn retire_link_allocation(&mut self, attachment: &OutputAttachment) -> bool {
+        self.session.retire_link_allocation(attachment)
+    }
+
     fn on_incoming_begin(
         &mut self,
         channel: IncomingChannel,

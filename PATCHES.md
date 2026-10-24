@@ -819,7 +819,7 @@ Regressions: `late_session_allocation_retires_without_ending_connection`,
 send/drop. Restoring original native oneshot disposition behavior (no handoff
 on failed send or unread receiver Drop) fails the allocation tests (exit 101).
 With the patch the all-feature library suite passes (150 tests, exit 0), on
-macOS arm64 / Rust 1.97.0. The fork's existing untracked Cargo.lock is used;
+macOS arm64 / Rust 1.98.1. The fork's existing untracked Cargo.lock is used;
 a fresh resolution upgrades tokio-util and fails untouched transport sink
 type inference, outside this patch.
 
@@ -839,7 +839,7 @@ actual sender admission path and exercises all three completion methods in
 both handoff orders, retaining the Accepted outcome or the actual failure.
 With the preceding raw oneshot handoff restored in `send_new_payload`, it
 fails (exit 101); the all-feature library suite passes with the patch
-(151 tests, exit 0), on macOS arm64 / Rust 1.97.0.
+(151 tests, exit 0), on macOS arm64 / Rust 1.98.1.
 
 ## W4e: keep resource-side transaction reply ownership
 
@@ -855,7 +855,7 @@ No Discharge or rollback is introduced by cancellation.
 transaction session's three controls in both handoff orders, checks exactly one
 native answer and verifies the session remains mapped. Restoring original
 failed-send ownership at the shared native checkpoint makes it fail (exit 101).
-The regression passes with the patch (exit 0), on macOS arm64 / Rust 1.97.0.
+The regression passes with the patch (exit 0), on macOS arm64 / Rust 1.98.1.
 
 ## W4e: preserve engine answers at the last native handoff
 
@@ -872,7 +872,29 @@ The two `engine_outcome::completion_tests` cover sender-first, receiver-first,
 probed-buffer drop, and cancelling a borrowed engine wait before its result.
 Restoring the preceding raw oneshot handoff fails both regressions (exit 101).
 All 154 all-feature library tests pass, including the existing local-stop race,
-panic and repeated-stop tests (exit 0), on macOS arm64 / Rust 1.97.0.
+panic and repeated-stop tests (exit 0), on macOS arm64 / Rust 1.98.1.
 Production/integration compilation also keeps the session engine's protocol-type
 imports unconditional after retiring its test-only oneshot import; otherwise
 unit-test-only compilation masks the missing production imports.
+
+## W4e: retire only an abandoned allocation's input routing
+
+The allocation disposition must not remove routing needed by an ordinary
+closing or non-closing Detach exchange. The first W4e implementation removed
+input relays in `Session::deallocate_link`, which also runs when a live sender
+sends Detach. Its peer's reply then lost its route, and retained deliveries
+failed to resume with `DetachError(IllegalState)`.
+
+`Session::retire_link_allocation` is the one cleanup point for an allocation
+reply nobody took. The engine's private retirement queue calls it; the listener
+and transaction session wrappers delegate it. Ordinary deallocation retains
+its existing detach routing. Attachment identity still prevents an old
+retirement from removing a later allocation that reused its handle.
+
+Regression evidence: the existing `detached_link_frames` cases
+`a_paused_delivery_never_written_is_sent_again_whole_once`,
+`a_delivery_paused_in_a_later_fragment_is_resumed_whole_once`, and
+`a_delivery_the_peer_holds_is_resumed_under_its_tag_without_new_credit` all fail
+on the first W4e implementation. They exercise the native effect; the allocation
+checkpoint tests also require an abandoned incoming allocation's relay to be
+removed. The final rerun is a required verification of this correction.

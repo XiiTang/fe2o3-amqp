@@ -63,6 +63,11 @@ pub(crate) trait Session {
     /// `attachment` still holds the handle. Returns whether it did.
     fn deallocate_link(&mut self, attachment: &OutputAttachment) -> bool;
 
+    /// Retire a reply the allocator never took, including its unattached relay.
+    fn retire_link_allocation(&mut self, attachment: &OutputAttachment) -> bool {
+        self.deallocate_link(attachment)
+    }
+
     fn on_incoming_begin(
         &mut self,
         channel: IncomingChannel,

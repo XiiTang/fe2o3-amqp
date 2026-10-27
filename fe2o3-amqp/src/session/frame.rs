@@ -36,6 +36,7 @@ impl SessionFrame {
 
 // #[derive(Debug)]
 pub(crate) enum SessionFrameBody {
+    TransferRefused,
     // Frames handled by Link
     Attach(Attach),
     Flow(Flow),
@@ -54,6 +55,7 @@ pub(crate) enum SessionFrameBody {
 impl std::fmt::Debug for SessionFrameBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::TransferRefused => f.write_str("TransferRefused"),
             Self::Attach(arg0) => f.debug_tuple("Attach").field(arg0).finish(),
             Self::Flow(arg0) => f.debug_tuple("Flow").field(arg0).finish(),
             Self::Transfer {

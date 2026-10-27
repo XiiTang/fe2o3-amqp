@@ -91,6 +91,16 @@ cfg_acceptor! {
 /// Errors with sending message on the control link
 #[derive(Debug, thiserror::Error)]
 pub enum ControllerSendError {
+    /// The native control link consumed this actual Detach.
+    #[error("control link detached (closed={closed})")]
+    ControlDetached {
+        /// The Detach's actual closed flag.
+        closed: bool,
+        /// The original peer error, if any.
+        error: Option<fe2o3_amqp_types::definitions::Error>,
+        /// Native dispatch and answer provenance, for tracked commands.
+        receipt: Option<super::ControlReceipt>,
+    },
     /// An earlier discharge may have reached the coordinator. Do not resend it.
     #[error("The previous discharge outcome is unknown")]
     DischargeOutcomeUnknown,

@@ -27,6 +27,14 @@ impl ReceiveWindow {
     pub fn available(&self) -> u32 {
         self.maximum - self.held.load(Ordering::Acquire)
     }
+    fn consumed(&self) {
+        self.released.fetch_add(1, Ordering::AcqRel);
+        self.changed.notify_one();
+    }
+    pub(crate) fn consumed_without_hold(&self) {
+        self.consumed();
+    }
+
     pub fn take_released(&self) -> u32 {
         self.released.swap(0, Ordering::AcqRel)
     }
@@ -44,7 +52,6 @@ pub(crate) struct Slot(Arc<ReceiveWindow>);
 impl Drop for Slot {
     fn drop(&mut self) {
         self.0.held.fetch_sub(1, Ordering::AcqRel);
-        self.0.released.fetch_add(1, Ordering::AcqRel);
-        self.0.changed.notify_one();
+        self.0.consumed();
     }
 }

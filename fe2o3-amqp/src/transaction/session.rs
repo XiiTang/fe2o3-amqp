@@ -14,7 +14,10 @@ use uuid::Uuid;
 use crate::{
     connection::ConnectionStopReason,
     control::SessionControl,
-    endpoint::{self, IncomingChannel, InputHandle, AttachmentId, LinkFlow, OutgoingChannel, OutputAttachment},
+    endpoint::{
+        self, AttachmentId, IncomingChannel, InputHandle, LinkFlow, OutgoingChannel,
+        OutputAttachment,
+    },
     link::{target_archetype::VariantOfTargetArchetype, LinkRelay, SessionStopReason},
     session::{
         self,
@@ -305,6 +308,10 @@ where
         //     Some(false) | None => self.session.on_incoming_flow(flow).await,
         // }
         self.session.on_incoming_flow(flow).await
+    }
+
+    fn on_refused_incoming_transfer(&mut self) {
+        self.session.on_refused_incoming_transfer();
     }
 
     async fn on_incoming_transfer(

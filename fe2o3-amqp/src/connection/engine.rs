@@ -309,6 +309,18 @@ where
         let Frame { channel, body } = frame;
         let channel = IncomingChannel(channel);
         match body {
+            FrameBody::TransferRefused(_) => {
+                if matches!(self.connection.local_state(), ConnectionState::Opened) {
+                    if let Some(tx) = self.connection.session_tx_by_incoming_channel(channel) {
+                        let _ = tx
+                            .send(SessionFrame::new(
+                                channel,
+                                SessionFrameBody::TransferRefused,
+                            ))
+                            .await;
+                    }
+                }
+            }
             FrameBody::Open(open) => {
                 let remote_idle_timeout = open.idle_time_out;
                 self.connection.on_incoming_open(channel, open)?;
@@ -453,6 +465,7 @@ where
         } = frame;
         let channel = OutgoingChannel(channel);
         let frame = match body {
+            SessionFrameBody::TransferRefused => unreachable!("incoming-only refused Transfer"),
             SessionFrameBody::Begin(begin) => self.connection.on_outgoing_begin(channel, begin)?,
             SessionFrameBody::Attach(attach) => Frame::new(channel, FrameBody::Attach(attach)),
             SessionFrameBody::Flow(flow) => Frame::new(channel, FrameBody::Flow(flow)),
@@ -698,5 +711,96 @@ where
         tracing::debug!("Stopped");
         #[cfg(feature = "log")]
         log::debug!("Stopped");
+    }
+}
+
+#[cfg(test)]
+mod refused_transfer_tests {
+    use super::*;
+    use crate::{frames::amqp::RefusedTransfer, Connection};
+    use fe2o3_amqp_types::performatives::Open;
+    use tokio::sync::mpsc;
+
+    fn refused() -> Frame {
+        Frame::new(3u16, FrameBody::TransferRefused(RefusedTransfer::new()))
+    }
+
+    #[tokio::test]
+    async fn a_refused_transfer_on_a_retired_session_is_consumed_quietly() {
+        let open = Open {
+            container_id: "refusal".into(),
+            hostname: None,
+            max_frame_size: Default::default(),
+            channel_max: Default::default(),
+            idle_time_out: None,
+            outgoing_locales: None,
+            incoming_locales: None,
+            offered_capabilities: None,
+            desired_capabilities: None,
+            properties: None,
+        };
+        let mut connection = Connection::new(ConnectionState::Opened, open);
+        let (to_session, mut session) = mpsc::channel(1);
+        connection
+            .session_by_incoming_channel
+            .insert(IncomingChannel(3), Arc::new(to_session));
+        let (io, _peer) = tokio::io::duplex(4096);
+        let (_control, controls) = mpsc::channel(1);
+        let (_out, outgoing) = mpsc::channel(1);
+        let mut engine = ConnectionEngine {
+            transport: Transport::bind(io, 4096, None),
+            connection,
+            control: controls,
+            outgoing_session_frames: outgoing,
+            heartbeat: HeartBeat::never(),
+            write_pending: false,
+        };
+        assert!(matches!(
+            engine.on_incoming(refused()).await.unwrap(),
+            Running::Continue
+        ));
+        {
+            let second = engine.on_incoming(refused());
+            tokio::pin!(second);
+            tokio_test::assert_pending!(futures_util::poll!(second.as_mut()));
+            let first = session.recv().await.unwrap();
+            assert_eq!(first.channel, 3);
+            assert!(matches!(first.body, SessionFrameBody::TransferRefused));
+            assert!(matches!(second.await.unwrap(), Running::Continue));
+        }
+        assert!(matches!(
+            session.recv().await.unwrap().body,
+            SessionFrameBody::TransferRefused
+        ));
+        drop(session);
+        assert!(matches!(
+            engine.on_incoming(refused()).await.unwrap(),
+            Running::Continue
+        ));
+        engine.connection.session_by_incoming_channel.clear();
+        assert!(matches!(
+            engine.on_incoming(refused()).await.unwrap(),
+            Running::Continue
+        ));
+        assert!(matches!(
+            engine.connection.local_state,
+            ConnectionState::Opened
+        ));
+        for state in [
+            ConnectionState::CloseSent,
+            ConnectionState::Discarding,
+            ConnectionState::End,
+        ] {
+            engine.connection.local_state = state.clone();
+            let result = engine.on_incoming(refused()).await.unwrap();
+            assert!(matches!(
+                (state, result),
+                (ConnectionState::End, Running::Stop)
+                    | (
+                        ConnectionState::CloseSent | ConnectionState::Discarding,
+                        Running::Continue
+                    )
+            ));
+        }
     }
 }

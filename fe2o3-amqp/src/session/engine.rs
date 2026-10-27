@@ -172,6 +172,11 @@ where
         let SessionFrame { channel, body, .. } = incoming;
         let channel = IncomingChannel(channel);
         match body {
+            SessionFrameBody::TransferRefused => {
+                if matches!(self.session.local_state(), SessionState::Mapped) {
+                    self.session.on_refused_incoming_transfer();
+                }
+            }
             SessionFrameBody::Begin(begin) => {
                 self.session.on_incoming_begin(channel, begin)?;
             }
@@ -1160,6 +1165,189 @@ mod detached_attachment_tests {
                     );
                 }
             }
+        }
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod refused_transfer_tests {
+    use super::*;
+    use crate::{
+        endpoint::{InputHandle, OutgoingChannel, OutputAttachment},
+        link::{
+            state::{LinkFlowState, LinkFlowStateInner},
+            unsettled_store::Store,
+            LinkRelay,
+        },
+        session::Builder,
+        Payload, Session as NativeSession,
+    };
+    use fe2o3_amqp_types::{
+        definitions::ReceiverSettleMode,
+        performatives::{End, Transfer},
+    };
+
+    async fn exercise<S>(wrap: impl FnOnce(NativeSession) -> S, mut check: impl FnMut(&S))
+    where
+        S: endpoint::SessionEndpoint<State = SessionState> + Send + Sync + 'static,
+        AllocLinkError: From<S::AllocError>,
+        SessionInnerError: From<S::Error> + From<S::BeginError> + From<S::EndError>,
+    {
+        let mut native = Builder::new().incoming_window(1).into_session(
+            OutgoingChannel(0),
+            SessionState::Mapped,
+            Arc::new(OnceLock::new()),
+        );
+        native.remote_outgoing_window = 1;
+        let (link_tx, mut link_rx) = mpsc::channel(2);
+        let store = Arc::new(Store::new(None));
+        let flow = Arc::new(LinkFlowState::receiver(LinkFlowStateInner {
+            initial_delivery_count: 0,
+            delivery_count: 0,
+            link_credit: 2,
+            available: 0,
+            drain: false,
+            properties: None,
+        }));
+        let relay =
+            LinkRelay::new_receiver(link_tx, flow, store.clone(), ReceiverSettleMode::First)
+                .with_output_handle(OutputAttachment::for_tests(0));
+        native.link_by_input_handle.insert(InputHandle(0), relay);
+        let (conn_control, _conn_rx) = mpsc::channel(4);
+        let (control_tx, control) = mpsc::channel(4);
+        let (incoming_tx, incoming) = mpsc::channel(4);
+        let (outgoing, mut written) = mpsc::channel(4);
+        let (_link_tx, outgoing_link_frames) = mpsc::channel(4);
+        let mut engine = SessionEngine {
+            conn_control,
+            control,
+            incoming,
+            outgoing,
+            outgoing_link_frames,
+            session: wrap(native),
+        };
+        engine
+            .on_incoming(SessionFrame::new(0u16, SessionFrameBody::TransferRefused))
+            .await
+            .unwrap();
+        check(&engine.session);
+        assert_eq!(engine.session.receive_window().available(), 1);
+        assert!(store.read().is_none());
+        assert!(link_rx.try_recv().is_err());
+        let (join, mut outcome) = engine.spawn();
+        let SessionFrameBody::Flow(flow) = written.recv().await.unwrap().body else {
+            panic!("automatic session Flow")
+        };
+        assert_eq!(flow.next_incoming_id, Some(1));
+        assert_eq!(flow.incoming_window, 1);
+        assert!(flow.handle.is_none());
+        let transfer: Transfer =
+            serde_amqp::from_slice(&[0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0, 1, 0x55, 0x43])
+                .unwrap();
+        incoming_tx
+            .send(SessionFrame::new(
+                0u16,
+                SessionFrameBody::Transfer {
+                    performative: transfer,
+                    payload: Payload::from_static(&[0, 0x53, 0x75, 0xa0, 1, 7]),
+                },
+            ))
+            .await
+            .unwrap();
+        let frame = link_rx.recv().await.unwrap();
+        assert!(matches!(frame, LinkFrame::Transfer { .. }));
+        drop(frame);
+        let SessionFrameBody::Flow(flow) = written.recv().await.unwrap().body else {
+            panic!("following consumed window")
+        };
+        assert_eq!(flow.next_incoming_id, Some(2));
+        assert_eq!(flow.incoming_window, 1);
+        assert!(flow.handle.is_none());
+        control_tx.send(SessionControl::End(None)).await.unwrap();
+        assert!(matches!(
+            written.recv().await.unwrap().body,
+            SessionFrameBody::End(_)
+        ));
+        incoming_tx
+            .send(SessionFrame::new(
+                0u16,
+                SessionFrameBody::End(End { error: None }),
+            ))
+            .await
+            .unwrap();
+        join.await.unwrap();
+        outcome.recv().await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn refused_transfer_keeps_only_physical_session_progress() {
+        exercise(
+            |session| session,
+            |session| {
+                assert_eq!(session.next_incoming_id, 1);
+                assert_eq!(session.remote_outgoing_window, 0);
+                assert!(session.delivery_tag_by_id.is_empty());
+            },
+        )
+        .await;
+        #[cfg(feature = "acceptor")]
+        {
+            let (listener, mut notices) = mpsc::channel(2);
+            exercise(
+                |session| crate::acceptor::session::ListenerSession {
+                    session,
+                    link_listener: listener,
+                    pending_link_flows: Default::default(),
+                },
+                |session| {
+                    assert!(session.pending_link_flows.is_empty());
+                    assert!(notices.try_recv().is_err());
+                    assert!(session.session.delivery_tag_by_id.is_empty());
+                },
+            )
+            .await;
+        }
+        #[cfg(all(feature = "transaction", feature = "acceptor"))]
+        {
+            use crate::transaction::{
+                coordinator::ControlLinkAcceptor, manager::TransactionManager, session::TxnSession,
+            };
+            let (control, _rx) = mpsc::channel(2);
+            let (outgoing, _rx2) = crate::session::transfer_queue::channel(2);
+            exercise(
+                |session| TxnSession {
+                    session,
+                    control,
+                    txn_manager: TransactionManager::new(outgoing, ControlLinkAcceptor::default()),
+                    max_frame_size: 4096,
+                },
+                |session| {
+                    assert!(session.txn_manager.txns.is_empty());
+                    assert!(session.session.delivery_tag_by_id.is_empty());
+                },
+            )
+            .await;
+            let (listener, mut notices) = mpsc::channel(2);
+            let (control, _rx) = mpsc::channel(2);
+            let (outgoing, _rx2) = crate::session::transfer_queue::channel(2);
+            exercise(
+                |session| TxnSession {
+                    session: crate::acceptor::session::ListenerSession {
+                        session,
+                        link_listener: listener,
+                        pending_link_flows: Default::default(),
+                    },
+                    control,
+                    txn_manager: TransactionManager::new(outgoing, ControlLinkAcceptor::default()),
+                    max_frame_size: 4096,
+                },
+                |session| {
+                    assert!(session.txn_manager.txns.is_empty());
+                    assert!(session.session.pending_link_flows.is_empty());
+                    assert!(notices.try_recv().is_err());
+                },
+            )
+            .await;
         }
     }
 }

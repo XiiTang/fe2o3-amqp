@@ -607,8 +607,242 @@ where
 
     fn on_incoming_attach(
         &mut self,
-        remote_attach: Attach,
+        attach: Attach,
     ) -> Result<Self::AttachExchange, Self::AttachError> {
+        self.accept_attach(attach, AttachPurpose::Ordinary)
+    }
+
+    fn on_incoming_attach_for_close(&mut self, attach: Attach) -> Result<(), Self::AttachError> {
+        match self.accept_attach(attach, AttachPurpose::CloseOnly)? {
+            ReceiverAttachExchange::Complete => Ok(()),
+            _ => Err(ReceiverAttachError::IllegalState),
+        }
+    }
+
+    /// # Cancel safety
+    ///
+    /// This is cancel safe: it only awaits on sending over `tokio::mpsc::Sender`
+    /// (see `send_attach_inner`) and on `tokio::sync::mpsc::Receiver::recv`,
+    /// both of which are cancel safe.
+    async fn send_attach(
+        &mut self,
+        writer: &crate::session::transfer_queue::Sender,
+        is_reattaching: bool,
+    ) -> Result<(), Self::AttachError> {
+        self.send_attach_inner(writer, is_reattaching, &AttachPurpose::Ordinary)
+            .await?;
+        Ok(())
+    }
+}
+
+impl<T> endpoint::Link for ReceiverLink<T> where
+    T: Into<TargetArchetype>
+        + TryFrom<TargetArchetype>
+        + VerifyTargetArchetype
+        + Clone
+        + Send
+        + Sync
+{
+}
+
+impl<T> endpoint::LinkExt for ReceiverLink<T>
+where
+    T: Into<TargetArchetype>
+        + TryFrom<TargetArchetype>
+        + VerifyTargetArchetype
+        + Clone
+        + Send
+        + Sync,
+{
+    type FlowState = ReceiverFlowState;
+    type Unsettled = ArcReceiverUnsettledMap;
+    type Target = T;
+
+    fn local_state(&self) -> &LinkState {
+        &self.local_state
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn output_handle_mut(&mut self) -> &mut Option<crate::endpoint::OutputAttachment> {
+        &mut self.output_handle
+    }
+
+    fn session_stop_reason(&self) -> &Arc<OnceLock<SessionStopReason>> {
+        &self.session_stop_reason
+    }
+
+    fn flow_state(&self) -> &Self::FlowState {
+        &self.flow_state
+    }
+
+    fn unsettled(&self) -> &Self::Unsettled {
+        &self.unsettled
+    }
+
+    fn rcv_settle_mode(&self) -> &ReceiverSettleMode {
+        &self.rcv_settle_mode
+    }
+
+    fn max_message_size(&self) -> Option<u64> {
+        match self.max_message_size {
+            0 => None,
+            _ => Some(self.max_message_size),
+        }
+    }
+
+    fn properties<F, O>(&self, op: F) -> O
+    where
+        F: FnOnce(&Option<Fields>) -> O,
+    {
+        let guard = self.flow_state.lock.read();
+        op(&guard.properties)
+    }
+
+    fn properties_mut<F, O>(&self, op: F) -> O
+    where
+        F: FnOnce(&mut Option<Fields>) -> O,
+    {
+        let mut guard = self.flow_state.lock.write();
+        op(&mut guard.properties)
+    }
+
+    /// # Cancel safety
+    ///
+    /// This is cancel safe: it only awaits on sending over `tokio::mpsc::Sender`
+    /// and on `tokio::sync::mpsc::Receiver::recv`, both of which are cancel safe.
+    async fn exchange_attach(
+        &mut self,
+        writer: &crate::session::transfer_queue::Sender,
+        reader: &mut mpsc::Receiver<LinkFrame>,
+        is_reattaching: bool,
+    ) -> Result<Self::AttachExchange, Self::AttachError> {
+        self.exchange_attach_inner(writer, reader, is_reattaching, AttachPurpose::Ordinary)
+            .await
+    }
+
+    async fn exchange_attach_for_close(
+        &mut self,
+        writer: &crate::session::transfer_queue::Sender,
+        reader: &mut mpsc::Receiver<LinkFrame>,
+    ) -> Result<(), Self::AttachError> {
+        match self
+            .exchange_attach_inner(writer, reader, true, AttachPurpose::CloseOnly)
+            .await?
+        {
+            ReceiverAttachExchange::Complete => Ok(()),
+            _ => Err(ReceiverAttachError::IllegalState),
+        }
+    }
+
+    async fn handle_attach_error(
+        &mut self,
+        attach_error: ReceiverAttachError,
+        writer: &crate::session::transfer_queue::Sender,
+        reader: &mut mpsc::Receiver<LinkFrame>,
+        session: &mpsc::Sender<SessionControl>,
+    ) -> ReceiverAttachError {
+        match attach_error {
+            // Errors that indicate failed attachment
+            ReceiverAttachError::SessionStopped(_)
+            | ReceiverAttachError::IllegalState
+            | ReceiverAttachError::NonAttachFrameReceived
+            | ReceiverAttachError::ExpectImmediateDetach
+            | ReceiverAttachError::RemoteClosedWithError(_) => attach_error,
+
+            ReceiverAttachError::DuplicatedLinkName => {
+                let error = definitions::Error::new(
+                    SessionError::HandleInUse,
+                    "Link name is in use".to_string(),
+                    None,
+                );
+                session
+                    .send(SessionControl::End(Some(error)))
+                    .await
+                    .map(|_| attach_error)
+                    .unwrap_or(match self.session_stop_reason.get() {
+                        Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
+                        None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                    })
+            }
+
+            // ReceiverAttachError::SndSettleModeNotSupported
+            ReceiverAttachError::IncomingSourceIsNone => {
+                // Just send detach immediately
+                let err = self
+                    .send_detach(writer, true, None)
+                    .await
+                    .map(|_| attach_error)
+                    .unwrap_or(match self.session_stop_reason.get() {
+                        Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
+                        None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                    });
+                recv_detach(self, reader, err).await
+            }
+
+            ReceiverAttachError::CoordinatorIsNotImplemented
+            | ReceiverAttachError::InitialDeliveryCountIsNone
+            | ReceiverAttachError::SourceAddressIsNoneWhenDynamicIsTrue
+            | ReceiverAttachError::TargetAddressIsSomeWhenDynamicIsTrue
+            | ReceiverAttachError::DynamicNodePropertiesIsSomeWhenDynamicIsFalse => {
+                match (&attach_error).try_into() {
+                    Ok(error) => match self.send_detach(writer, true, Some(error)).await {
+                        Ok(_) => recv_detach(self, reader, attach_error).await,
+                        Err(_) => match self.session_stop_reason.get() {
+                            Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
+                            None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                        },
+                    },
+                    Err(_) => attach_error,
+                }
+            }
+            _ => attach_error,
+        }
+    }
+}
+
+async fn recv_detach<T>(
+    link: &mut ReceiverLink<T>,
+    reader: &mut mpsc::Receiver<LinkFrame>,
+    err: ReceiverAttachError,
+) -> ReceiverAttachError
+where
+    T: Into<TargetArchetype>
+        + TryFrom<TargetArchetype>
+        + VerifyTargetArchetype
+        + Clone
+        + Send
+        + Sync,
+{
+    match reader.recv().await {
+        Some(LinkFrame::Detach(remote_detach, _)) => match link.on_detach_reply(remote_detach) {
+            Ok(_) => err,
+            Err(detach_error) => detach_error.try_into().unwrap_or(err),
+        },
+        Some(_) => ReceiverAttachError::NonAttachFrameReceived,
+        None => match link.session_stop_reason.get() {
+            Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
+            None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+        },
+    }
+}
+
+impl<T> ReceiverLink<T>
+where
+    T: Into<TargetArchetype>
+        + TryFrom<TargetArchetype>
+        + VerifyTargetArchetype
+        + Clone
+        + Send
+        + Sync,
+{
+    fn accept_attach(
+        &mut self,
+        remote_attach: Attach,
+        purpose: AttachPurpose,
+    ) -> Result<ReceiverAttachExchange, ReceiverAttachError> {
         use self::source::VerifySource;
 
         match (&self.local_state, remote_attach.incomplete_unsettled) {
@@ -704,6 +938,20 @@ where
             });
         }
 
+        if matches!(purpose, AttachPurpose::CloseOnly) {
+            if remote_attach.incomplete_unsettled
+                || matches!(
+                    self.local_state,
+                    LinkState::IncompleteAttachSent
+                        | LinkState::IncompleteAttachReceived
+                        | LinkState::IncompleteAttachExchanged
+                )
+            {
+                return Err(ReceiverAttachError::IllegalState);
+            }
+            return Ok(ReceiverAttachExchange::Complete);
+        }
+
         // Ok(Self::AttachExchange::Complete)
         Ok(self.handle_unsettled_in_attach(
             remote_attach.unsettled,
@@ -711,107 +959,16 @@ where
         ))
     }
 
-    /// # Cancel safety
-    ///
-    /// This is cancel safe: it only awaits on sending over `tokio::mpsc::Sender`
-    /// (see `send_attach_inner`) and on `tokio::sync::mpsc::Receiver::recv`,
-    /// both of which are cancel safe.
-    async fn send_attach(
-        &mut self,
-        writer: &crate::session::transfer_queue::Sender,
-        is_reattaching: bool,
-    ) -> Result<(), Self::AttachError> {
-        self.send_attach_inner(writer, is_reattaching).await?;
-        Ok(())
-    }
-}
-
-impl<T> endpoint::Link for ReceiverLink<T> where
-    T: Into<TargetArchetype>
-        + TryFrom<TargetArchetype>
-        + VerifyTargetArchetype
-        + Clone
-        + Send
-        + Sync
-{
-}
-
-impl<T> endpoint::LinkExt for ReceiverLink<T>
-where
-    T: Into<TargetArchetype>
-        + TryFrom<TargetArchetype>
-        + VerifyTargetArchetype
-        + Clone
-        + Send
-        + Sync,
-{
-    type FlowState = ReceiverFlowState;
-    type Unsettled = ArcReceiverUnsettledMap;
-    type Target = T;
-
-    fn local_state(&self) -> &LinkState {
-        &self.local_state
-    }
-
-    fn name(&self) -> &str {
-        &self.name
-    }
-
-    fn output_handle_mut(&mut self) -> &mut Option<crate::endpoint::OutputAttachment> {
-        &mut self.output_handle
-    }
-
-    fn session_stop_reason(&self) -> &Arc<OnceLock<SessionStopReason>> {
-        &self.session_stop_reason
-    }
-
-    fn flow_state(&self) -> &Self::FlowState {
-        &self.flow_state
-    }
-
-    fn unsettled(&self) -> &Self::Unsettled {
-        &self.unsettled
-    }
-
-    fn rcv_settle_mode(&self) -> &ReceiverSettleMode {
-        &self.rcv_settle_mode
-    }
-
-    fn max_message_size(&self) -> Option<u64> {
-        match self.max_message_size {
-            0 => None,
-            _ => Some(self.max_message_size),
-        }
-    }
-
-    fn properties<F, O>(&self, op: F) -> O
-    where
-        F: FnOnce(&Option<Fields>) -> O,
-    {
-        let guard = self.flow_state.lock.read();
-        op(&guard.properties)
-    }
-
-    fn properties_mut<F, O>(&self, op: F) -> O
-    where
-        F: FnOnce(&mut Option<Fields>) -> O,
-    {
-        let mut guard = self.flow_state.lock.write();
-        op(&mut guard.properties)
-    }
-
-    /// # Cancel safety
-    ///
-    /// This is cancel safe: it only awaits on sending over `tokio::mpsc::Sender`
-    /// and on `tokio::sync::mpsc::Receiver::recv`, both of which are cancel safe.
-    async fn exchange_attach(
+    async fn exchange_attach_inner(
         &mut self,
         writer: &crate::session::transfer_queue::Sender,
         reader: &mut mpsc::Receiver<LinkFrame>,
         is_reattaching: bool,
-    ) -> Result<Self::AttachExchange, ReceiverAttachError> {
+        purpose: AttachPurpose,
+    ) -> Result<ReceiverAttachExchange, ReceiverAttachError> {
         // Send out local attach
-        self.send_attach(writer, is_reattaching).await?;
+        self.send_attach_inner(writer, is_reattaching, &purpose)
+            .await?;
 
         // Wait for remote attach
         let remote_attach = match reader
@@ -825,98 +982,15 @@ where
             _ => return Err(ReceiverAttachError::NonAttachFrameReceived),
         };
 
-        self.on_incoming_attach(remote_attach)
-    }
-
-    async fn handle_attach_error(
-        &mut self,
-        attach_error: ReceiverAttachError,
-        writer: &crate::session::transfer_queue::Sender,
-        reader: &mut mpsc::Receiver<LinkFrame>,
-        session: &mpsc::Sender<SessionControl>,
-    ) -> ReceiverAttachError {
-        match attach_error {
-            // Errors that indicate failed attachment
-            ReceiverAttachError::SessionStopped(_)
-            | ReceiverAttachError::IllegalState
-            | ReceiverAttachError::NonAttachFrameReceived
-            | ReceiverAttachError::ExpectImmediateDetach
-            | ReceiverAttachError::RemoteClosedWithError(_) => attach_error,
-
-            ReceiverAttachError::DuplicatedLinkName => {
-                let error = definitions::Error::new(
-                    SessionError::HandleInUse,
-                    "Link name is in use".to_string(),
-                    None,
-                );
-                session
-                    .send(SessionControl::End(Some(error)))
-                    .await
-                    .map(|_| attach_error)
-                    .unwrap_or(match self.session_stop_reason.get() {
-                        Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
-                        None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                    })
+        match purpose {
+            AttachPurpose::Ordinary => {
+                endpoint::LinkAttach::on_incoming_attach(self, remote_attach)
             }
-
-            // ReceiverAttachError::SndSettleModeNotSupported
-            ReceiverAttachError::IncomingSourceIsNone => {
-                // Just send detach immediately
-                let err = self
-                    .send_detach(writer, true, None)
-                    .await
-                    .map(|_| attach_error)
-                    .unwrap_or(match self.session_stop_reason.get() {
-                        Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
-                        None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                    });
-                recv_detach(self, reader, err).await
+            AttachPurpose::CloseOnly => {
+                endpoint::LinkAttach::on_incoming_attach_for_close(self, remote_attach)?;
+                Ok(ReceiverAttachExchange::Complete)
             }
-
-            ReceiverAttachError::CoordinatorIsNotImplemented
-            | ReceiverAttachError::InitialDeliveryCountIsNone
-            | ReceiverAttachError::SourceAddressIsNoneWhenDynamicIsTrue
-            | ReceiverAttachError::TargetAddressIsSomeWhenDynamicIsTrue
-            | ReceiverAttachError::DynamicNodePropertiesIsSomeWhenDynamicIsFalse => {
-                match (&attach_error).try_into() {
-                    Ok(error) => match self.send_detach(writer, true, Some(error)).await {
-                        Ok(_) => recv_detach(self, reader, attach_error).await,
-                        Err(_) => match self.session_stop_reason.get() {
-                            Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
-                            None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                        },
-                    },
-                    Err(_) => attach_error,
-                }
-            }
-            _ => attach_error,
         }
-    }
-}
-
-async fn recv_detach<T>(
-    link: &mut ReceiverLink<T>,
-    reader: &mut mpsc::Receiver<LinkFrame>,
-    err: ReceiverAttachError,
-) -> ReceiverAttachError
-where
-    T: Into<TargetArchetype>
-        + TryFrom<TargetArchetype>
-        + VerifyTargetArchetype
-        + Clone
-        + Send
-        + Sync,
-{
-    match reader.recv().await {
-        Some(LinkFrame::Detach(remote_detach, _)) => match link.on_detach_reply(remote_detach) {
-            Ok(_) => err,
-            Err(detach_error) => detach_error.try_into().unwrap_or(err),
-        },
-        Some(_) => ReceiverAttachError::NonAttachFrameReceived,
-        None => match link.session_stop_reason.get() {
-            Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
-            None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-        },
     }
 }
 

@@ -23,6 +23,17 @@ struct Entries<T> {
 pub(crate) struct Store<T> {
     entries: RwLock<Entries<T>>,
     revision: watch::Sender<u64>,
+    #[cfg(test)]
+    before_receiver_write: BeforeReceiverWrite,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct BeforeReceiverWrite(parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+#[cfg(test)]
+impl std::fmt::Debug for BeforeReceiverWrite {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("BeforeReceiverWrite")
+    }
 }
 impl<T> Store<T> {
     pub fn new(value: Option<UnsettledMap<T>>) -> Self {
@@ -32,6 +43,8 @@ impl<T> Store<T> {
                 closed: None,
             }),
             revision: watch::channel(0).0,
+            #[cfg(test)]
+            before_receiver_write: BeforeReceiverWrite::default(),
         }
     }
     pub fn read(&self) -> MappedRwLockReadGuard<'_, Option<UnsettledMap<T>>> {
@@ -52,7 +65,20 @@ impl<T> Store<T> {
     }
 }
 impl Store<ReceiverDelivery> {
+    #[cfg(test)]
+    pub(crate) fn before_write_once(&self, callback: impl FnOnce() + Send + 'static) {
+        let mut slot = self.before_receiver_write.0.lock();
+        assert!(slot.is_none());
+        *slot = Some(Box::new(callback));
+    }
     pub fn write(&self) -> Write<'_, ReceiverDelivery> {
+        #[cfg(test)]
+        {
+            let callback = self.before_receiver_write.0.lock().take();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
         self.write_entries()
     }
 }

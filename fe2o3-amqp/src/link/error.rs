@@ -8,6 +8,20 @@ use fe2o3_amqp_types::transaction::Coordinator;
 
 use super::{delivery::DeliveryInfo, receiver::DetachedReceiver, sender::DetachedSender};
 
+/// The phase that prevented an exact end exchange from completing.
+#[derive(Debug, thiserror::Error)]
+pub enum LinkExchangeError<A, E> {
+    /// The close-only Attach failed; the original role-specific error is retained.
+    #[error("close-only Attach failed")]
+    Attach(#[source] A),
+    /// The Detach exchange failed.
+    #[error("Detach exchange failed")]
+    Detach(#[source] DetachError),
+    /// Correlation could not be armed before reattachment.
+    #[error("reattach correlation failed")]
+    Correlation(#[source] E),
+}
+
 /// Why the link's session (or its connection) stopped before the link was
 /// detached or closed. From a link's perspective, a parent stopping earlier
 /// is always an error for the link's operations; the variants here describe

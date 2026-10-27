@@ -107,6 +107,33 @@ impl std::fmt::Debug for Sender {
 }
 
 impl Sender {
+    /// Close in place, arming correlation before every internal reattachment.
+    pub async fn close_in_place_exact<F, G, E>(
+        &mut self,
+        peer_suspended: bool,
+        mut before: F,
+    ) -> Result<(), super::LinkExchangeError<SenderAttachError, E>>
+    where
+        F: FnMut() -> Result<G, E> + Send,
+        G: Send,
+        E: Send,
+    {
+        super::shared_inner::close_exact(&mut self.inner, peer_suspended, &mut before).await
+    }
+
+    /// Suspend in place and retain correlation through a crossed mandatory close.
+    pub async fn detach_borrowed_exact<F, G, E>(
+        &mut self,
+        mut before: F,
+    ) -> Result<(), super::LinkExchangeError<SenderAttachError, E>>
+    where
+        F: FnMut() -> Result<G, E> + Send,
+        G: Send,
+        E: Send,
+    {
+        super::shared_inner::detach_exact(&mut self.inner, &mut before).await
+    }
+
     /// Creates a builder for [`Sender`] link
     pub fn builder(
     ) -> builder::Builder<role::SenderMarker, Target, WithoutName, WithSource, WithoutTarget> {
@@ -714,6 +741,14 @@ where
     ) -> Result<SenderAttachExchange, <Self::Link as LinkAttach>::AttachError> {
         self.link
             .exchange_attach(&self.outgoing, &mut self.incoming, is_reattaching)
+            .await
+    }
+
+    async fn exchange_attach_for_close(
+        &mut self,
+    ) -> Result<(), <Self::Link as LinkAttach>::AttachError> {
+        self.link
+            .exchange_attach_for_close(&self.outgoing, &mut self.incoming)
             .await
     }
 
@@ -1371,6 +1406,229 @@ impl DetachedSender {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn every_crossed_exchange_arms_exactly_one_reattach() {
+        use crate::link::test_util::{drive_exact_end, CorrelationGuard};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let (inner, control, outgoing, incoming) = make_sender_inner_with_channels(4096);
+        let mut sender = Sender { inner };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (result, detaches) = tokio::join!(
+            sender.detach_borrowed_exact(|| {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok::<_, std::io::Error>(CorrelationGuard(dropped.clone()))
+            }),
+            drive_exact_end(
+                control,
+                outgoing,
+                incoming,
+                peer_receiver_attach(),
+                || {
+                    assert_eq!(calls.load(Ordering::Acquire), 1);
+                    assert!(!dropped.load(Ordering::Acquire));
+                },
+                || {
+                    assert!(!dropped.load(Ordering::Acquire));
+                    None
+                }
+            )
+        );
+        assert!(matches!(
+            result,
+            Err(super::super::LinkExchangeError::Detach(
+                DetachError::ClosedByRemote
+            ))
+        ));
+        assert_eq!(detaches, 2);
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn reattach_errors_keep_phase_and_drop_correlation() {
+        use super::super::LinkExchangeError;
+        use crate::link::test_util::CorrelationGuard;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (mut inner, mut controls, mut outgoing, _incoming) =
+            make_sender_inner_with_channels(4096);
+        inner.link.local_state = LinkState::Detached;
+        inner.link.output_handle.take();
+        let mut endpoint = Sender { inner };
+        assert!(matches!(
+            endpoint
+                .close_in_place_exact(false, || Err::<(), _>(std::io::Error::other("refused")))
+                .await,
+            Err(LinkExchangeError::Correlation(_))
+        ));
+        assert!(controls.try_recv().is_err());
+        assert!(outgoing.try_recv().is_err());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (result, ()) = tokio::join!(
+            endpoint.close_in_place_exact(false, || Ok::<_, std::io::Error>(CorrelationGuard(
+                dropped.clone()
+            ))),
+            async {
+                let SessionControl::GetIncomingWindow(reply) = controls.recv().await.unwrap()
+                else {
+                    panic!("window allocation")
+                };
+                assert!(!dropped.load(Ordering::Acquire));
+                reply.send(16).unwrap();
+                let SessionControl::AllocateLink { responder, .. } = controls.recv().await.unwrap()
+                else {
+                    panic!("link allocation")
+                };
+                assert!(!dropped.load(Ordering::Acquire));
+                responder
+                    .send(Err(crate::session::error::AllocLinkError::SessionNotMapped))
+                    .unwrap();
+            }
+        );
+        assert!(matches!(
+            result,
+            Err(LinkExchangeError::Attach(
+                SenderAttachError::SessionNotMapped
+            ))
+        ));
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_attach_and_detach_failures_keep_their_original_phase() {
+        use super::super::LinkExchangeError;
+        use crate::link::test_util::{drive_exact_end, CorrelationGuard};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for refusal in [false, true] {
+            let (mut inner, control, outgoing, incoming) = make_sender_inner_with_channels(4096);
+            inner.link.local_state = LinkState::Detached;
+            inner.link.output_handle.take();
+            let mut endpoint = Sender { inner };
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut attach = peer_receiver_attach();
+            if refusal {
+                attach.target = None;
+            }
+            let error = definitions::Error::new(definitions::AmqpError::NotFound, None, None);
+            let (result, _) = tokio::join!(
+                endpoint.close_in_place_exact(false, || Ok::<_, std::io::Error>(CorrelationGuard(
+                    dropped.clone()
+                ))),
+                drive_exact_end(
+                    control,
+                    outgoing,
+                    incoming,
+                    attach,
+                    || {
+                        assert!(!dropped.load(Ordering::Acquire));
+                    },
+                    || {
+                        assert!(!dropped.load(Ordering::Acquire));
+                        Some(error.clone())
+                    }
+                )
+            );
+            if refusal {
+                assert!(
+                    matches!(result,Err(LinkExchangeError::Attach(SenderAttachError::RemoteClosedWithError(actual))) if actual.condition==error.condition)
+                );
+            } else {
+                assert!(
+                    matches!(result,Err(LinkExchangeError::Detach(DetachError::RemoteClosedWithError(actual))) if actual.condition==error.condition)
+                );
+            }
+            assert!(dropped.load(Ordering::Acquire));
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_detached_endpoint_reattaches_without_replay() {
+        use crate::link::test_util::{drive_exact_end, CorrelationGuard};
+        use std::{
+            cell::RefCell,
+            sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+        };
+        for initially_detached in [false, true] {
+            for incomplete in [false, true] {
+                for peer_has_map in [false, true] {
+                    let (mut inner, control, outgoing, incoming) =
+                        make_sender_inner_with_channels(4096);
+                    if initially_detached {
+                        inner.link.local_state = LinkState::Detached;
+                        inner.link.output_handle.take();
+                    }
+                    let tag: DeliveryTag = vec![42].into();
+                    let payload = Payload::from_static(b"kept-pending");
+                    let payload_ptr = payload.as_ptr();
+                    let (tx, rx) = oneshot::channel();
+                    let rx = RefCell::new(rx);
+                    inner
+                        .link
+                        .unsettled
+                        .register(tag.clone(), UnsettledMessage::new(payload, None, 0, tx))
+                        .unwrap();
+                    let store = inner.link.unsettled.clone();
+                    let mut sender = Sender { inner };
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let mut attach = peer_receiver_attach();
+                    attach.handle = 17u32.into();
+                    attach.incomplete_unsettled = incomplete;
+                    if peer_has_map {
+                        let mut map = super::super::UnsettledMap::new();
+                        map.insert(
+                            tag.clone(),
+                            Some(
+                                Outcome::Accepted(fe2o3_amqp_types::messaging::Accepted {}).into(),
+                            ),
+                        );
+                        attach.unsettled = Some(map);
+                    }
+                    let assert_live = || {
+                        assert_eq!(calls.load(Ordering::Acquire), 1);
+                        assert!(!dropped.load(Ordering::Acquire));
+                        let guard = store.read();
+                        let map = guard.as_ref().unwrap();
+                        assert_eq!(map.len(), 1);
+                        assert_eq!(map.get(&tag).unwrap().payload.as_ptr(), payload_ptr);
+                        assert!(matches!(
+                            rx.borrow_mut().try_recv(),
+                            Err(oneshot::error::TryRecvError::Empty)
+                        ));
+                    };
+                    let (result, detaches) = tokio::join!(
+                        sender.close_in_place_exact(false, || {
+                            calls.fetch_add(1, Ordering::AcqRel);
+                            Ok::<_, std::io::Error>(CorrelationGuard(dropped.clone()))
+                        }),
+                        drive_exact_end(control, outgoing, incoming, attach, assert_live, || {
+                            assert_live();
+                            None
+                        })
+                    );
+                    if incomplete {
+                        assert!(matches!(
+                            result,
+                            Err(super::super::LinkExchangeError::Attach(
+                                SenderAttachError::IllegalState
+                            ))
+                        ));
+                    } else {
+                        result.unwrap();
+                        assert_eq!(detaches, if initially_detached { 1 } else { 2 });
+                    }
+                    assert!(dropped.load(Ordering::Acquire));
+                    assert!(is_registered(&sender.inner.link, &tag));
+                    assert!(matches!(
+                        rx.borrow_mut().try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ));
+                }
+            }
+        }
+    }
+
     use std::marker::PhantomData;
 
     use fe2o3_amqp_types::{

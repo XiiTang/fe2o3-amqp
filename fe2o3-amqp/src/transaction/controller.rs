@@ -27,6 +27,189 @@ use super::ControllerSendError;
 #[cfg(docsrs)]
 use super::{OwnedTransaction, Transaction};
 
+/// Opaque native attachment identity used only for command correlation.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ControlAttachment(crate::endpoint::AttachmentId);
+impl std::fmt::Debug for ControlAttachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ControlAttachment")
+    }
+}
+
+/// Incoming-frame fences from the fixed owner of this command.
+pub trait ControlProbe: Send + Sync {
+    /// Capture the fence before the first native Transfer admission.
+    fn first_fence(&self, attachment: &ControlAttachment, delivery_tag: &[u8]) -> u64;
+    /// Capture a fence after all command fragments were admitted.
+    fn dispatch_fence(&self) -> u64;
+    /// The matching observed Detach sequence, if available.
+    fn detach_sequence(&self, attachment: &ControlAttachment) -> Option<u64>;
+}
+
+/// Read-only native dispatch and answer provenance for one control request.
+#[derive(Clone)]
+pub struct ControlReceipt {
+    facts: Box<ControlReceiptFacts>,
+}
+#[derive(Clone)]
+struct ControlReceiptFacts {
+    request: u64,
+    attachment: Option<ControlAttachment>,
+    delivery_tag: Option<Vec<u8>>,
+    first_fence: Option<u64>,
+    complete_fence: Option<u64>,
+    complete: bool,
+    detach_sequence: Option<u64>,
+    answered: Option<DeliveryState>,
+}
+impl std::fmt::Debug for ControlReceipt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlReceipt")
+            .field("request", &self.facts.request)
+            .field("complete", &self.facts.complete)
+            .finish_non_exhaustive()
+    }
+}
+impl ControlReceipt {
+    /// The immutable request ordinal.
+    pub fn request(&self) -> u64 {
+        self.facts.request
+    }
+    /// The native attachment fixed at first admission.
+    pub fn attachment(&self) -> Option<&ControlAttachment> {
+        self.facts.attachment.as_ref()
+    }
+    /// The actual native credit-assigned delivery tag.
+    pub fn delivery_tag(&self) -> Option<&[u8]> {
+        self.facts.delivery_tag.as_deref()
+    }
+    /// Incoming fence before first admission.
+    pub fn first_fence(&self) -> Option<u64> {
+        self.facts.first_fence
+    }
+    /// Incoming fence after final admission.
+    pub fn complete_fence(&self) -> Option<u64> {
+        self.facts.complete_fence
+    }
+    /// Whether the final command fragment was admitted.
+    pub fn complete(&self) -> bool {
+        self.facts.complete
+    }
+    /// The fixed attachment's observed Detach sequence.
+    pub fn detach_sequence(&self) -> Option<u64> {
+        self.facts.detach_sequence
+    }
+    /// The actual terminal disposition accepted by the native unsettled owner.
+    pub fn answered(&self) -> Option<&DeliveryState> {
+        self.facts.answered.as_ref()
+    }
+}
+
+/// Shared provenance owner of exactly one native control command.
+#[derive(Clone)]
+pub struct ControlTracker(Arc<ControlTrackingState>);
+struct ControlTrackingState {
+    request: u64,
+    probe: Arc<dyn ControlProbe>,
+    snapshot: std::sync::Mutex<ControlReceipt>,
+    #[cfg(test)]
+    after_answer: std::sync::Mutex<Option<AfterAnswer>>,
+}
+#[cfg(test)]
+type AfterAnswer = Arc<dyn Fn() + Send + Sync>;
+impl std::fmt::Debug for ControlTracker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ControlTracker")
+            .field("request", &self.0.request)
+            .finish_non_exhaustive()
+    }
+}
+impl ControlTracker {
+    /// Fix the request and probe before dispatch; neither can be replaced.
+    pub fn new(request: u64, probe: Arc<dyn ControlProbe>) -> Self {
+        Self(Arc::new(ControlTrackingState {
+            request,
+            probe,
+            #[cfg(test)]
+            after_answer: std::sync::Mutex::new(None),
+            snapshot: std::sync::Mutex::new(ControlReceipt {
+                facts: Box::new(ControlReceiptFacts {
+                    request,
+                    attachment: None,
+                    delivery_tag: None,
+                    first_fence: None,
+                    complete_fence: None,
+                    complete: false,
+                    detach_sequence: None,
+                    answered: None,
+                }),
+            }),
+        }))
+    }
+    /// Snapshot provenance without holding the snapshot lock while calling the probe.
+    pub fn receipt(&self) -> ControlReceipt {
+        let mut receipt = self.0.snapshot.lock().unwrap().clone();
+        receipt.facts.detach_sequence = receipt
+            .facts
+            .attachment
+            .as_ref()
+            .and_then(|a| self.0.probe.detach_sequence(a));
+        receipt
+    }
+    pub(crate) fn before_first(
+        &self,
+        attachment: crate::endpoint::AttachmentId,
+        tag: &[u8],
+    ) -> u64 {
+        self.0
+            .probe
+            .first_fence(&ControlAttachment(attachment), tag)
+    }
+    pub(crate) fn first_admitted(
+        &self,
+        attachment: crate::endpoint::AttachmentId,
+        tag: &[u8],
+        fence: u64,
+    ) {
+        let mut snapshot = self.0.snapshot.lock().unwrap();
+        assert!(
+            snapshot.facts.first_fence.is_none(),
+            "one first admission per control request"
+        );
+        snapshot.facts.attachment = Some(ControlAttachment(attachment));
+        snapshot.facts.delivery_tag = Some(tag.to_vec());
+        snapshot.facts.first_fence = Some(fence);
+    }
+    pub(crate) fn complete_admitted(&self) {
+        let fence = self.0.probe.dispatch_fence();
+        let mut snapshot = self.0.snapshot.lock().unwrap();
+        assert!(
+            snapshot.facts.first_fence.is_some() && !snapshot.facts.complete,
+            "one complete admission per request"
+        );
+        snapshot.facts.complete_fence = Some(fence);
+        snapshot.facts.complete = true;
+    }
+    pub(crate) fn answered_state(&self, state: &DeliveryState) {
+        if !state.is_terminal() {
+            return;
+        }
+        let mut snapshot = self.0.snapshot.lock().unwrap();
+        match &snapshot.facts.answered {
+            None => snapshot.facts.answered = Some(state.clone()),
+            Some(prior) => assert_eq!(prior, state, "one terminal native answer per request"),
+        }
+        drop(snapshot);
+        #[cfg(test)]
+        {
+            let callback = self.0.after_answer.lock().unwrap().clone();
+            if let Some(callback) = callback {
+                callback();
+            }
+        }
+    }
+}
+
 pub(crate) type ControlLink = SenderLink<Coordinator>;
 
 /// Transaction controller
@@ -136,6 +319,23 @@ pub(crate) async fn discharge_on_link(
 }
 
 impl Controller {
+    /// Retain the native controller and scoped correlation through exact close.
+    pub async fn close_retained_tracked_exact<F, G, E>(
+        &self,
+        dispatch: Arc<AtomicBool>,
+        mut before: F,
+    ) -> Result<(), link::LinkExchangeError<SenderAttachError, E>>
+    where
+        F: FnMut() -> Result<G, E> + Send,
+        G: Send,
+        E: Send,
+    {
+        let mut guard = self.inner.lock().await;
+        let inner = guard.as_mut().expect("retained controller");
+        inner.link.operation_dispatch = Some(dispatch);
+        link::shared_inner::close_exact(inner, false, &mut before).await
+    }
+
     /// Creates a new builder for controller
     pub fn builder() -> link::builder::Builder<
         role::SenderMarker,
@@ -269,17 +469,76 @@ pub struct SharedTransaction {
     completed: bool,
 }
 impl SharedTransaction {
+    /// Discharge with immutable provenance; interrupted dispatch cannot be replayed.
+    pub async fn discharge_tracked(
+        &mut self,
+        fail: bool,
+        tracking: ControlTracker,
+    ) -> Result<(), ControllerSendError> {
+        self.discharge_inner(fail, Some(tracking)).await
+    }
+    async fn discharge_inner(
+        &mut self,
+        fail: bool,
+        tracking: Option<ControlTracker>,
+    ) -> Result<(), ControllerSendError> {
+        if self.completed {
+            return Ok(());
+        }
+        if self.discharge_dispatched() {
+            return Err(ControllerSendError::DischargeOutcomeUnknown);
+        }
+        let mut guard = self.controller.inner.lock().await;
+        let inner = guard.as_mut().expect("shared controller");
+        let message = Message::builder()
+            .value(Discharge {
+                txn_id: self.declared.txn_id.clone(),
+                fail: Some(fail),
+            })
+            .build();
+        inner
+            .send_control_tracked(message, &self.dispatched, tracking.as_ref())
+            .await?
+            .accepted_or_else(|state| match state {
+                DeliveryState::Rejected(rejected) => ControllerSendError::Rejected(rejected),
+                _ => ControllerSendError::IllegalDeliveryState,
+            })?;
+        self.completed = true;
+        Ok(())
+    }
+
     /// Declare on an existing controller. Dispatch metadata survives cancellation.
     pub async fn declare(
         controller: Arc<Controller>,
         global_id: Option<TransactionId>,
         dispatched: Arc<AtomicBool>,
     ) -> Result<Self, ControllerSendError> {
+        Self::declare_inner(controller, global_id, dispatched, None).await
+    }
+
+    /// Declare with immutable native dispatch and answer provenance.
+    pub async fn declare_tracked(
+        controller: Arc<Controller>,
+        global_id: Option<TransactionId>,
+        dispatched: Arc<AtomicBool>,
+        tracking: ControlTracker,
+    ) -> Result<Self, ControllerSendError> {
+        Self::declare_inner(controller, global_id, dispatched, Some(tracking)).await
+    }
+
+    async fn declare_inner(
+        controller: Arc<Controller>,
+        global_id: Option<TransactionId>,
+        dispatched: Arc<AtomicBool>,
+        tracking: Option<ControlTracker>,
+    ) -> Result<Self, ControllerSendError> {
         let declared = {
             let mut guard = controller.inner.lock().await;
             let inner = guard.as_mut().expect("shared controller");
             let message = Message::builder().value(Declare { global_id }).build();
-            let outcome = inner.send_control_tracked(message, &dispatched).await?;
+            let outcome = inner
+                .send_control_tracked(message, &dispatched, tracking.as_ref())
+                .await?;
             outcome.declared_or_else(|state| match state {
                 DeliveryState::Rejected(rejected) => ControllerSendError::Rejected(rejected),
                 _ => ControllerSendError::IllegalDeliveryState,
@@ -320,29 +579,7 @@ impl super::TransactionDischarge for SharedTransaction {
         self.completed
     }
     async fn discharge(&mut self, fail: bool) -> Result<(), Self::Error> {
-        if self.completed {
-            return Ok(());
-        }
-        if self.discharge_dispatched() {
-            return Err(ControllerSendError::DischargeOutcomeUnknown);
-        }
-        let mut guard = self.controller.inner.lock().await;
-        let inner = guard.as_mut().expect("shared controller");
-        let message = Message::builder()
-            .value(Discharge {
-                txn_id: self.declared.txn_id.clone(),
-                fail: Some(fail),
-            })
-            .build();
-        inner
-            .send_control_tracked(message, &self.dispatched)
-            .await?
-            .accepted_or_else(|state| match state {
-                DeliveryState::Rejected(rejected) => ControllerSendError::Rejected(rejected),
-                _ => ControllerSendError::IllegalDeliveryState,
-            })?;
-        self.completed = true;
-        Ok(())
+        self.discharge_inner(fail, None).await
     }
 }
 impl super::TransactionPosting for SharedTransaction {}
@@ -355,6 +592,7 @@ impl SenderInner<ControlLink> {
         &mut self,
         message: Message<T>,
         dispatched: &AtomicBool,
+        tracking: Option<&ControlTracker>,
     ) -> Result<DeliveryState, ControllerSendError> {
         use crate::endpoint::LinkExt;
         use fe2o3_amqp_types::messaging::message::__private::Serializable;
@@ -388,18 +626,598 @@ impl SenderInner<ControlLink> {
                 transfer,
                 payload,
                 Some(dispatched),
+                tracking,
             )
-            .await?;
+            .await
+            .map_err(|error| control_link_error(error, tracking))?;
         let Settlement::Unsettled { outcome, .. } = settlement else {
             return Err(ControllerSendError::IllegalDeliveryState);
         };
-        outcome
-            .await
-            .map_err(|_| match self.link.session_stop_reason.get() {
-                Some(reason) => LinkStateError::SessionStopped(reason.clone()),
-                None => LinkStateError::IllegalState,
-            })??
-            .ok_or(ControllerSendError::NonTerminalDeliveryState)
+        tokio::pin!(outcome);
+        loop {
+            tokio::select! { biased;
+                result = outcome.as_mut() => {
+                    let result = result.map_err(|_| match self.link.session_stop_reason.get() {
+                        Some(reason) => LinkStateError::SessionStopped(reason.clone()),
+                        None => LinkStateError::IllegalState,
+                    }).and_then(|value| value)
+                        .map_err(|error| control_link_error(error,tracking))?;
+                    return result.ok_or(ControllerSendError::NonTerminalDeliveryState);
+                }
+                frame = self.incoming.recv() => match frame {
+                    Some(link::LinkFrame::Detach(detach,_)) => {
+                        let closed=detach.closed;let error=detach.error.clone();
+                        let _=crate::endpoint::LinkDetach::apply_remote_detach_outcome(&mut self.link,detach);
+                        return Err(ControllerSendError::ControlDetached {
+                            closed,error,receipt:tracking.map(ControlTracker::receipt),
+                        });
+                    }
+                    Some(link::LinkFrame::Flow(..)) => {},
+                    Some(link::LinkFrame::Attach(_)|link::LinkFrame::Disposition(_)) =>
+                        return Err(ControllerSendError::NonTerminalDeliveryState),
+                    Some(link::LinkFrame::Transfer { .. }|link::LinkFrame::Acquisition(_)) =>
+                        return Err(ControllerSendError::IllegalDeliveryState),
+                    None => return Err(control_link_error(match self.link.session_stop_reason.get() {
+                        Some(reason)=>LinkStateError::SessionStopped(reason.clone()),
+                        None=>LinkStateError::IllegalState,
+                    },tracking)),
+                }
+            }
+        }
     }
 }
 
+fn control_link_error(
+    error: LinkStateError,
+    tracking: Option<&ControlTracker>,
+) -> ControllerSendError {
+    let (closed, error) = match error {
+        LinkStateError::RemoteClosed => (true, None),
+        LinkStateError::RemoteClosedWithError(error) => (true, Some(error)),
+        LinkStateError::RemoteDetached => (false, None),
+        LinkStateError::RemoteDetachedWithError(error) => (false, Some(error)),
+        other => return ControllerSendError::LinkStateError(other),
+    };
+    ControllerSendError::ControlDetached {
+        closed,
+        error,
+        receipt: tracking.map(ControlTracker::receipt),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tracked_terminal_state_precedes_oneshot_and_survives_control_end() {
+        use crate::{
+            endpoint::{OutgoingChannel, Session as _},
+            session::Builder,
+            util::Producer,
+        };
+        use fe2o3_amqp_types::{
+            messaging::{Accepted, Rejected},
+            performatives::Disposition,
+            states::SessionState,
+        };
+        for direct_settle in [false, true] {
+            for settled in [false, true] {
+                for state in [
+                    DeliveryState::Declared(Declared {
+                        txn_id: vec![7].into(),
+                    }),
+                    DeliveryState::Accepted(Accepted {}),
+                    DeliveryState::Rejected(Rejected { error: None }),
+                ] {
+                    let tracker = tracking();
+                    let (native_tx, mut result) = oneshot::channel();
+                    let (arrived, at) = std::sync::mpsc::sync_channel(0);
+                    let (release, wait) = std::sync::mpsc::sync_channel(0);
+                    let wait = std::sync::Mutex::new(wait);
+                    *tracker.0.after_answer.lock().unwrap() = Some(Arc::new(move || {
+                        arrived.send(()).unwrap();
+                        wait.lock()
+                            .unwrap()
+                            .recv_timeout(std::time::Duration::from_secs(10))
+                            .unwrap();
+                    }));
+                    let store = Arc::new(Store::new(None));
+                    let tag: fe2o3_amqp_types::definitions::DeliveryTag = vec![7].into();
+                    store
+                        .register(
+                            tag.clone(),
+                            link::delivery::UnsettledMessage::new_tracked(
+                                bytes::Bytes::new(),
+                                Some(state.clone()),
+                                0,
+                                native_tx,
+                                tracker.clone(),
+                            ),
+                        )
+                        .unwrap();
+                    let mut session = Builder::new().into_session(
+                        OutgoingChannel(0),
+                        SessionState::Mapped,
+                        Arc::new(OnceLock::new()),
+                    );
+                    let (frames, _inbox) = mpsc::channel(2);
+                    let flow = Arc::new(LinkFlowState::sender(LinkFlowStateInner {
+                        initial_delivery_count: 0,
+                        delivery_count: 0,
+                        link_credit: 1,
+                        available: 0,
+                        drain: false,
+                        properties: None,
+                    }));
+                    let relay = link::LinkRelay::new_sender(
+                        frames,
+                        Producer::new(Arc::new(Notify::new()), flow),
+                        store.clone(),
+                    )
+                    .with_output_handle(OutputAttachment::for_tests(0));
+                    session.link_by_input_handle.insert(InputHandle(0), relay);
+                    session
+                        .delivery_tag_by_id
+                        .insert((Role::Receiver, 7), (InputHandle(0), tag.clone()));
+                    let thread_state = state.clone();
+                    let owned_store = store.clone();
+                    let thread = std::thread::spawn(move || {
+                        if direct_settle {
+                            owned_store.withdraw(&tag).unwrap().settle().unwrap();
+                        } else {
+                            session
+                                .on_incoming_disposition(Disposition {
+                                    role: Role::Receiver,
+                                    first: 7,
+                                    last: None,
+                                    settled,
+                                    state: Some(thread_state),
+                                    batchable: false,
+                                })
+                                .unwrap();
+                        }
+                    });
+                    at.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+                    assert_eq!(tracker.receipt().answered(), Some(&state));
+                    assert!(matches!(
+                        result.try_recv(),
+                        Err(oneshot::error::TryRecvError::Empty)
+                    ));
+                    // A later control end cannot overwrite an answer accepted by the unsettled owner.
+                    store.close(LinkStateError::RemoteClosed);
+                    assert_eq!(tracker.receipt().answered(), Some(&state));
+                    release.send(()).unwrap();
+                    thread.join().unwrap();
+                    assert_eq!(result.try_recv().unwrap().unwrap(), Some(state));
+                }
+            }
+        }
+        let tracker = tracking();
+        let (tx, mut rx) = oneshot::channel();
+        link::delivery::UnsettledMessage::new_tracked(
+            bytes::Bytes::new(),
+            None,
+            0,
+            tx,
+            tracker.clone(),
+        )
+        .fail(LinkStateError::IllegalState)
+        .unwrap();
+        assert!(tracker.receipt().answered().is_none());
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            Err(LinkStateError::IllegalState)
+        ));
+    }
+
+    use super::*;
+    use crate::{
+        control::SessionControl,
+        endpoint::{InputHandle, OutputAttachment},
+        link::{
+            state::{LinkFlowState, LinkFlowStateInner, LinkState},
+            unsettled_store::Store,
+            LinkFrame,
+        },
+        util::Consumer,
+    };
+    use fe2o3_amqp_types::{
+        definitions::{ReceiverSettleMode, Role},
+        messaging::TargetArchetype,
+        performatives::{Attach, Detach},
+    };
+    use std::sync::{
+        atomic::{AtomicU64, AtomicUsize},
+        OnceLock,
+    };
+    use tokio::sync::{mpsc, Notify};
+
+    struct Probe(AtomicU64);
+    impl ControlProbe for Probe {
+        fn first_fence(&self, _: &ControlAttachment, _: &[u8]) -> u64 {
+            self.0.fetch_add(1, Ordering::AcqRel)
+        }
+        fn dispatch_fence(&self) -> u64 {
+            self.0.fetch_add(1, Ordering::AcqRel)
+        }
+        fn detach_sequence(&self, _: &ControlAttachment) -> Option<u64> {
+            Some(2)
+        }
+    }
+    fn tracking() -> ControlTracker {
+        ControlTracker::new(1, Arc::new(Probe(AtomicU64::new(0))))
+    }
+    fn fixture(
+        max_frame: usize,
+        capacity: usize,
+    ) -> (
+        Arc<Controller>,
+        mpsc::Receiver<SessionControl>,
+        mpsc::Receiver<LinkFrame>,
+        mpsc::Sender<LinkFrame>,
+        link::ArcSenderUnsettledMap,
+    ) {
+        let (control, controls) = mpsc::channel(16);
+        let (outgoing, sent) = mpsc::channel(capacity);
+        let (incoming, frames) = mpsc::channel(16);
+        let flow = Arc::new(LinkFlowState::sender(LinkFlowStateInner {
+            initial_delivery_count: 0,
+            delivery_count: 0,
+            link_credit: 1,
+            available: 0,
+            drain: false,
+            properties: None,
+        }));
+        let store = Arc::new(Store::new(None));
+        let coordinator = Coordinator {
+            capabilities: Some(
+                vec![fe2o3_amqp_types::transaction::TxnCapability::DistributedTransactions].into(),
+            ),
+        };
+        let mut link = Controller::builder()
+            .name("control")
+            .coordinator(coordinator)
+            .sender_settle_mode(SenderSettleMode::Unsettled)
+            .create_link(
+                store.clone(),
+                OutputAttachment::for_tests(0),
+                Consumer::new(Arc::new(Notify::new()), flow),
+                Arc::new(OnceLock::new()),
+                max_frame,
+            );
+        link.local_state = LinkState::Attached;
+        link.input_handle = Some(InputHandle(0));
+        let inner = SenderInner {
+            link,
+            buffer_size: 16,
+            session: control,
+            outgoing: outgoing.into(),
+            incoming: frames,
+        };
+        (
+            Arc::new(Controller {
+                inner: Mutex::new(Some(inner)),
+            }),
+            controls,
+            sent,
+            incoming,
+            store,
+        )
+    }
+    fn peer_attach() -> Attach {
+        Attach {
+            name: "control".into(),
+            handle: 17u32.into(),
+            role: Role::Receiver,
+            snd_settle_mode: SenderSettleMode::Unsettled,
+            rcv_settle_mode: ReceiverSettleMode::First,
+            source: None,
+            target: Some(Box::new(TargetArchetype::Coordinator(Coordinator {
+                capabilities: Some(
+                    vec![fe2o3_amqp_types::transaction::TxnCapability::DistributedTransactions]
+                        .into(),
+                ),
+            }))),
+            unsettled: None,
+            incomplete_unsettled: false,
+            initial_delivery_count: None,
+            max_message_size: None,
+            offered_capabilities: None,
+            desired_capabilities: None,
+            properties: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn controller_crossed_close_uses_the_exact_hook_and_keeps_phase_error() {
+        use crate::link::test_util::{drive_exact_end, CorrelationGuard};
+        for incomplete in [false, true] {
+            let (controller, controls, outgoing, incoming, _) = fixture(4096, 16);
+            let dispatch = Arc::new(AtomicBool::new(false));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut attach = peer_attach();
+            attach.incomplete_unsettled = incomplete;
+            let at = || {
+                assert_eq!(calls.load(Ordering::Acquire), 1);
+                assert!(!dropped.load(Ordering::Acquire));
+            };
+            let (result, detaches) = tokio::join!(
+                controller.close_retained_tracked_exact(dispatch.clone(), || {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    Ok::<_, std::io::Error>(CorrelationGuard(dropped.clone()))
+                }),
+                drive_exact_end(controls, outgoing, incoming, attach, at, || {
+                    at();
+                    None
+                })
+            );
+            if incomplete {
+                assert!(matches!(
+                    result,
+                    Err(link::LinkExchangeError::Attach(
+                        SenderAttachError::IllegalState
+                    ))
+                ));
+            } else {
+                result.unwrap();
+                assert_eq!(detaches, 2);
+            }
+            assert!(dispatch.load(Ordering::Acquire));
+            assert!(dropped.load(Ordering::Acquire));
+            assert!(controller.inner.try_lock().is_ok());
+        }
+    }
+
+    async fn control_detach(
+        discharge: bool,
+        fail: bool,
+        closed: bool,
+        error: Option<definitions::Error>,
+    ) {
+        let (controller, _controls, mut sent, incoming, store) = fixture(4096, 16);
+        let tracker = tracking();
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let mut transaction = SharedTransaction {
+            controller: controller.clone(),
+            declared: Declared {
+                txn_id: vec![1].into(),
+            },
+            dispatched: dispatched.clone(),
+            completed: false,
+        };
+        let work = async {
+            if discharge {
+                transaction.discharge_tracked(fail, tracker.clone()).await
+            } else {
+                SharedTransaction::declare_tracked(
+                    controller.clone(),
+                    None,
+                    dispatched.clone(),
+                    tracker.clone(),
+                )
+                .await
+                .map(drop)
+            }
+        };
+        tokio::pin!(work);
+        tokio_test::assert_pending!(futures_util::poll!(work.as_mut()));
+        let LinkFrame::Transfer { performative, .. } = sent.recv().await.unwrap() else {
+            panic!("control Transfer")
+        };
+        assert!(dispatched.load(Ordering::Acquire));
+        assert!(tracker.receipt().complete());
+        if closed {
+            store.close(match &error {
+                Some(error) => LinkStateError::RemoteClosedWithError(error.clone()),
+                None => LinkStateError::RemoteClosed,
+            });
+        }
+        incoming
+            .send(LinkFrame::Detach(
+                Detach {
+                    handle: 0u32.into(),
+                    closed,
+                    error: error.clone(),
+                },
+                crate::endpoint::AttachmentId::allocate(),
+            ))
+            .await
+            .unwrap();
+        let result = work.await;
+        assert!(
+            matches!(result,Err(ControllerSendError::ControlDetached {closed:actual,error:actual_error,receipt:Some(receipt)}) if actual==closed && actual_error==error && receipt.complete() && receipt.delivery_tag()==performative.delivery_tag.as_ref().map(|t|t.as_ref()))
+        );
+        assert!(controller.inner.try_lock().is_ok());
+        if !closed {
+            assert_eq!(store.read().as_ref().unwrap().len(), 1);
+        }
+        assert!(sent.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn a_nonclosing_coordinator_detach_completes_the_tracked_control_wait() {
+        for discharge in [false, true] {
+            for fail in [false, true] {
+                control_detach(
+                    discharge,
+                    fail,
+                    false,
+                    Some(definitions::Error::new(
+                        fe2o3_amqp_types::transaction::TransactionError::Rollback,
+                        None,
+                        None,
+                    )),
+                )
+                .await;
+            }
+        }
+    }
+    #[tokio::test]
+    async fn control_detach_and_confirmed_outcome_keep_their_provenance() {
+        for discharge in [false, true] {
+            for closed in [false, true] {
+                control_detach(discharge, false, closed, None).await;
+            }
+        }
+        for discharge in [false, true] {
+            for closed in [false, true] {
+                let (controller, _controls, mut sent, incoming, _store) = fixture(4096, 16);
+                let tracker = tracking();
+                let dispatched = Arc::new(AtomicBool::new(false));
+                incoming
+                    .send(LinkFrame::Detach(
+                        Detach {
+                            handle: 0u32.into(),
+                            closed,
+                            error: None,
+                        },
+                        crate::endpoint::AttachmentId::allocate(),
+                    ))
+                    .await
+                    .unwrap();
+                let mut transaction = SharedTransaction {
+                    controller: controller.clone(),
+                    declared: Declared {
+                        txn_id: vec![1].into(),
+                    },
+                    dispatched: dispatched.clone(),
+                    completed: false,
+                };
+                let result = if discharge {
+                    transaction.discharge_tracked(false, tracker.clone()).await
+                } else {
+                    SharedTransaction::declare_tracked(
+                        controller.clone(),
+                        None,
+                        dispatched.clone(),
+                        tracker.clone(),
+                    )
+                    .await
+                    .map(drop)
+                };
+                assert!(
+                    matches!(result,Err(ControllerSendError::ControlDetached {closed:actual,error:None,..}) if actual==closed)
+                );
+                assert!(!dispatched.load(Ordering::Acquire));
+                assert!(tracker.receipt().first_fence().is_none());
+                assert!(tracker.receipt().complete_fence().is_none());
+                assert!(tracker.receipt().answered().is_none());
+                assert!(sent.try_recv().is_err());
+                assert!(controller.inner.try_lock().is_ok());
+            }
+        }
+        for closed in [false, true] {
+            let (controller, _controls, mut sent, incoming, store) = fixture(4096, 16);
+            let tracker = tracking();
+            let dispatched = Arc::new(AtomicBool::new(false));
+            let work = SharedTransaction::declare_tracked(
+                controller.clone(),
+                None,
+                dispatched,
+                tracker.clone(),
+            );
+            tokio::pin!(work);
+            tokio_test::assert_pending!(futures_util::poll!(work.as_mut()));
+            let LinkFrame::Transfer { performative, .. } = sent.recv().await.unwrap() else {
+                panic!("control Transfer")
+            };
+            let state = DeliveryState::Declared(Declared {
+                txn_id: vec![7].into(),
+            });
+            let message = store
+                .withdraw(performative.delivery_tag.as_ref().unwrap())
+                .unwrap();
+            message.settle_with_state(Some(state.clone())).unwrap();
+            assert_eq!(tracker.receipt().answered(), Some(&state));
+            incoming
+                .send(LinkFrame::Detach(
+                    Detach {
+                        handle: 0u32.into(),
+                        closed,
+                        error: None,
+                    },
+                    crate::endpoint::AttachmentId::allocate(),
+                ))
+                .await
+                .unwrap();
+            let transaction = work.await.unwrap();
+            assert_eq!(
+                super::super::TransactionBase::txn_id(&transaction).as_ref(),
+                &[7u8]
+            );
+            assert!(controller.inner.try_lock().is_ok());
+        }
+    }
+    #[tokio::test]
+    async fn control_receipt_requires_final_admission_and_original_attachment() {
+        for discharge in [false, true] {
+            for closed in [false, true] {
+                for with_error in [false, true] {
+                    let (controller, _controls, mut sent, incoming, store) = fixture(512, 1);
+                    let tracker = tracking();
+                    let dispatched = Arc::new(AtomicBool::new(false));
+                    let mut transaction = SharedTransaction {
+                        controller: controller.clone(),
+                        declared: Declared {
+                            txn_id: vec![1; 1024].into(),
+                        },
+                        dispatched: dispatched.clone(),
+                        completed: false,
+                    };
+                    let work = async {
+                        if discharge {
+                            transaction.discharge_tracked(false, tracker.clone()).await
+                        } else {
+                            SharedTransaction::declare_tracked(
+                                controller.clone(),
+                                Some(vec![2; 1024].into()),
+                                dispatched.clone(),
+                                tracker.clone(),
+                            )
+                            .await
+                            .map(drop)
+                        }
+                    };
+                    tokio::pin!(work);
+                    tokio_test::assert_pending!(futures_util::poll!(work.as_mut()));
+                    assert_eq!(sent.len(), 1);
+                    assert!(dispatched.load(Ordering::Acquire));
+                    let receipt = tracker.receipt();
+                    assert!(receipt.first_fence().is_some());
+                    assert!(!receipt.complete());
+                    assert!(receipt.complete_fence().is_none());
+                    let error = with_error.then(|| {
+                        definitions::Error::new(
+                            fe2o3_amqp_types::transaction::TransactionError::Rollback,
+                            None,
+                            None,
+                        )
+                    });
+                    incoming
+                        .send(LinkFrame::Detach(
+                            Detach {
+                                handle: 0u32.into(),
+                                closed,
+                                error: error.clone(),
+                            },
+                            crate::endpoint::AttachmentId::allocate(),
+                        ))
+                        .await
+                        .unwrap();
+                    let result = work.await;
+                    assert!(
+                        matches!(result,Err(ControllerSendError::ControlDetached {closed:actual,error:actual_error,receipt:Some(receipt)}) if actual==closed && actual_error==error && receipt.first_fence().is_some() && !receipt.complete())
+                    );
+                    assert!(controller.inner.try_lock().is_ok());
+                    let LinkFrame::Transfer { performative, .. } = sent.try_recv().unwrap() else {
+                        panic!("first fragment")
+                    };
+                    assert!(performative.more);
+                    if !closed {
+                        assert_eq!(store.read().as_ref().unwrap().len(), 1);
+                    }
+                    assert!(sent.try_recv().is_err());
+                }
+            }
+        }
+    }
+}

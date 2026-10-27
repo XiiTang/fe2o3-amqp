@@ -12,6 +12,22 @@ use crate::Payload;
 
 use super::{Error, FRAME_TYPE_AMQP};
 
+/// Internal proof that an incoming Transfer was refused before link consumption.
+#[doc(hidden)]
+pub struct RefusedTransfer {
+    _private: (),
+}
+impl std::fmt::Debug for RefusedTransfer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TransferRefused")
+    }
+}
+impl RefusedTransfer {
+    pub(crate) fn new() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// AMQP frame
 #[derive(Debug)]
 pub struct Frame {
@@ -173,6 +189,7 @@ impl Encoder<Frame> for FrameEncoder {
         use serde_amqp::ser::Serializer;
 
         match item.body {
+            FrameBody::TransferRefused(_) => unreachable!("refused Transfer cannot be encoded"),
             FrameBody::Open(performative) => {
                 write_header(dst, item.channel);
                 let mut serializer = Serializer::from(dst.writer());
@@ -296,6 +313,9 @@ impl Decoder for FrameDecoder {
 /// AMQP frame body
 // #[derive(Debug)]
 pub enum FrameBody {
+    /// Internal incoming-only marker; never encoded on the wire.
+    #[doc(hidden)]
+    TransferRefused(RefusedTransfer),
     // Frames handled by Link
     /// Attach performative
     Attach(Attach),
@@ -339,6 +359,7 @@ pub enum FrameBody {
 impl std::fmt::Debug for FrameBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::TransferRefused(_) => f.write_str("TransferRefused"),
             Self::Attach(arg0) => f.debug_tuple("Attach").field(arg0).finish(),
             Self::Flow(arg0) => f.debug_tuple("Flow").field(arg0).finish(),
             Self::Transfer {

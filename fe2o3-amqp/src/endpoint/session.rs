@@ -80,6 +80,9 @@ pub(crate) trait Session {
         flow: Flow,
     ) -> impl Future<Output = Result<Option<SessionOutgoingItem>, Self::Error>> + Send;
 
+    /// Consume a refused Transfer only in session window/sequence accounting.
+    fn on_refused_incoming_transfer(&mut self);
+
     /// Handle an incoming transfer.
     ///
     /// An `Ok(Some(Disposition))` is produced only by the transactional session

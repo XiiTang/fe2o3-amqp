@@ -555,13 +555,21 @@ where
                         // tracing::debug!("raw bytes {:#x?}", &src[..]);
                         let raw = this.observer.as_ref().map(|_| src.clone().freeze());
                         let mut decoder = amqp::FrameDecoder {};
-                        let decoded = decoder.decode(&mut src).map_err(Into::into);
+                        let mut decoded = decoder.decode(&mut src).map_err(Into::into);
                         if let (Ok(Some(frame)), Some(raw), Some(observer)) =
-                            (&decoded, raw, this.observer.as_ref())
+                            (&mut decoded, raw, this.observer.as_ref())
                         {
-                            observer.incoming(std::sync::Arc::new(
+                            let action = observer.incoming(std::sync::Arc::new(
                                 observation::IncomingFrame::from_decoded(raw, frame),
                             ));
+                            if matches!(action, observation::IncomingFrameAction::RefuseTransfer) {
+                                assert!(
+                                    matches!(frame.body, amqp::FrameBody::Transfer { .. }),
+                                    "only Transfer may be refused"
+                                );
+                                frame.body =
+                                    amqp::FrameBody::TransferRefused(amqp::RefusedTransfer::new());
+                            }
                         }
                         Poll::Ready(decoded.transpose())
                     }

@@ -69,6 +69,215 @@ impl Default for CreditMode {
     }
 }
 
+/// A receive result before a saved protocol-fault close is dispatched.
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the native Delivery is the hot path and must move without an extra allocation"
+)]
+pub enum ReceiverReadStep<T> {
+    /// A complete delivery from the normal receiver parser.
+    Delivery(Delivery<T>),
+    /// The receiver saved its fault; its owner must finish the close.
+    SelfClosing,
+}
+
+/// A receive-preserving step of an explicit suspension.
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the native Delivery is the hot path and must move without an extra allocation"
+)]
+pub enum ReceiverDetachStep<T> {
+    /// A complete delivery preceding the Detach reply.
+    Delivery(Delivery<T>),
+    /// A saved protocol fault requires its owned close.
+    SelfClosing,
+    /// The peer suspended this attachment.
+    Suspended {
+        /// The original peer error, if any.
+        error: Option<definitions::Error>,
+    },
+    /// The crossed mandatory closing handshake completed.
+    Closed {
+        /// The original closing Detach's error, if any.
+        error: Option<definitions::Error>,
+    },
+}
+
+/// A queued receive result after the original native session stopped.
+#[derive(Debug)]
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the native Delivery is the hot path and must move without an extra allocation"
+)]
+pub enum ReceiverCollectionStep<T> {
+    /// A complete delivery from the normal parser.
+    Delivery(Delivery<T>),
+    /// The native queue is exhausted.
+    Drained {
+        /// The original session's immutable stop reason.
+        reason: SessionStopReason,
+    },
+    /// A queued closing Detach prevents recovery.
+    Closed {
+        /// The original peer error, if any.
+        error: Option<definitions::Error>,
+    },
+}
+
+/// The receive or exchange phase that prevented suspension.
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiverDetachError<E> {
+    /// A native receive fault.
+    #[error("receive failed during suspension")]
+    Receive(#[source] RecvError),
+    /// A crossed end exchange failed.
+    #[error("crossed exchange failed during suspension")]
+    Exchange(#[source] super::LinkExchangeError<ReceiverAttachError, E>),
+}
+
+/// The parser's decision for exactly one consumed Transfer.
+#[derive(Debug)]
+pub enum ReceiverTransferEffect {
+    /// A payload fragment is retained for completion.
+    PayloadIncomplete,
+    /// A complete delivery was constructed.
+    Delivered {
+        /// That delivery's exact native identity.
+        info: DeliveryInfo,
+    },
+    /// The peer aborted the delivery.
+    Aborted,
+    /// The native recovery parser ignored an unknown resumed delivery.
+    Ignored {
+        /// Whether the ignored delivery continues.
+        more: bool,
+    },
+    /// A retained complete delivery was resumed without redelivery.
+    StateOnly {
+        /// The first frame's exact new identity, if one was installed.
+        info: Option<DeliveryInfo>,
+        /// Whether the tag remains in the native store.
+        retained: bool,
+        /// Whether this resumed delivery continues.
+        more: bool,
+    },
+    /// This frame failed native validation or parsing.
+    Failed,
+}
+
+/// Original framing identity, before continuation normalization.
+pub struct ReceiverTransferHeader {
+    handle: u32,
+    delivery_id: Option<u32>,
+    delivery_tag: Option<DeliveryTag>,
+    message_format: Option<u32>,
+    more: bool,
+    aborted: bool,
+    resume: bool,
+}
+
+impl std::fmt::Debug for ReceiverTransferHeader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReceiverTransferHeader")
+    }
+}
+
+impl ReceiverTransferHeader {
+    /// The original incoming link handle.
+    pub fn handle(&self) -> u32 {
+        self.handle
+    }
+    /// The unnormalized delivery id, including omission.
+    pub fn delivery_id(&self) -> Option<u32> {
+        self.delivery_id
+    }
+    /// The unnormalized delivery tag, including omission.
+    pub fn delivery_tag(&self) -> Option<&DeliveryTag> {
+        self.delivery_tag.as_ref()
+    }
+    /// The unnormalized message format, including omission.
+    pub fn message_format(&self) -> Option<u32> {
+        self.message_format
+    }
+    /// The original more bit.
+    pub fn more(&self) -> bool {
+        self.more
+    }
+    /// The original aborted bit.
+    pub fn aborted(&self) -> bool {
+        self.aborted
+    }
+    /// The original resume bit.
+    pub fn resume(&self) -> bool {
+        self.resume
+    }
+}
+
+/// One native decision tied to the exact original Transfer header.
+#[derive(Debug)]
+pub struct ReceiverTransferProgress {
+    original: ReceiverTransferHeader,
+    effect: ReceiverTransferEffect,
+}
+
+impl ReceiverTransferProgress {
+    /// Original, unnormalized framing identity.
+    pub fn original(&self) -> &ReceiverTransferHeader {
+        &self.original
+    }
+    /// The native parser's authoritative decision.
+    pub fn effect(&self) -> &ReceiverTransferEffect {
+        &self.effect
+    }
+}
+
+/// Synchronous progress sink; callbacks run outside native map and flow locks.
+pub trait ReceiverTransferObserver: Send {
+    /// Runs before this frame changes native parser state.
+    fn begin(&mut self, original: &ReceiverTransferHeader);
+    /// Runs once after the native semantic decision, before another frame.
+    fn transfer(&mut self, progress: ReceiverTransferProgress);
+}
+
+struct NoopTransferObserver;
+impl ReceiverTransferObserver for NoopTransferObserver {
+    fn begin(&mut self, _: &ReceiverTransferHeader) {}
+    fn transfer(&mut self, _: ReceiverTransferProgress) {}
+}
+
+#[derive(Clone, Copy)]
+enum ReceiveContext {
+    Live,
+    Stopped,
+}
+
+#[derive(Debug)]
+enum ReceiveFault {
+    Error(RecvError),
+    SelfClosing,
+}
+impl From<RecvError> for ReceiveFault {
+    fn from(error: RecvError) -> Self {
+        Self::Error(error)
+    }
+}
+
+struct TransferCommit {
+    original: Option<ReceiverTransferHeader>,
+}
+impl TransferCommit {
+    fn commit<O: ReceiverTransferObserver + ?Sized>(
+        &mut self,
+        effect: ReceiverTransferEffect,
+        observer: &mut O,
+    ) {
+        let original = self.original.take().expect("each Transfer commits once");
+        observer.transfer(ReceiverTransferProgress { original, effect });
+    }
+}
+
 /// An AMQP1.0 receiver
 ///
 /// # Attach a new receiver with default configurations
@@ -121,6 +330,284 @@ pub struct Receiver {
 }
 
 impl Receiver {
+    /// Receive with authoritative per-Transfer progress, before protocol-close wire work.
+    pub async fn recv_observed<T, O>(
+        &mut self,
+        observer: &mut O,
+    ) -> Result<ReceiverReadStep<T>, RecvError>
+    where
+        for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
+    {
+        self.inner.recv_observed(observer).await
+    }
+
+    /// The saved native cause of a signalled protocol-fault close.
+    pub fn self_close_cause(&self) -> Option<&RecvError> {
+        self.inner.self_close.as_ref().map(|close| &close.cause)
+    }
+
+    /// Finish the saved protocol close without replay, keeping scoped correlation.
+    pub async fn finish_self_close_exact<F, G, E>(
+        &mut self,
+        before: &mut F,
+    ) -> Result<(), super::LinkExchangeError<ReceiverAttachError, E>>
+    where
+        F: FnMut() -> Result<G, E> + Send,
+        G: Send,
+        E: Send,
+    {
+        use super::{state::LinkState, LinkExchangeError as X};
+        let error = self
+            .inner
+            .self_close
+            .as_ref()
+            .ok_or(X::Detach(DetachError::IllegalState))?
+            .error
+            .clone();
+        match self.inner.link.local_state() {
+            LinkState::Closed => {}
+            LinkState::Detached => {
+                super::shared_inner::reattach_then_close_exact(
+                    &mut self.inner,
+                    before,
+                    Some(error),
+                )
+                .await?;
+            }
+            state => {
+                let was_detaching = matches!(state, LinkState::DetachSent);
+                if !matches!(state, LinkState::DetachSent | LinkState::CloseSent) {
+                    self.inner
+                        .send_detach(true, Some(error.clone()))
+                        .await
+                        .map_err(X::Detach)?;
+                }
+                let reply = super::shared_inner::recv_remote_detach(&mut self.inner)
+                    .await
+                    .map_err(X::Detach)?;
+                if was_detaching {
+                    if !reply.closed {
+                        let _ = self.inner.link.apply_remote_detach_outcome(reply);
+                    }
+                    super::shared_inner::reattach_then_close_exact(
+                        &mut self.inner,
+                        before,
+                        Some(error),
+                    )
+                    .await?;
+                } else if reply.closed {
+                    self.inner.link.on_detach_reply(reply).map_err(X::Detach)?;
+                } else {
+                    let _ = self.inner.link.apply_remote_detach_outcome(reply);
+                    super::shared_inner::reattach_then_close_exact(
+                        &mut self.inner,
+                        before,
+                        Some(error),
+                    )
+                    .await?;
+                }
+            }
+        }
+        self.inner.self_close.take();
+        Ok(())
+    }
+
+    /// Drain in-flight deliveries while waiting for an explicit suspension reply.
+    pub async fn recv_detaching_exact<T, O, F, G, E>(
+        &mut self,
+        observer: &mut O,
+        before: &mut F,
+    ) -> Result<ReceiverDetachStep<T>, ReceiverDetachError<E>>
+    where
+        for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
+        F: FnMut() -> Result<G, E> + Send,
+        G: Send,
+        E: Send,
+    {
+        loop {
+            if self.inner.self_close.is_some() {
+                return Ok(ReceiverDetachStep::SelfClosing);
+            }
+            if !matches!(
+                self.inner.link.local_state(),
+                super::state::LinkState::DetachSent
+            ) {
+                return Err(ReceiverDetachError::Receive(
+                    LinkStateError::IllegalState.into(),
+                ));
+            }
+            let frame = self
+                .inner
+                .incoming
+                .recv()
+                .await
+                .ok_or_else(|| ReceiverDetachError::Receive(self.inner.stopped()))?;
+            match frame {
+                LinkFrame::Transfer {
+                    performative,
+                    payload,
+                    window_slot,
+                    ..
+                } => {
+                    match self
+                        .inner
+                        .receive_transfer(
+                            performative,
+                            payload,
+                            window_slot,
+                            ReceiveContext::Live,
+                            observer,
+                        )
+                        .await
+                    {
+                        Ok(Some(delivery)) => return Ok(ReceiverDetachStep::Delivery(delivery)),
+                        Ok(None) => {}
+                        Err(ReceiveFault::SelfClosing) => {
+                            return Ok(ReceiverDetachStep::SelfClosing)
+                        }
+                        Err(ReceiveFault::Error(error)) => {
+                            return Err(ReceiverDetachError::Receive(error))
+                        }
+                    }
+                }
+                LinkFrame::Detach(detach, _) => {
+                    let closed = detach.closed;
+                    let error = detach.error.clone();
+                    if closed {
+                        super::shared_inner::reattach_then_close_exact(
+                            &mut self.inner,
+                            before,
+                            None,
+                        )
+                        .await
+                        .map_err(ReceiverDetachError::Exchange)?;
+                        return Ok(ReceiverDetachStep::Closed { error });
+                    }
+                    let result = self.inner.link.apply_remote_detach_outcome(detach);
+                    if matches!(result, Err(super::ApplyRemoteDetachError::IllegalState)) {
+                        return Err(ReceiverDetachError::Receive(
+                            LinkStateError::IllegalState.into(),
+                        ));
+                    }
+                    return Ok(ReceiverDetachStep::Suspended { error });
+                }
+                LinkFrame::Attach(_) => {
+                    return Err(ReceiverDetachError::Receive(
+                        LinkStateError::IllegalState.into(),
+                    ))
+                }
+                LinkFrame::Flow(..) | LinkFrame::Disposition(_) => {
+                    unreachable!("handled by LinkRelay")
+                }
+                #[cfg(feature = "transaction")]
+                LinkFrame::Acquisition(_) => {
+                    self.inner.close_itself(
+                        definitions::Error::new(
+                            AmqpError::NotImplemented,
+                            "Transactional acquisition is not implemented".to_string(),
+                            None,
+                        ),
+                        RecvError::TransactionalAcquisitionIsNotImeplemented,
+                    );
+                    return Ok(ReceiverDetachStep::SelfClosing);
+                }
+            }
+        }
+    }
+
+    /// Consume only input queued by the original, already-stopped native session.
+    pub async fn recv_collecting_stopped<T, O>(
+        &mut self,
+        observer: &mut O,
+    ) -> Result<ReceiverCollectionStep<T>, RecvError>
+    where
+        for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
+    {
+        let reason = self
+            .inner
+            .link
+            .session_stop_reason
+            .get()
+            .cloned()
+            .ok_or(RecvError::LinkStateError(LinkStateError::IllegalState))?;
+        if let Some(close) = self.inner.self_close.take() {
+            return Err(close.cause);
+        }
+        loop {
+            let frame = match self.inner.incoming.try_recv() {
+                Ok(frame) => frame,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Ok(ReceiverCollectionStep::Drained { reason })
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    return Err(LinkStateError::IllegalState.into())
+                }
+            };
+            match frame {
+                LinkFrame::Transfer {
+                    performative,
+                    payload,
+                    window_slot,
+                    ..
+                } => {
+                    match self
+                        .inner
+                        .receive_transfer(
+                            performative,
+                            payload,
+                            window_slot,
+                            ReceiveContext::Stopped,
+                            observer,
+                        )
+                        .await
+                    {
+                        Ok(Some(delivery)) => {
+                            return Ok(ReceiverCollectionStep::Delivery(delivery))
+                        }
+                        Ok(None) => {}
+                        Err(ReceiveFault::Error(error)) => return Err(error),
+                        Err(ReceiveFault::SelfClosing) => {
+                            unreachable!("stopped collection cannot initiate close")
+                        }
+                    }
+                }
+                LinkFrame::Detach(detach, _) => {
+                    let closed = detach.closed;
+                    let error = detach.error.clone();
+                    let _ = self.inner.link.apply_remote_detach_outcome(detach);
+                    if closed {
+                        return Ok(ReceiverCollectionStep::Closed { error });
+                    }
+                }
+                LinkFrame::Attach(_) => return Err(LinkStateError::IllegalState.into()),
+                LinkFrame::Flow(..) | LinkFrame::Disposition(_) => {
+                    unreachable!("handled by LinkRelay")
+                }
+                #[cfg(feature = "transaction")]
+                LinkFrame::Acquisition(_) => {
+                    return Err(RecvError::TransactionalAcquisitionIsNotImeplemented)
+                }
+            }
+        }
+    }
+
+    /// Close in place, arming correlation before every internal reattachment.
+    pub async fn close_in_place_exact<F, G, E>(
+        &mut self,
+        peer_suspended: bool,
+        mut before: F,
+    ) -> Result<(), super::LinkExchangeError<ReceiverAttachError, E>>
+    where
+        F: FnMut() -> Result<G, E> + Send,
+        G: Send,
+        E: Send,
+    {
+        super::shared_inner::close_exact(&mut self.inner, peer_suspended, &mut before).await
+    }
+
     /// Creates a builder for the [`Receiver`]
     pub fn builder(
     ) -> builder::Builder<role::ReceiverMarker, Target, WithoutName, WithoutSource, WithTarget>
@@ -1094,6 +1581,14 @@ where
             .await
     }
 
+    async fn exchange_attach_for_close(
+        &mut self,
+    ) -> Result<(), <Self::Link as LinkAttach>::AttachError> {
+        self.link
+            .exchange_attach_for_close(&self.outgoing, &mut self.incoming)
+            .await
+    }
+
     async fn handle_attach_error(
         &mut self,
         attach_error: <Self::Link as LinkAttach>::AttachError,
@@ -1157,69 +1652,115 @@ where
     where
         for<'de> T: FromBody<'de> + Send,
     {
+        match self.recv_observed(&mut NoopTransferObserver).await? {
+            ReceiverReadStep::Delivery(delivery) => Ok(delivery),
+            ReceiverReadStep::SelfClosing => Err(self.finish_self_close().await),
+        }
+    }
+
+    async fn recv_observed<T, O>(
+        &mut self,
+        observer: &mut O,
+    ) -> Result<ReceiverReadStep<T>, RecvError>
+    where
+        for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
+    {
         loop {
-            match self.recv_inner().await? {
-                Some(delivery) => return Ok(delivery),
-                None => continue, // Incomplete transfer, there are more transfer frames coming
+            match self.recv_inner(ReceiveContext::Live, observer).await {
+                Ok(Some(delivery)) => return Ok(ReceiverReadStep::Delivery(delivery)),
+                Ok(None) => {}
+                Err(ReceiveFault::Error(error)) => return Err(error),
+                Err(ReceiveFault::SelfClosing) => return Ok(ReceiverReadStep::SelfClosing),
             }
         }
     }
 
-    /// # Cancel safety
-    ///
-    /// This is cancel safe because all internal `.await` point(s) are cancel
-    /// safe (`tokio::sync::mpsc` operations and synchronous processing)
-    #[inline]
-    pub(crate) async fn recv_inner<T>(&mut self) -> Result<Option<Delivery<T>>, RecvError>
+    async fn recv_inner<T, O>(
+        &mut self,
+        context: ReceiveContext,
+        observer: &mut O,
+    ) -> Result<Option<Delivery<T>>, ReceiveFault>
     where
         for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
     {
-        // A close this receiver started goes on before anything else is read:
-        // a `recv` dropped mid-close resumes it here.
         if self.self_close.is_some() {
-            return Err(self.finish_self_close().await);
+            return Err(ReceiveFault::SelfClosing);
         }
-        // When the session or the connection stops, the channel closes and this
-        // returns `RecvError::LinkStateError(SessionStopped(reason))` with the
-        // stop reason observed by the link.
-        let frame = match self.incoming.recv().await {
-            // cancel safe
-            Some(frame) => frame,
-            None => return Err(self.stopped()),
-        };
-
+        let frame = self.incoming.recv().await.ok_or_else(|| self.stopped())?;
         match frame {
-            LinkFrame::Detach(detach, _) => Err(self.on_incoming_detach(detach).await),
             LinkFrame::Transfer {
-                input_handle: _,
-                attachment: _,
                 performative,
                 payload,
                 window_slot,
-                queue_slot: _,
+                ..
             } => {
-                let result = self.on_incoming_transfer(performative, payload).await;
-                drop(window_slot);
-                result
-            } // cancel safe
-            LinkFrame::Attach(_) => Err(LinkStateError::IllegalState.into()),
-            LinkFrame::Flow(..) | LinkFrame::Disposition(_) => {
-                // Flow and Disposition are handled by LinkRelay which runs
-                // in the session loop
-                unreachable!()
+                self.receive_transfer(performative, payload, window_slot, context, observer)
+                    .await
             }
+            LinkFrame::Detach(detach, _) => {
+                let closed = detach.closed;
+                let error = match self.link.apply_remote_detach_outcome(detach) {
+                    Err(error) => RecvError::from(error),
+                    Ok(()) if closed => RecvError::from(LinkStateError::RemoteClosed),
+                    Ok(()) => RecvError::from(LinkStateError::RemoteDetached),
+                };
+                Err(error.into())
+            }
+            LinkFrame::Attach(_) => Err(RecvError::from(LinkStateError::IllegalState).into()),
+            LinkFrame::Flow(..) | LinkFrame::Disposition(_) => unreachable!("handled by LinkRelay"),
             #[cfg(feature = "transaction")]
             LinkFrame::Acquisition(_) => {
-                let error = definitions::Error::new(
-                    AmqpError::NotImplemented,
-                    "Transactional acquisition is not implemented".to_string(),
-                    None,
-                );
-                Err(self
-                    .close_itself(error, RecvError::TransactionalAcquisitionIsNotImeplemented)
-                    .await)
+                let cause = RecvError::TransactionalAcquisitionIsNotImeplemented;
+                if matches!(context, ReceiveContext::Stopped) {
+                    return Err(cause.into());
+                }
+                Err(self.close_itself(
+                    definitions::Error::new(
+                        AmqpError::NotImplemented,
+                        "Transactional acquisition is not implemented".to_string(),
+                        None,
+                    ),
+                    cause,
+                ))
             }
         }
+    }
+
+    async fn receive_transfer<T, O>(
+        &mut self,
+        performative: Transfer,
+        payload: Payload,
+        window_slot: Option<crate::session::receive_window::Slot>,
+        context: ReceiveContext,
+        observer: &mut O,
+    ) -> Result<Option<Delivery<T>>, ReceiveFault>
+    where
+        for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
+    {
+        let original = ReceiverTransferHeader {
+            handle: performative.handle.0,
+            delivery_id: performative.delivery_id,
+            delivery_tag: performative.delivery_tag.clone(),
+            message_format: performative.message_format,
+            more: performative.more,
+            aborted: performative.aborted,
+            resume: performative.resume,
+        };
+        observer.begin(&original);
+        let mut commit = TransferCommit {
+            original: Some(original),
+        };
+        let result = self
+            .on_incoming_transfer(performative, payload, context, observer, &mut commit)
+            .await;
+        if result.is_err() && commit.original.is_some() {
+            commit.commit(ReceiverTransferEffect::Failed, observer);
+        }
+        drop(window_slot);
+        result
     }
 
     /// The one place a Detach the link receives is told apart. One that
@@ -1261,9 +1802,9 @@ where
     /// Closes the link because of `cause`, sending `error` in its closing
     /// Detach. The cause is recorded before the Detach is sent, so a `recv`
     /// dropped at any point resumes the close and returns the cause.
-    async fn close_itself(&mut self, error: definitions::Error, cause: RecvError) -> RecvError {
+    fn close_itself(&mut self, error: definitions::Error, cause: RecvError) -> ReceiveFault {
         self.self_close = Some(SelfClose { error, cause });
-        self.finish_self_close().await
+        ReceiveFault::SelfClosing
     }
 
     /// Sends the closing Detach if it is not out yet, then reads the link's
@@ -1318,24 +1859,31 @@ where
     /// Close the link because a transfer violated the multi-frame delivery
     /// rules. AMQP 1.0 §2.6.5 requires the endpoint to be detached with error
     /// information and then destroyed.
-    async fn close_on_malformed_delivery(
+    fn close_on_malformed_delivery(
         &mut self,
         error: ReceiverTransferError,
-    ) -> Result<(), RecvError> {
+        context: ReceiveContext,
+    ) -> Result<(), ReceiveFault> {
+        if matches!(context, ReceiveContext::Stopped) {
+            return Err(RecvError::from(error).into());
+        }
         let detach_error = definitions::Error::new(
             definitions::AmqpError::NotAllowed,
             Some(error.to_string()),
             None,
         );
-        Err(self.close_itself(detach_error, error.into()).await)
+        Err(self.close_itself(detach_error, error.into()))
     }
 
-    async fn on_transfer_state(
+    fn on_transfer_state<O: ReceiverTransferObserver + ?Sized>(
         &mut self,
         delivery_tag: &Option<DeliveryTag>,
         settled: Option<bool>,
         state: DeliveryState,
-    ) -> Result<(), RecvError> {
+        context: ReceiveContext,
+        _observer: &mut O,
+        _commit: &mut TransferCommit,
+    ) -> Result<(), ReceiveFault> {
         let effective_tag = delivery_tag.clone().or_else(|| {
             self.incomplete_transfer
                 .as_ref()
@@ -1343,36 +1891,40 @@ where
         });
         if effective_tag.is_none() {
             return self
-                .close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone)
-                .await;
+                .close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone, context);
         }
         if let Some(partial) = &mut self.incomplete_transfer {
             if partial.performative.delivery_tag == effective_tag {
                 if let DeliveryState::Received(received) = &state {
-                    partial.keep_buffer_till_section_number_and_offset(
-                        received.section_number,
-                        received.section_offset,
-                    )?;
+                    partial
+                        .keep_buffer_till_section_number_and_offset(
+                            received.section_number,
+                            received.section_offset,
+                        )
+                        .map_err(RecvError::from)?;
                 }
             }
         }
         self.link
             .on_transfer_state(&effective_tag, settled, state)
-            .map_err(Into::into)
+            .map_err(|error| ReceiveFault::from(RecvError::from(error)))
     }
 
-    async fn on_incomplete_transfer(
+    fn on_incomplete_transfer<O: ReceiverTransferObserver + ?Sized>(
         &mut self,
         transfer: Transfer,
         payload: Payload,
-    ) -> Result<(), RecvError> {
+        context: ReceiveContext,
+        observer: &mut O,
+        commit: &mut TransferCommit,
+    ) -> Result<(), ReceiveFault> {
         // Partial transfer of the delivery
         match &mut self.incomplete_transfer {
             Some(incomplete) => {
                 if let Err(error) = incomplete.or_assign(transfer) {
-                    return self.close_on_malformed_delivery(error).await;
+                    return self.close_on_malformed_delivery(error, context);
                 }
-                incomplete.append(payload)?;
+                incomplete.append(payload).map_err(RecvError::from)?;
 
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
@@ -1390,8 +1942,8 @@ where
                         Err(
                             error @ (ReceiverTransferError::DeliveryIdIsNone
                             | ReceiverTransferError::DeliveryTagIsNone),
-                        ) => return self.close_on_malformed_delivery(error).await,
-                        Err(error) => return Err(error.into()),
+                        ) => return self.close_on_malformed_delivery(error, context),
+                        Err(error) => return Err(RecvError::from(error).into()),
                     };
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
@@ -1405,6 +1957,7 @@ where
             }
         }
 
+        commit.commit(ReceiverTransferEffect::PayloadIncomplete, observer);
         Ok(())
     }
 
@@ -1427,11 +1980,12 @@ where
     /// max-message-size, as required for a `message-size-exceeded` link error
     /// (AMQP 1.0 §2.6.5). The buffered chunks are discarded and the link can
     /// only be restored by resuming it.
-    async fn close_on_message_size_exceeded(
+    fn close_on_message_size_exceeded(
         &mut self,
         total_size: u64,
         max_size: u64,
-    ) -> RecvError {
+        context: ReceiveContext,
+    ) -> ReceiveFault {
         #[cfg(feature = "tracing")]
         tracing::warn!(
             "Detaching link: received message of {total_size} bytes exceeds the max message size of {max_size}"
@@ -1454,58 +2008,76 @@ where
             size: total_size,
             max_size,
         });
-        self.close_itself(error, cause).await
+        if matches!(context, ReceiveContext::Stopped) {
+            cause.into()
+        } else {
+            self.close_itself(error, cause)
+        }
     }
 
     /// # Cancel safety
     ///
     /// This is cancel safe because all internal `.await` point(s) are cancel safe
-    async fn on_complete_transfer<T>(
+    async fn on_complete_transfer<T, O>(
         &mut self,
         transfer: Transfer,
         payload: Payload,
-    ) -> Result<Option<Delivery<T>>, RecvError>
+        context: ReceiveContext,
+        observer: &mut O,
+        commit: &mut TransferCommit,
+    ) -> Result<Option<Delivery<T>>, ReceiveFault>
     where
         for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
     {
         // Enforce the negotiated max-message-size of the link before
         // assembling the delivery
         if let Some(max_size) = self.link.max_message_size() {
             let total = self.accumulated_message_size(&transfer) + payload.len() as u64;
             if total > max_size {
-                return Err(self.close_on_message_size_exceeded(total, max_size).await);
+                return Err(self.close_on_message_size_exceeded(total, max_size, context));
             }
         }
 
         let delivery = match self.incomplete_transfer.take() {
             Some(mut incomplete) => {
                 if let Err(error) = incomplete.or_assign(transfer) {
-                    return self.close_on_malformed_delivery(error).await.map(|()| None);
+                    return self
+                        .close_on_malformed_delivery(error, context)
+                        .map(|()| None);
                 }
-                incomplete.append(payload)?; // This also computes the section number and offset incrementally
+                incomplete.append(payload).map_err(RecvError::from)?; // This also computes the section number and offset incrementally
 
-                self.link.on_complete_transfer(
-                    incomplete.performative,
-                    incomplete.buffer,
-                    incomplete.section_number.unwrap_or(0),
-                    incomplete.section_offset,
-                )?
+                self.link
+                    .on_complete_transfer(
+                        incomplete.performative,
+                        incomplete.buffer,
+                        incomplete.section_number.unwrap_or(0),
+                        incomplete.section_offset,
+                    )
+                    .map_err(RecvError::from)?
             }
             None => {
                 let (section_number, section_offset) =
-                    count_number_of_sections_and_offset(&payload)?;
-                self.link.on_complete_transfer(
-                    transfer,
-                    &payload,
-                    section_number,
-                    section_offset,
-                )?
+                    count_number_of_sections_and_offset(&payload).map_err(RecvError::from)?;
+                self.link
+                    .on_complete_transfer(transfer, &payload, section_number, section_offset)
+                    .map_err(RecvError::from)?
             }
         };
 
+        commit.commit(
+            ReceiverTransferEffect::Delivered {
+                info: DeliveryInfo::from(&delivery),
+            },
+            observer,
+        );
+
         // Auto accept the message and leave settled to be determined based on rcv_settle_mode
-        if self.auto_accept {
-            self.dispose(&delivery, None, Accepted {}.into()).await?; // cancel safe
+        if self.auto_accept && matches!(context, ReceiveContext::Live) {
+            self.dispose(&delivery, None, Accepted {}.into())
+                .await
+                .map_err(RecvError::from)?; // cancel safe
         }
 
         Ok(Some(delivery))
@@ -1515,13 +2087,17 @@ where
     ///
     /// This is cancel safe because all internal `.await` point(s) are cancel safe
     #[inline]
-    async fn on_incoming_transfer<T>(
+    async fn on_incoming_transfer<T, O>(
         &mut self,
         mut transfer: Transfer,
         payload: Payload,
-    ) -> Result<Option<Delivery<T>>, RecvError>
+        context: ReceiveContext,
+        observer: &mut O,
+        commit: &mut TransferCommit,
+    ) -> Result<Option<Delivery<T>>, ReceiveFault>
     where
         for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
     {
         use super::incoming_recovery::Kind;
         let continuation = match self.incoming_recovery.continuation(&mut transfer) {
@@ -1530,11 +2106,11 @@ where
                 return self
                     .close_on_malformed_delivery(
                         ReceiverTransferError::InconsistentFieldInMultiFrameDelivery,
+                        context,
                     )
-                    .await
                     .map(|()| None)
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.into()),
         };
         if transfer.aborted {
             if let Some(partial) = &self.incomplete_transfer {
@@ -1550,8 +2126,8 @@ where
                     return self
                         .close_on_malformed_delivery(
                             ReceiverTransferError::InconsistentFieldInMultiFrameDelivery,
+                            context,
                         )
-                        .await
                         .map(|()| None);
                 }
             }
@@ -1566,20 +2142,19 @@ where
                     map.swap_remove(&tag);
                 }
             }
+            commit.commit(ReceiverTransferEffect::Aborted, observer);
             return Ok(None);
         }
         let mut kind = continuation;
         if continuation.is_none() && transfer.resume {
             if transfer.delivery_tag.is_none() {
                 return self
-                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone)
-                    .await
+                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone, context)
                     .map(|()| None);
             }
             if transfer.delivery_id.is_none() {
                 return self
-                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone)
-                    .await
+                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone, context)
                     .map(|()| None);
             }
             let tag = transfer.delivery_tag.as_ref().unwrap();
@@ -1605,25 +2180,34 @@ where
                         return self
                             .close_on_malformed_delivery(
                                 ReceiverTransferError::InconsistentFieldInMultiFrameDelivery,
+                                context,
                             )
-                            .await
                             .map(|()| None);
                     }
-                    partial.keep_buffer_till_section_number_and_offset(number, offset)?;
+                    partial
+                        .keep_buffer_till_section_number_and_offset(number, offset)
+                        .map_err(RecvError::from)?;
                     partial.performative.delivery_id = transfer.delivery_id;
                 } else if number != 0 || offset != 0 {
-                    return Err(RecvError::InvalidMessageEncoding(
-                        serde_amqp::Error::InvalidValue,
-                    ));
+                    return Err(
+                        RecvError::InvalidMessageEncoding(serde_amqp::Error::InvalidValue).into(),
+                    );
                 }
             }
             self.incoming_recovery
                 .start(&transfer, kind.expect("resume classification"));
         }
         if kind == Some(Kind::Ignore) {
+            commit.commit(
+                ReceiverTransferEffect::Ignored {
+                    more: transfer.more,
+                },
+                observer,
+            );
             return Ok(None);
         }
         if kind == Some(Kind::StateOnly) {
+            let mut info = None;
             if continuation.is_none() {
                 if let Some(entry) = self.link.unsettled().write().as_mut().and_then(|map| {
                     transfer
@@ -1642,6 +2226,7 @@ where
                         rcv_settle_mode: transfer.rcv_settle_mode.clone(),
                         _sealed: crate::util::Sealed {},
                     });
+                    info = entry.info.clone();
                 }
             }
             if transfer.aborted || transfer.settled == Some(true) {
@@ -1651,28 +2236,47 @@ where
                     }
                 }
             } else if let Some(state) = transfer.state {
-                self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state)
-                    .await?;
+                self.on_transfer_state(
+                    &transfer.delivery_tag,
+                    transfer.settled,
+                    state,
+                    context,
+                    observer,
+                    commit,
+                )?;
             }
+            let retained = transfer.delivery_tag.as_ref().is_some_and(|tag| {
+                self.link
+                    .unsettled()
+                    .read()
+                    .as_ref()
+                    .is_some_and(|map| map.contains_key(tag))
+            });
+            commit.commit(
+                ReceiverTransferEffect::StateOnly {
+                    info,
+                    retained,
+                    more: transfer.more,
+                },
+                observer,
+            );
             return Ok(None);
         }
         if self.incomplete_transfer.is_none() {
             if transfer.delivery_id.is_none() {
                 return self
-                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone)
-                    .await
+                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryIdIsNone, context)
                     .map(|()| None);
             }
             if transfer.delivery_tag.is_none() {
                 return self
-                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone)
-                    .await
+                    .close_on_malformed_delivery(ReceiverTransferError::DeliveryTagIsNone, context)
                     .map(|()| None);
             }
             if transfer.message_format.is_none() {
-                return Err(RecvError::InvalidMessageEncoding(
-                    serde_amqp::Error::InvalidValue,
-                ));
+                return Err(
+                    RecvError::InvalidMessageEncoding(serde_amqp::Error::InvalidValue).into(),
+                );
             }
         } else if transfer.delivery_tag.is_none() {
             transfer.delivery_tag = self
@@ -1682,7 +2286,9 @@ where
         }
         if let Some(partial) = self.incomplete_transfer.as_mut() {
             if let Err(error) = partial.or_assign(transfer.clone()) {
-                return self.close_on_malformed_delivery(error).await.map(|()| None);
+                return self
+                    .close_on_malformed_delivery(error, context)
+                    .map(|()| None);
             }
         }
         if let Some(state) = transfer.state.clone() {
@@ -1690,14 +2296,20 @@ where
             // on the transfer can be thought of as being equivalent to sending a disposition immediately before
             // the transfer performative, i.e., it is the state of the delivery (not the transfer) that existed at the
             // point the frame was sent.
-            self.on_transfer_state(&transfer.delivery_tag, transfer.settled, state)
-                .await?;
+            self.on_transfer_state(
+                &transfer.delivery_tag,
+                transfer.settled,
+                state,
+                context,
+                observer,
+                commit,
+            )?;
         }
 
         if let Some(max_size) = self.link.max_message_size() {
             let total = self.accumulated_message_size(&transfer) + payload.len() as u64;
             if total > max_size {
-                return Err(self.close_on_message_size_exceeded(total, max_size).await);
+                return Err(self.close_on_message_size_exceeded(total, max_size, context));
             }
         }
         if transfer
@@ -1705,21 +2317,20 @@ where
             .as_ref()
             .is_some_and(|tag| tag.len() > 32)
         {
-            return Err(RecvError::InvalidMessageEncoding(
-                serde_amqp::Error::InvalidValue,
-            ));
+            return Err(RecvError::InvalidMessageEncoding(serde_amqp::Error::InvalidValue).into());
         }
 
         if transfer.more {
             // Partial transfer of the delivery
             // There is only ONE incomplet transfer locally, so the partial transfer must belong to the
             // same delivery
-            self.on_incomplete_transfer(transfer, payload).await?;
+            self.on_incomplete_transfer(transfer, payload, context, observer, commit)?;
             // Partial delivery doesn't yield a complete message
             Ok(None)
         } else {
             // Final transfer of the delivery
-            self.on_complete_transfer(transfer, payload).await // cancel safe
+            self.on_complete_transfer(transfer, payload, context, observer, commit)
+                .await // cancel safe
         }
     }
 
@@ -2311,6 +2922,1023 @@ impl DetachedReceiver {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn state_only_settlement_before_the_native_write_supplies_no_identity() {
+        use crate::{
+            endpoint::{InputHandle, OutgoingChannel, OutputAttachment, Session as _},
+            session::Builder,
+        };
+        use fe2o3_amqp_types::{performatives::Disposition, states::SessionState};
+        let (inner, _control, _outgoing, incoming) = make_receiver_inner_with_channels(4096);
+        seed_unsettled(inner.link.unsettled(), &[vec![9]]);
+        let tag: DeliveryTag = vec![9].into();
+        {
+            let mut guard = inner.link.unsettled().write();
+            let entry = guard.as_mut().unwrap().get_mut(&tag).unwrap();
+            entry.received = true;
+            entry.info = Some(make_delivery_info(1, tag.to_vec()));
+        }
+        let mut session = Builder::new().into_session(
+            OutgoingChannel(0),
+            SessionState::Mapped,
+            Arc::new(OnceLock::new()),
+        );
+        let (frames, _inbox) = mpsc::channel(2);
+        session.link_by_input_handle.insert(
+            InputHandle(0),
+            LinkRelay::new_receiver(
+                frames,
+                inner.link.flow_state.clone(),
+                inner.link.unsettled.clone(),
+                ReceiverSettleMode::First,
+            )
+            .with_output_handle(OutputAttachment::for_tests(0)),
+        );
+        session
+            .delivery_tag_by_id
+            .insert((Role::Sender, 1), (InputHandle(0), tag.clone()));
+        let session = Arc::new(std::sync::Mutex::new(session));
+        let owner = Arc::downgrade(&session);
+        inner.link.unsettled.before_write_once(move || {
+            owner
+                .upgrade()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .on_incoming_disposition(Disposition {
+                    role: Role::Sender,
+                    first: 1,
+                    last: None,
+                    settled: true,
+                    state: Some(Accepted {}.into()),
+                    batchable: false,
+                })
+                .unwrap();
+        });
+        let mut resumed = make_incoming_transfer(9, Some(tag.to_vec()), false, false);
+        resumed.resume = true;
+        incoming
+            .send(queued_transfer(resumed, Payload::new()))
+            .await
+            .unwrap();
+        incoming
+            .send(queued_transfer(
+                make_incoming_transfer(10, Some(vec![10]), false, false),
+                Payload::from_static(&[0, 0x53, 0x75, 0xa0, 2, 7, 8]),
+            ))
+            .await
+            .unwrap();
+        let mut receiver = Receiver { inner };
+        let mut progress = Progress::default();
+        let delivery = observed_delivery(0, &mut receiver, &mut progress).await;
+        assert_eq!(*delivery.delivery_id(), 10);
+        assert_eq!(progress.begins, 2);
+        assert!(matches!(
+            progress.steps[0].effect(),
+            ReceiverTransferEffect::StateOnly {
+                info: None,
+                retained: false,
+                more: false
+            }
+        ));
+        assert!(!receiver
+            .inner
+            .link
+            .unsettled
+            .read()
+            .as_ref()
+            .unwrap()
+            .contains_key(&tag));
+    }
+
+    #[tokio::test]
+    async fn detached_dispositions_use_only_the_original_live_session() {
+        for transactional in [false, true] {
+            let (mut inner, _control, mut outgoing, _incoming) =
+                make_receiver_inner_with_channels(4096);
+            inner.credit_mode = CreditMode::Manual;
+            inner.link.local_state = LinkState::Detached;
+            inner.link.output_handle.take();
+            inner.link.input_handle.take();
+            let tag: DeliveryTag = vec![42].into();
+            seed_unsettled(inner.link.unsettled(), &[tag.to_vec()]);
+            let info = make_delivery_info(42, tag.to_vec());
+            {
+                inner
+                    .link
+                    .unsettled()
+                    .write()
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&tag)
+                    .unwrap()
+                    .info = Some(info.clone());
+            }
+            let state = if transactional {
+                #[cfg(feature = "transaction")]
+                {
+                    DeliveryState::TransactionalState(
+                        fe2o3_amqp_types::transaction::TransactionalState {
+                            txn_id: vec![3].into(),
+                            outcome: Some(fe2o3_amqp_types::messaging::Outcome::Accepted(
+                                Accepted {},
+                            )),
+                        },
+                    )
+                }
+                #[cfg(not(feature = "transaction"))]
+                {
+                    continue;
+                }
+            } else {
+                Accepted {}.into()
+            };
+            inner
+                .dispose(info.clone(), None, state.clone())
+                .await
+                .unwrap();
+            let LinkFrame::Disposition(disposition) = outgoing.recv().await.unwrap() else {
+                panic!("session disposition")
+            };
+            assert_eq!(disposition.first, 42);
+            assert_eq!(disposition.state, Some(state.clone()));
+            assert!(outgoing.try_recv().is_err());
+            // Exact native identity still excludes a reused tag and delivery number.
+            seed_unsettled(inner.link.unsettled(), &[tag.to_vec()]);
+            let fresh = make_delivery_info(42, tag.to_vec());
+            {
+                inner
+                    .link
+                    .unsettled()
+                    .write()
+                    .as_mut()
+                    .unwrap()
+                    .get_mut(&tag)
+                    .unwrap()
+                    .info = Some(fresh.clone());
+            }
+            assert!(matches!(
+                inner.dispose(info, None, state.clone()).await,
+                Err(IllegalLinkStateError::IllegalState)
+            ));
+            assert!(outgoing.try_recv().is_err());
+            inner
+                .link
+                .session_stop_reason
+                .set(SessionStopReason::Stopped)
+                .unwrap();
+            outgoing.close();
+            assert!(matches!(
+                inner.dispose(fresh, None, state).await,
+                Err(IllegalLinkStateError::SessionStopped(
+                    SessionStopReason::Stopped
+                ))
+            ));
+            assert!(outgoing.try_recv().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_exact_detach_delivers_inflight_and_retains_partial() {
+        use crate::link::test_util::{drive_exact_end, CorrelationGuard};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        for closed in [false, true] {
+            let (inner, control, mut outgoing, incoming) = make_receiver_inner_with_channels(4096);
+            let mut receiver = Receiver { inner };
+            receiver.request_detach().await.unwrap();
+            assert!(matches!(
+                outgoing.recv().await.unwrap(),
+                LinkFrame::Detach(Detach { closed: false, .. }, _)
+            ));
+            let body = Payload::from_static(&[0, 0x53, 0x75, 0xa0, 2, 7, 8]);
+            incoming
+                .send(queued_transfer(
+                    make_incoming_transfer(1, Some(vec![1]), false, false),
+                    body.clone(),
+                ))
+                .await
+                .unwrap();
+            incoming
+                .send(queued_transfer(
+                    make_incoming_transfer(2, Some(vec![2]), true, false),
+                    body.slice(..6),
+                ))
+                .await
+                .unwrap();
+            let mut continuation = make_incoming_transfer(2, None, false, false);
+            continuation.message_format = None;
+            incoming
+                .send(queued_transfer(continuation, body.slice(6..)))
+                .await
+                .unwrap();
+            incoming
+                .send(queued_transfer(
+                    make_incoming_transfer(3, Some(vec![3]), true, false),
+                    body.slice(..6),
+                ))
+                .await
+                .unwrap();
+            incoming
+                .send(LinkFrame::Detach(
+                    Detach {
+                        handle: 0u32.into(),
+                        closed,
+                        error: None,
+                    },
+                    crate::endpoint::AttachmentId::allocate(),
+                ))
+                .await
+                .unwrap();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut progress = Progress::default();
+            let mut before = || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok::<_, std::io::Error>(CorrelationGuard(dropped.clone()))
+            };
+            for id in [1, 2] {
+                let ReceiverDetachStep::Delivery(delivery)=receiver.recv_detaching_exact::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_,_,_,_>(&mut progress,&mut before).await.unwrap() else {panic!("in-flight complete delivery")};
+                assert_eq!(*delivery.delivery_id(), id);
+                let data: Vec<u8> = delivery
+                    .body()
+                    .try_as_data()
+                    .unwrap()
+                    .flat_map(|binary| binary.iter().copied())
+                    .collect();
+                assert_eq!(data, [7, 8]);
+            }
+            if closed {
+                let (result,_)=tokio::join!(receiver.recv_detaching_exact::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_,_,_,_>(&mut progress,&mut before),
+                    drive_exact_end(control,outgoing,incoming,peer_sender_attach(),|| {assert_eq!(calls.load(Ordering::Acquire),1);assert!(!dropped.load(Ordering::Acquire));},|| {assert!(!dropped.load(Ordering::Acquire));None}));
+                assert!(matches!(
+                    result.unwrap(),
+                    ReceiverDetachStep::Closed { error: None }
+                ));
+                assert!(dropped.load(Ordering::Acquire));
+            } else {
+                assert!(matches!(receiver.recv_detaching_exact::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_,_,_,_>(&mut progress,&mut before).await.unwrap(),ReceiverDetachStep::Suspended {error:None}));
+                assert_eq!(calls.load(Ordering::Acquire), 0);
+                assert!(outgoing.try_recv().is_err());
+            }
+            assert_eq!(progress.begins, 4);
+            assert_eq!(progress.steps.len(), 4);
+            assert!(receiver.inner.incomplete_transfer.is_some());
+            assert_eq!(receiver.inner.receive_budget.retained_bytes(), 6);
+        }
+    }
+
+    #[tokio::test]
+    async fn reattach_errors_keep_phase_and_drop_correlation() {
+        use super::super::LinkExchangeError;
+        use crate::link::test_util::CorrelationGuard;
+        use std::sync::atomic::AtomicBool;
+        let (mut inner, mut controls, mut outgoing, _incoming) =
+            make_receiver_inner_with_channels(4096);
+        inner.link.local_state = LinkState::Detached;
+        inner.link.output_handle.take();
+        let mut endpoint = Receiver { inner };
+        assert!(matches!(
+            endpoint
+                .close_in_place_exact(false, || Err::<(), _>(std::io::Error::other("refused")))
+                .await,
+            Err(LinkExchangeError::Correlation(_))
+        ));
+        assert!(controls.try_recv().is_err());
+        assert!(outgoing.try_recv().is_err());
+        let dropped = Arc::new(AtomicBool::new(false));
+        let (result, ()) = tokio::join!(
+            endpoint.close_in_place_exact(false, || Ok::<_, std::io::Error>(CorrelationGuard(
+                dropped.clone()
+            ))),
+            async {
+                let SessionControl::GetIncomingWindow(reply) = controls.recv().await.unwrap()
+                else {
+                    panic!("window allocation")
+                };
+                assert!(!dropped.load(Ordering::Acquire));
+                reply.send(16).unwrap();
+                let SessionControl::AllocateLink { responder, .. } = controls.recv().await.unwrap()
+                else {
+                    panic!("link allocation")
+                };
+                assert!(!dropped.load(Ordering::Acquire));
+                responder
+                    .send(Err(crate::session::error::AllocLinkError::SessionNotMapped))
+                    .unwrap();
+            }
+        );
+        assert!(matches!(
+            result,
+            Err(LinkExchangeError::Attach(
+                ReceiverAttachError::SessionNotMapped
+            ))
+        ));
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_attach_and_detach_failures_keep_their_original_phase() {
+        use super::super::LinkExchangeError;
+        use crate::link::test_util::{drive_exact_end, CorrelationGuard};
+        use std::sync::atomic::AtomicBool;
+        for refusal in [false, true] {
+            let (mut inner, control, outgoing, incoming) = make_receiver_inner_with_channels(4096);
+            inner.link.local_state = LinkState::Detached;
+            inner.link.output_handle.take();
+            let mut endpoint = Receiver { inner };
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut attach = peer_sender_attach();
+            if refusal {
+                attach.source = None;
+            }
+            let error = definitions::Error::new(definitions::AmqpError::NotFound, None, None);
+            let (result, _) = tokio::join!(
+                endpoint.close_in_place_exact(false, || Ok::<_, std::io::Error>(CorrelationGuard(
+                    dropped.clone()
+                ))),
+                drive_exact_end(
+                    control,
+                    outgoing,
+                    incoming,
+                    attach,
+                    || {
+                        assert!(!dropped.load(Ordering::Acquire));
+                    },
+                    || {
+                        assert!(!dropped.load(Ordering::Acquire));
+                        Some(error.clone())
+                    }
+                )
+            );
+            if refusal {
+                assert!(
+                    matches!(result,Err(LinkExchangeError::Attach(ReceiverAttachError::RemoteClosedWithError(actual))) if actual.condition==error.condition)
+                );
+            } else {
+                assert!(
+                    matches!(result,Err(LinkExchangeError::Detach(DetachError::RemoteClosedWithError(actual))) if actual.condition==error.condition)
+                );
+            }
+            assert!(dropped.load(Ordering::Acquire));
+        }
+    }
+
+    #[derive(Default)]
+    struct Progress {
+        begins: usize,
+        steps: Vec<ReceiverTransferProgress>,
+    }
+    impl ReceiverTransferObserver for Progress {
+        fn begin(&mut self, _: &ReceiverTransferHeader) {
+            self.begins += 1;
+        }
+        fn transfer(&mut self, progress: ReceiverTransferProgress) {
+            self.steps.push(progress);
+        }
+    }
+    fn queued_transfer(performative: Transfer, payload: Payload) -> LinkFrame {
+        LinkFrame::Transfer {
+            input_handle: crate::endpoint::InputHandle(0),
+            attachment: crate::endpoint::AttachmentId::allocate(),
+            performative,
+            payload,
+            window_slot: None,
+            queue_slot: None,
+        }
+    }
+    async fn observed_delivery(
+        mode: u8,
+        receiver: &mut Receiver,
+        observer: &mut Progress,
+    ) -> Delivery<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>> {
+        match mode {
+            0 => match receiver.recv_observed(observer).await.unwrap() {
+                ReceiverReadStep::Delivery(delivery) => delivery,
+                other => panic!("{other:?}"),
+            },
+            1 => match receiver
+                .recv_detaching_exact(observer, &mut || Ok::<_, std::io::Error>(()))
+                .await
+                .unwrap()
+            {
+                ReceiverDetachStep::Delivery(delivery) => delivery,
+                other => panic!("{other:?}"),
+            },
+            _ => match receiver.recv_collecting_stopped(observer).await.unwrap() {
+                ReceiverCollectionStep::Delivery(delivery) => delivery,
+                other => panic!("{other:?}"),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_abort_then_delivery_retires_only_the_partial() {
+        for mode in 0..3 {
+            for standalone in [false, true] {
+                let (inner, _control, mut outgoing, incoming) =
+                    make_receiver_inner_with_channels(4096);
+                let budget = inner.receive_budget.clone();
+                let mut receiver = Receiver { inner };
+                if mode == 1 {
+                    receiver.request_detach().await.unwrap();
+                    outgoing.recv().await.unwrap();
+                }
+                let mut abort = make_incoming_transfer(1, Some(vec![1]), false, false);
+                abort.aborted = true;
+                if !standalone {
+                    incoming
+                        .send(queued_transfer(
+                            make_incoming_transfer(1, Some(vec![1]), true, false),
+                            Payload::from_static(&[0, 0x53, 0x75, 0xa0, 2, 0]),
+                        ))
+                        .await
+                        .unwrap();
+                    abort.delivery_id = None;
+                    abort.delivery_tag = None;
+                    abort.message_format = None;
+                }
+                incoming
+                    .send(queued_transfer(abort, Payload::new()))
+                    .await
+                    .unwrap();
+                incoming
+                    .send(queued_transfer(
+                        make_incoming_transfer(2, Some(vec![2]), false, false),
+                        Payload::from_static(&[0, 0x53, 0x75, 0xa0, 2, 7, 8]),
+                    ))
+                    .await
+                    .unwrap();
+                if mode == 2 {
+                    receiver
+                        .inner
+                        .link
+                        .session_stop_reason
+                        .set(SessionStopReason::Stopped)
+                        .unwrap();
+                }
+                drop(incoming);
+                let mut progress = Progress::default();
+                let delivery = observed_delivery(mode, &mut receiver, &mut progress).await;
+                assert_eq!(*delivery.delivery_id(), 2);
+                assert_eq!(budget.retained_bytes(), 0);
+                assert_eq!(progress.begins, if standalone { 2 } else { 3 });
+                let abort_index = usize::from(!standalone);
+                assert!(matches!(
+                    progress.steps[abort_index].effect(),
+                    ReceiverTransferEffect::Aborted
+                ));
+                if !standalone {
+                    assert!(matches!(
+                        progress.steps[0].effect(),
+                        ReceiverTransferEffect::PayloadIncomplete
+                    ));
+                    assert!(progress.steps[1].original().delivery_id().is_none());
+                    assert!(progress.steps[1].original().delivery_tag().is_none());
+                }
+                assert!(
+                    matches!(progress.steps.last().unwrap().effect(),ReceiverTransferEffect::Delivered {info} if info.same_delivery(&DeliveryInfo::from(&delivery)))
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_ignored_resume_consumes_every_fragment_without_a_delivery() {
+        for mode in 0..3 {
+            let (inner, _control, mut outgoing, incoming) = make_receiver_inner_with_channels(4096);
+            let mut receiver = Receiver { inner };
+            if mode == 1 {
+                receiver.request_detach().await.unwrap();
+                outgoing.recv().await.unwrap();
+            }
+            let mut first = make_incoming_transfer(9, Some(vec![9]), true, false);
+            first.resume = true;
+            incoming
+                .send(queued_transfer(first.clone(), Payload::new()))
+                .await
+                .unwrap();
+            first.delivery_id = None;
+            first.delivery_tag = None;
+            first.message_format = None;
+            first.more = false;
+            first.resume = false;
+            incoming
+                .send(queued_transfer(first, Payload::new()))
+                .await
+                .unwrap();
+            incoming
+                .send(queued_transfer(
+                    make_incoming_transfer(10, Some(vec![10]), false, false),
+                    Payload::from_static(&[0, 0x53, 0x75, 0xa0, 2, 7, 8]),
+                ))
+                .await
+                .unwrap();
+            if mode == 2 {
+                receiver
+                    .inner
+                    .link
+                    .session_stop_reason
+                    .set(SessionStopReason::Stopped)
+                    .unwrap();
+            }
+            drop(incoming);
+            let mut progress = Progress::default();
+            let delivery = observed_delivery(mode, &mut receiver, &mut progress).await;
+            assert_eq!(*delivery.delivery_id(), 10);
+            assert_eq!(progress.begins, 3);
+            assert!(matches!(
+                progress.steps[0].effect(),
+                ReceiverTransferEffect::Ignored { more: true }
+            ));
+            assert!(matches!(
+                progress.steps[1].effect(),
+                ReceiverTransferEffect::Ignored { more: false }
+            ));
+            assert!(progress.steps[1].original().delivery_id().is_none());
+            assert!(progress.steps[1].original().delivery_tag().is_none());
+            assert!(receiver.inner.incomplete_transfer.is_none());
+            assert_eq!(receiver.inner.receive_budget.retained_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_state_only_supplies_the_exact_native_identity_once() {
+        for mode in 0..3 {
+            for settled in [false, true] {
+                let (inner, _control, mut outgoing, incoming) =
+                    make_receiver_inner_with_channels(4096);
+                seed_unsettled(inner.link.unsettled(), &[vec![9]]);
+                let old = make_delivery_info(1, vec![9]);
+                {
+                    let mut guard = inner.link.unsettled().write();
+                    let entry = guard
+                        .as_mut()
+                        .unwrap()
+                        .get_mut(&DeliveryTag::from(vec![9]))
+                        .unwrap();
+                    entry.received = true;
+                    entry.info = Some(old.clone());
+                }
+                let mut receiver = Receiver { inner };
+                if mode == 1 {
+                    receiver.request_detach().await.unwrap();
+                    outgoing.recv().await.unwrap();
+                }
+                let mut first = make_incoming_transfer(9, Some(vec![9]), true, false);
+                first.resume = true;
+                incoming
+                    .send(queued_transfer(first.clone(), Payload::new()))
+                    .await
+                    .unwrap();
+                first.delivery_id = None;
+                first.delivery_tag = None;
+                first.message_format = None;
+                first.more = false;
+                first.resume = false;
+                first.settled = Some(settled);
+                incoming
+                    .send(queued_transfer(first, Payload::new()))
+                    .await
+                    .unwrap();
+                incoming
+                    .send(queued_transfer(
+                        make_incoming_transfer(10, Some(vec![10]), false, false),
+                        Payload::from_static(&[0, 0x53, 0x75, 0xa0, 2, 7, 8]),
+                    ))
+                    .await
+                    .unwrap();
+                if mode == 2 {
+                    receiver
+                        .inner
+                        .link
+                        .session_stop_reason
+                        .set(SessionStopReason::Stopped)
+                        .unwrap();
+                }
+                drop(incoming);
+                let mut progress = Progress::default();
+                let delivery = observed_delivery(mode, &mut receiver, &mut progress).await;
+                assert_eq!(*delivery.delivery_id(), 10);
+                assert_eq!(progress.begins, 3);
+                let ReceiverTransferEffect::StateOnly {
+                    info: Some(info),
+                    retained: true,
+                    more: true,
+                } = progress.steps[0].effect()
+                else {
+                    panic!("first state-only identity")
+                };
+                assert_eq!(info.delivery_id(), 9);
+                assert!(!info.same_delivery(&old));
+                assert!(
+                    matches!(progress.steps[1].effect(),ReceiverTransferEffect::StateOnly {info:None,retained,more:false} if *retained==!settled)
+                );
+                if !settled {
+                    let guard = receiver.inner.link.unsettled.read();
+                    let native = guard
+                        .as_ref()
+                        .unwrap()
+                        .get(&DeliveryTag::from(vec![9]))
+                        .unwrap()
+                        .info
+                        .as_ref()
+                        .unwrap();
+                    assert!(info.same_delivery(native));
+                }
+                assert!(progress.steps[1].original().delivery_id().is_none());
+                assert!(receiver.inner.incomplete_transfer.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn stopped_collection_drains_normal_transfers_without_wire_work() {
+        let (inner, _control, mut outgoing, incoming) = make_receiver_inner_with_channels(4096);
+        let mut receiver = Receiver { inner };
+        receiver.inner.auto_accept = true;
+        let body = Payload::from_static(&[0, 0x53, 0x75, 0xa0, 2, 7, 8]);
+        incoming
+            .send(queued_transfer(
+                make_incoming_transfer(1, Some(vec![1]), false, false),
+                body.clone(),
+            ))
+            .await
+            .unwrap();
+        incoming
+            .send(queued_transfer(
+                make_incoming_transfer(2, Some(vec![2]), true, false),
+                body.slice(..6),
+            ))
+            .await
+            .unwrap();
+        let mut last = make_incoming_transfer(2, None, false, false);
+        last.message_format = None;
+        incoming
+            .send(queued_transfer(last, body.slice(6..)))
+            .await
+            .unwrap();
+        incoming
+            .send(queued_transfer(
+                make_incoming_transfer(3, Some(vec![3]), true, false),
+                body.slice(..6),
+            ))
+            .await
+            .unwrap();
+        let mut progress = Progress::default();
+        assert!(matches!(
+            receiver
+                .recv_collecting_stopped::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>, _>(
+                    &mut progress
+                )
+                .await,
+            Err(RecvError::LinkStateError(LinkStateError::IllegalState))
+        ));
+        assert_eq!(receiver.inner.incoming.len(), 4);
+        assert_eq!(progress.begins, 0);
+        receiver
+            .inner
+            .link
+            .session_stop_reason
+            .set(SessionStopReason::Stopped)
+            .unwrap();
+        drop(incoming);
+        assert_eq!(
+            *observed_delivery(2, &mut receiver, &mut progress)
+                .await
+                .delivery_id(),
+            1
+        );
+        assert_eq!(
+            *observed_delivery(2, &mut receiver, &mut progress)
+                .await
+                .delivery_id(),
+            2
+        );
+        assert!(matches!(
+            receiver
+                .recv_collecting_stopped::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>, _>(
+                    &mut progress
+                )
+                .await
+                .unwrap(),
+            ReceiverCollectionStep::Drained {
+                reason: SessionStopReason::Stopped
+            }
+        ));
+        assert!(receiver.inner.incomplete_transfer.is_some());
+        assert!(receiver.inner.receive_budget.retained_bytes() > 0);
+        assert_eq!(progress.begins, 4);
+        assert!(outgoing.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn stopped_collection_keeps_a_queued_closing_detach_unrecoverable() {
+        for closed in [false, true] {
+            for with_error in [false, true] {
+                let (inner, _control, mut outgoing, incoming) =
+                    make_receiver_inner_with_channels(4096);
+                inner
+                    .link
+                    .session_stop_reason
+                    .set(SessionStopReason::Stopped)
+                    .unwrap();
+                let error =
+                    with_error.then(|| definitions::Error::new(AmqpError::NotFound, None, None));
+                incoming
+                    .send(LinkFrame::Detach(
+                        Detach {
+                            handle: 0u32.into(),
+                            closed,
+                            error: error.clone(),
+                        },
+                        crate::endpoint::AttachmentId::allocate(),
+                    ))
+                    .await
+                    .unwrap();
+                drop(incoming);
+                let mut receiver = Receiver { inner };
+                let mut progress = Progress::default();
+                let step=receiver.recv_collecting_stopped::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_>(&mut progress).await.unwrap();
+                if closed {
+                    assert!(
+                        matches!(step,ReceiverCollectionStep::Closed {error:actual} if actual==error)
+                    );
+                } else {
+                    assert!(matches!(
+                        step,
+                        ReceiverCollectionStep::Drained {
+                            reason: SessionStopReason::Stopped
+                        }
+                    ));
+                }
+                assert_eq!(progress.begins, 0);
+                assert!(progress.steps.is_empty());
+                assert!(outgoing.try_recv().is_err());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn observed_protocol_close_returns_before_wire_and_uses_exact_finish() {
+        fn expected(fault: u8, cause: &RecvError) -> bool {
+            matches!(
+                (fault, cause),
+                (0, RecvError::MessageSizeExceeded(_))
+                    | (1, RecvError::DeliveryTagIsNone)
+                    | (2, RecvError::TransactionalAcquisitionIsNotImeplemented)
+                    | (3, RecvError::InconsistentFieldInMultiFrameDelivery)
+            )
+        }
+        for mode in 0..3 {
+            for fault in 0..4 {
+                #[cfg(not(feature = "transaction"))]
+                if fault == 2 {
+                    continue;
+                }
+                let (mut inner, control, mut outgoing, incoming) =
+                    make_receiver_inner_with_channels(4096);
+                if fault == 0 {
+                    inner.link.max_message_size = 1;
+                }
+                let mut receiver = Receiver { inner };
+                if mode == 1 {
+                    receiver.request_detach().await.unwrap();
+                    assert!(matches!(
+                        outgoing.recv().await.unwrap(),
+                        LinkFrame::Detach(Detach { closed: false, .. }, _)
+                    ));
+                }
+                if mode == 2 {
+                    receiver
+                        .inner
+                        .link
+                        .session_stop_reason
+                        .set(SessionStopReason::Stopped)
+                        .unwrap();
+                }
+                if fault == 2 {
+                    #[cfg(feature = "transaction")]
+                    incoming
+                        .send(LinkFrame::Acquisition(vec![1].into()))
+                        .await
+                        .unwrap();
+                } else {
+                    let body = Payload::from_static(&[0, 0x53, 0x75, 0xa0, 2, 7, 8]);
+                    if fault == 3 {
+                        incoming
+                            .send(queued_transfer(
+                                make_incoming_transfer(1, Some(vec![1]), true, false),
+                                body.slice(..6),
+                            ))
+                            .await
+                            .unwrap();
+                        incoming
+                            .send(queued_transfer(
+                                make_incoming_transfer(1, Some(vec![2]), false, false),
+                                body.slice(6..),
+                            ))
+                            .await
+                            .unwrap();
+                    } else {
+                        incoming
+                            .send(queued_transfer(
+                                make_incoming_transfer(
+                                    1,
+                                    if fault == 1 { None } else { Some(vec![1]) },
+                                    false,
+                                    false,
+                                ),
+                                body,
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                }
+                let mut progress = Progress::default();
+                let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let mut before = || {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    Ok::<_, std::io::Error>(())
+                };
+                if mode == 2 {
+                    drop(incoming);
+                    let error=receiver.recv_collecting_stopped::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_>(&mut progress).await.unwrap_err();
+                    assert!(expected(fault, &error));
+                    assert!(receiver.self_close_cause().is_none());
+                    assert!(outgoing.try_recv().is_err());
+                } else {
+                    if mode == 0 {
+                        assert!(matches!(receiver.recv_observed::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_>(&mut progress).await.unwrap(),ReceiverReadStep::SelfClosing));
+                    } else {
+                        assert!(matches!(receiver.recv_detaching_exact::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_,_,_,_>(&mut progress,&mut before).await.unwrap(),ReceiverDetachStep::SelfClosing));
+                    }
+                    assert!(expected(fault, receiver.self_close_cause().unwrap()));
+                    assert!(outgoing.try_recv().is_err());
+                    assert_eq!(calls.load(Ordering::Acquire), 0);
+                    if mode == 1 {
+                        incoming
+                            .send(LinkFrame::Detach(
+                                Detach {
+                                    handle: 0u32.into(),
+                                    closed: false,
+                                    error: None,
+                                },
+                                crate::endpoint::AttachmentId::allocate(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    let (result, detaches) = tokio::join!(
+                        receiver.finish_self_close_exact(&mut before),
+                        crate::link::test_util::drive_exact_end(
+                            control,
+                            outgoing,
+                            incoming,
+                            peer_sender_attach(),
+                            || {},
+                            || None
+                        )
+                    );
+                    result.unwrap();
+                    assert_eq!(detaches, if mode == 0 { 2 } else { 1 });
+                    assert_eq!(calls.load(Ordering::Acquire), 1);
+                    assert!(receiver.self_close_cause().is_none());
+                }
+                assert_eq!(
+                    progress.begins,
+                    if fault == 2 {
+                        0
+                    } else if fault == 3 {
+                        2
+                    } else {
+                        1
+                    }
+                );
+                if fault == 2 {
+                    assert!(progress.steps.is_empty());
+                } else {
+                    assert!(matches!(
+                        progress.steps.last().unwrap().effect(),
+                        ReceiverTransferEffect::Failed
+                    ));
+                }
+            }
+        }
+    }
+
+    impl ReceiverInner<ReceiverLink<Target>> {
+        async fn test_transfer<T>(
+            &mut self,
+            transfer: Transfer,
+            payload: Payload,
+        ) -> Result<Option<Delivery<T>>, RecvError>
+        where
+            for<'de> T: FromBody<'de> + Send,
+        {
+            match self
+                .receive_transfer(
+                    transfer,
+                    payload,
+                    None,
+                    ReceiveContext::Live,
+                    &mut NoopTransferObserver,
+                )
+                .await
+            {
+                Ok(delivery) => Ok(delivery),
+                Err(ReceiveFault::Error(error)) => Err(error),
+                Err(ReceiveFault::SelfClosing) => Err(self.finish_self_close().await),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_a_detached_endpoint_reattaches_without_replay() {
+        use crate::link::test_util::{drive_exact_end, CorrelationGuard};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        for initially_detached in [false, true] {
+            for incomplete in [false, true] {
+                for peer_has_map in [false, true] {
+                    let (mut inner, control, outgoing, incoming) =
+                        make_receiver_inner_with_channels(4096);
+                    let c: DeliveryTag = vec![42].into();
+                    let q: DeliveryTag = vec![43].into();
+                    seed_unsettled(inner.link.unsettled(), &[c.to_vec(), q.to_vec()]);
+                    let info = make_delivery_info(42, c.to_vec());
+                    {
+                        let mut map = inner.link.unsettled().write();
+                        let entry = map.as_mut().unwrap().get_mut(&c).unwrap();
+                        entry.received = true;
+                        entry.info = Some(info.clone());
+                    }
+                    let transfer = make_incoming_transfer(43, Some(q.to_vec()), true, false);
+                    inner.receive_transfer::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_>(transfer,
+                        Payload::from_static(&[0,0x53,0x75,0xa0,2,0]),None,ReceiveContext::Live,&mut NoopTransferObserver).await.unwrap();
+                    let store = inner.link.unsettled.clone();
+                    let budget = inner.receive_budget.clone();
+                    let retained = budget.retained_bytes();
+                    assert!(retained > 0);
+                    if initially_detached {
+                        inner.link.local_state = LinkState::Detached;
+                        inner.link.output_handle.take();
+                    }
+                    let mut receiver = Receiver { inner };
+                    let calls = Arc::new(AtomicUsize::new(0));
+                    let dropped = Arc::new(AtomicBool::new(false));
+                    let mut attach = peer_sender_attach();
+                    attach.handle = 17u32.into();
+                    attach.incomplete_unsettled = incomplete;
+                    if peer_has_map {
+                        let mut map = super::super::UnsettledMap::new();
+                        map.insert(c.clone(), Some(Accepted {}.into()));
+                        attach.unsettled = Some(map);
+                    }
+                    let assert_live = || {
+                        assert_eq!(calls.load(Ordering::Acquire), 1);
+                        assert!(!dropped.load(Ordering::Acquire));
+                        let guard = store.read();
+                        let map = guard.as_ref().unwrap();
+                        assert_eq!(map.len(), 2);
+                        assert!(map
+                            .get(&c)
+                            .unwrap()
+                            .info
+                            .as_ref()
+                            .unwrap()
+                            .same_delivery(&info));
+                        assert!(map.contains_key(&q));
+                        assert_eq!(budget.retained_bytes(), retained);
+                    };
+                    let (result, detaches) = tokio::join!(
+                        receiver.close_in_place_exact(false, || {
+                            calls.fetch_add(1, Ordering::AcqRel);
+                            Ok::<_, std::io::Error>(CorrelationGuard(dropped.clone()))
+                        }),
+                        drive_exact_end(control, outgoing, incoming, attach, assert_live, || {
+                            assert_live();
+                            None
+                        })
+                    );
+                    if incomplete {
+                        assert!(matches!(
+                            result,
+                            Err(super::super::LinkExchangeError::Attach(
+                                ReceiverAttachError::IllegalState
+                            ))
+                        ));
+                    } else {
+                        result.unwrap();
+                        assert_eq!(detaches, if initially_detached { 1 } else { 2 });
+                    }
+                    assert!(dropped.load(Ordering::Acquire));
+                    assert_eq!(budget.retained_bytes(), retained);
+                    assert!(receiver.inner.incomplete_transfer.is_some());
+                }
+            }
+        }
+    }
+
     use super::*;
 
     use crate::link::state::{LinkFlowState, LinkFlowStateInner, LinkState};
@@ -2591,7 +4219,13 @@ mod tests {
         transfer.more = true;
         let prefix = vec![0, 0x53, 0x75, 0xa0, 2, 0];
         receiver
-            .on_incomplete_transfer(transfer, prefix.clone().into())
+            .receive_transfer::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>, _>(
+                transfer,
+                prefix.clone().into(),
+                None,
+                ReceiveContext::Live,
+                &mut NoopTransferObserver,
+            )
             .await
             .unwrap();
         receiver.discard_settled_partial();
@@ -2674,7 +4308,7 @@ mod tests {
         transfer.resume = true;
         let result = receiver
             .inner
-            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
+            .test_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
             .await
             .unwrap();
         assert!(
@@ -2686,7 +4320,7 @@ mod tests {
         transfer.delivery_tag = Some(vec![0x43].into());
         assert!(receiver
             .inner
-            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
+            .test_transfer::<Body<serde_amqp::Value>>(transfer.clone(), Vec::new().into())
             .await
             .unwrap()
             .is_none());
@@ -2695,7 +4329,7 @@ mod tests {
         transfer.settled = Some(true);
         assert!(receiver
             .inner
-            .on_incoming_transfer::<Body<serde_amqp::Value>>(transfer, Vec::new().into())
+            .test_transfer::<Body<serde_amqp::Value>>(transfer, Vec::new().into())
             .await
             .unwrap()
             .is_none());
@@ -3126,7 +4760,7 @@ mod tests {
     async fn accumulated_size_counts_tagless_continuation_but_not_other_delivery() {
         let mut inner = make_receiver_inner(4096);
         inner
-            .on_incoming_transfer::<String>(
+            .test_transfer::<String>(
                 make_incoming_transfer(1, Some(vec![0x01]), true, false),
                 encoded_binary_prefix(60),
             )
@@ -3865,7 +5499,7 @@ mod tests {
         let payload = encoded_sectioned_payload();
         let full_len = payload.len() as u64;
         inner
-            .on_incoming_transfer::<String>(
+            .test_transfer::<String>(
                 make_incoming_transfer(1, Some(vec![0x01]), true, false),
                 payload,
             )
@@ -3878,7 +5512,7 @@ mod tests {
             section_offset: 0,
         }));
         inner
-            .on_incoming_transfer::<String>(state_transfer, Payload::new())
+            .test_transfer::<String>(state_transfer, Payload::new())
             .await
             .expect("a tagless state transfer must be attributed to the buffer");
 
@@ -4042,7 +5676,7 @@ mod tests {
         inner.receive_budget = crate::link::receive_budget::ReceiveBudget::new(100);
         let budget = inner.receive_budget.clone();
         inner
-            .on_incoming_transfer::<String>(
+            .test_transfer::<String>(
                 make_incoming_transfer(1, Some(vec![1]), true, false),
                 encoded_binary_prefix(100),
             )
@@ -4056,7 +5690,7 @@ mod tests {
         }));
         tokio::time::timeout(
             std::time::Duration::from_millis(300),
-            inner.on_incoming_transfer::<String>(continuation, Payload::from(vec![0; 10])),
+            inner.test_transfer::<String>(continuation, Payload::from(vec![0; 10])),
         )
         .await
         .expect("a valid reduced prefix must not enter a closing exchange")

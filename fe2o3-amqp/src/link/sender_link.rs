@@ -192,6 +192,10 @@ where
     /// dropped later, it withdraws the registration, so the map keeps only
     /// deliveries whose transfer was handed over or that a suspension left to
     /// resume.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keep native admission and optional control provenance in the same checked send entry"
+    )]
     pub(crate) async fn send_delivery<Fut>(
         &mut self,
         writer: &crate::session::transfer_queue::Sender,
@@ -200,6 +204,7 @@ where
         payload: Payload,
         unsettled: Option<UnsettledMessage>,
         dispatched: Option<&AtomicBool>,
+        #[cfg(feature = "transaction")] tracking: Option<&crate::transaction::ControlTracker>,
     ) -> Result<DeliveryTag, LinkStateError>
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
@@ -215,6 +220,8 @@ where
             payload,
             registration,
             dispatched,
+            #[cfg(feature = "transaction")]
+            tracking,
         )
         .await
         .map(|delivery_tag| delivery_tag.expect("only a moved delivery can be gone"))
@@ -223,6 +230,10 @@ where
     /// [`Self::send_delivery`], registering the delivery as `registration`
     /// says. `None` when the delivery a `Registration::Move` would send was
     /// settled or withdrawn before it could be: nothing is sent then.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keep native admission and optional control provenance in the same checked send entry"
+    )]
     async fn deliver<Fut>(
         &mut self,
         writer: &crate::session::transfer_queue::Sender,
@@ -231,6 +242,7 @@ where
         payload: Payload,
         mut registration: Registration,
         dispatched: Option<&AtomicBool>,
+        #[cfg(feature = "transaction")] tracking: Option<&crate::transaction::ControlTracker>,
     ) -> Result<Option<DeliveryTag>, LinkStateError>
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
@@ -288,6 +300,9 @@ where
                 // delivery before this task resumes.
                 open.register(delivery_tag.clone(), unsettled);
             }
+            #[cfg(feature = "transaction")]
+            let first_fence =
+                tracking.map(|tracker| tracker.before_first(attachment.id, &delivery_tag));
             room.send(LinkFrame::Transfer {
                 window_slot: None,
                 queue_slot: None,
@@ -296,6 +311,10 @@ where
                 performative: first,
                 payload: first_payload,
             });
+            #[cfg(feature = "transaction")]
+            if let (Some(tracker), Some(fence)) = (tracking, first_fence) {
+                tracker.first_admitted(attachment.id, &delivery_tag, fence);
+            }
             drop(open);
             break delivery_tag;
         };
@@ -327,6 +346,10 @@ where
                     ) => {
                         // Suspended: the delivery waits for an explicit resume.
                         registration.keep();
+                        #[cfg(feature = "transaction")]
+                        if tracking.is_some() {
+                            return Err(error);
+                        }
                         Ok(Some(delivery_tag))
                     }
                     _ => Err(error),
@@ -339,11 +362,19 @@ where
         if let Some(registration) = registration {
             registration.keep();
         }
+        #[cfg(feature = "transaction")]
+        if let Some(tracker) = tracking {
+            tracker.complete_admitted();
+        }
         Ok(Some(delivery_tag))
     }
 
     /// Sends a new delivery of `payload`, settled or with an outcome to wait
     /// for, as the link's settle mode and `transfer` say.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "keep native admission and optional control provenance in the same checked send entry"
+    )]
     pub(crate) async fn send_new_payload<Fut>(
         &mut self,
         writer: &crate::session::transfer_queue::Sender,
@@ -352,17 +383,39 @@ where
         transfer: Transfer,
         payload: Payload,
         dispatched: Option<&AtomicBool>,
+        #[cfg(feature = "transaction")] tracking: Option<&crate::transaction::ControlTracker>,
     ) -> Result<Settlement, LinkStateError>
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
     {
         if self.is_settled_on_send(&transfer) {
             let delivery_tag = self
-                .send_delivery(writer, detached, transfer, payload, None, dispatched)
+                .send_delivery(
+                    writer,
+                    detached,
+                    transfer,
+                    payload,
+                    None,
+                    dispatched,
+                    #[cfg(feature = "transaction")]
+                    tracking,
+                )
                 .await?;
             return Ok(Settlement::Settled(delivery_tag));
         }
         let (tx, rx) = oneshot::channel();
+        #[cfg(feature = "transaction")]
+        let unsettled = match tracking {
+            Some(tracking) => UnsettledMessage::new_tracked(
+                payload.clone(),
+                None,
+                message_format,
+                tx,
+                tracking.clone(),
+            ),
+            None => UnsettledMessage::new(payload.clone(), None, message_format, tx),
+        };
+        #[cfg(not(feature = "transaction"))]
         let unsettled = UnsettledMessage::new(payload.clone(), None, message_format, tx);
         let delivery_tag = self
             .send_delivery(
@@ -372,6 +425,8 @@ where
                 payload,
                 Some(unsettled),
                 dispatched,
+                #[cfg(feature = "transaction")]
+                tracking,
             )
             .await?;
         Ok(Settlement::Unsettled {
@@ -407,8 +462,17 @@ where
             false,
         )?;
         if self.is_settled_on_send(&transfer) {
-            self.send_delivery(writer, detached, transfer, payload, None, None)
-                .await?;
+            self.send_delivery(
+                writer,
+                detached,
+                transfer,
+                payload,
+                None,
+                None,
+                #[cfg(feature = "transaction")]
+                None,
+            )
+            .await?;
             if let Some(local) = self.unsettled.withdraw(&delivery_tag) {
                 let _ = local.settle();
             }
@@ -420,6 +484,8 @@ where
             transfer,
             payload,
             Registration::Move(delivery_tag),
+            None,
+            #[cfg(feature = "transaction")]
             None,
         )
         .await
@@ -585,8 +651,17 @@ where
             batchable,
         )?;
 
-        self.send_new_payload(writer, detached, message_format, transfer, payload, None)
-            .await
+        self.send_new_payload(
+            writer,
+            detached,
+            message_format,
+            transfer,
+            payload,
+            None,
+            #[cfg(feature = "transaction")]
+            None,
+        )
+        .await
     }
 
     async fn dispose(
@@ -819,111 +894,16 @@ where
 
     fn on_incoming_attach(
         &mut self,
-        remote_attach: Attach,
+        attach: Attach,
     ) -> Result<Self::AttachExchange, Self::AttachError> {
-        use self::source::VerifySource;
+        self.accept_attach(attach, AttachPurpose::Ordinary)
+    }
 
-        match (&self.local_state, remote_attach.incomplete_unsettled) {
-            (LinkState::AttachSent, false) => {
-                self.local_state = LinkState::Attached;
-            }
-            (LinkState::IncompleteAttachSent, false) => {
-                self.local_state = LinkState::IncompleteAttachExchanged;
-            }
-            (LinkState::Unattached, false) | (LinkState::Detached, false) => {
-                self.local_state = LinkState::AttachReceived; // re-attaching
-            }
-            (LinkState::AttachSent, true) | (LinkState::IncompleteAttachSent, true) => {
-                self.local_state = LinkState::IncompleteAttachExchanged;
-            }
-            (LinkState::Unattached, true) | (LinkState::Detached, true) => {
-                self.local_state = LinkState::IncompleteAttachReceived; // re-attaching
-            }
-            _ => return Err(SenderAttachError::IllegalState),
-        };
-
-        self.input_handle = Some(InputHandle::from(remote_attach.handle));
-
-        // In this case, the sender is considered to hold the authoritative version of the
-        // version of the source properties
-        //
-        // Only need to check the target
-        //
-        // If there is no pre-existing terminus, and the peer does not wish to create a new one,
-        // this is indicated by setting the local terminus (source or target as appropriate) to null.
-        if self.verify_incoming_source {
-            if let (Some(local_source), Some(remote_source)) = (&self.source, &remote_attach.source)
-            {
-                local_source.verify_as_sender(remote_source)?;
-            }
+    fn on_incoming_attach_for_close(&mut self, attach: Attach) -> Result<(), Self::AttachError> {
+        match self.accept_attach(attach, AttachPurpose::CloseOnly)? {
+            SenderAttachExchange::Complete => Ok(()),
+            _ => Err(SenderAttachError::IllegalState),
         }
-
-        let target = remote_attach
-            .target
-            .map(|t| T::try_from(*t))
-            .transpose()
-            .map_err(|_| SenderAttachError::CoordinatorIsNotImplemented)?;
-
-        // Note that it is the responsibility of the transaction controller to
-        // verify that the capabilities of the controller meet its requirements.
-        //
-        // the receiver is considered to hold the authoritative version of the target properties
-        match (&self.target, &target) {
-            (Some(local_target), Some(remote_target)) => {
-                if self.verify_incoming_target {
-                    local_target.verify_as_sender(remote_target)?
-                }
-            }
-            // Only need to check the target
-            //
-            // If there is no pre-existing terminus, and the peer does not wish to create a new one,
-            // this is indicated by setting the local terminus (source or target as appropriate) to null.
-            (_, None) => return Err(SenderAttachError::IncomingTargetIsNone),
-            _ => {}
-        }
-        self.target = target;
-
-        // The `rcv-settle-mode` field in the attach response from the receiver is the
-        // receiver's *actual* settlement mode in use ("when set at the receiver this
-        // indicates the actual settlement mode in use"). The sender must adapt its
-        // settlement handshake accordingly: with `second`, the receiver settles only
-        // after receiving the sender's confirming disposition. The session already
-        // propagates the actual mode to the link relay (`SessionInner::on_incoming_attach`),
-        // which drives the confirming echo at delivery time, so no strict validation
-        // is needed here. The local value is still updated with the receiver's actual
-        // mode so that it reflects the negotiated state (e.g. on reattach and through
-        // the `rcv_settle_mode` accessor), mirroring how the receiver side records the
-        // sender's actual `snd-settle-mode`.
-        self.rcv_settle_mode = remote_attach.rcv_settle_mode;
-
-        // The `snd-settle-mode` field in the attach response from the receiver only
-        // expresses the receiver's *desired* settlement mode for the sender. When the
-        // sender initiates the attach, the sender's own choice is the settlement mode in
-        // use and the receiver SHOULD respect it, failing the attach if it cannot.
-        //
-        // A definite conflict (neither side is `mixed`) is still treated as an error
-        // because it signals a receiver that expects a settlement behavior the sender
-        // will not provide; a `mixed` response is tolerated either way.
-        if let (SenderSettleMode::Settled, SenderSettleMode::Unsettled)
-        | (SenderSettleMode::Unsettled, SenderSettleMode::Settled) =
-            (&self.snd_settle_mode, &remote_attach.snd_settle_mode)
-        {
-            return Err(SenderAttachError::SndSettleModeNotSupported);
-        }
-
-        self.max_message_size =
-            get_max_message_size(self.max_message_size, remote_attach.max_message_size);
-
-        if let Some(remote_properties) = remote_attach.properties {
-            self.properties_mut(|local_properties| {
-                local_properties
-                    .get_or_insert_with(Default::default)
-                    .as_inner_mut()
-                    .extend(remote_properties.into_inner());
-            })
-        }
-
-        self.handle_unsettled_in_attach(remote_attach.unsettled)
     }
 
     async fn send_attach(
@@ -931,7 +911,8 @@ where
         writer: &crate::session::transfer_queue::Sender,
         is_reattaching: bool,
     ) -> Result<(), Self::AttachError> {
-        self.send_attach_inner(writer, is_reattaching).await?;
+        self.send_attach_inner(writer, is_reattaching, &AttachPurpose::Ordinary)
+            .await?;
         Ok(())
     }
 }
@@ -1015,24 +996,23 @@ where
         writer: &crate::session::transfer_queue::Sender,
         reader: &mut mpsc::Receiver<LinkFrame>,
         is_reattaching: bool,
-    ) -> Result<Self::AttachExchange, SenderAttachError> {
-        // Send out local attach
-        self.send_attach(writer, is_reattaching).await?;
+    ) -> Result<Self::AttachExchange, Self::AttachError> {
+        self.exchange_attach_inner(writer, reader, is_reattaching, AttachPurpose::Ordinary)
+            .await
+    }
 
-        // Wait for remote attach
-        let remote_attach =
-            match reader
-                .recv()
-                .await
-                .ok_or_else(|| match self.session_stop_reason.get() {
-                    Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
-                    None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                })? {
-                LinkFrame::Attach(attach) => attach,
-                _ => return Err(SenderAttachError::NonAttachFrameReceived),
-            };
-
-        self.on_incoming_attach(remote_attach)
+    async fn exchange_attach_for_close(
+        &mut self,
+        writer: &crate::session::transfer_queue::Sender,
+        reader: &mut mpsc::Receiver<LinkFrame>,
+    ) -> Result<(), Self::AttachError> {
+        match self
+            .exchange_attach_inner(writer, reader, true, AttachPurpose::CloseOnly)
+            .await?
+        {
+            SenderAttachExchange::Complete => Ok(()),
+            _ => Err(SenderAttachError::IllegalState),
+        }
     }
 
     #[cfg_attr(feature = "tracing", tracing::instrument(skip_all))]
@@ -1203,4 +1183,173 @@ enum Stopped {
     Detached(Option<LinkFrame>),
     /// The session's queue closed.
     Session,
+}
+
+impl<T> SenderLink<T>
+where
+    T: Into<TargetArchetype>
+        + TryFrom<TargetArchetype>
+        + VerifyTargetArchetype
+        + Clone
+        + Send
+        + Sync,
+{
+    fn accept_attach(
+        &mut self,
+        remote_attach: Attach,
+        purpose: AttachPurpose,
+    ) -> Result<SenderAttachExchange, SenderAttachError> {
+        use self::source::VerifySource;
+
+        match (&self.local_state, remote_attach.incomplete_unsettled) {
+            (LinkState::AttachSent, false) => {
+                self.local_state = LinkState::Attached;
+            }
+            (LinkState::IncompleteAttachSent, false) => {
+                self.local_state = LinkState::IncompleteAttachExchanged;
+            }
+            (LinkState::Unattached, false) | (LinkState::Detached, false) => {
+                self.local_state = LinkState::AttachReceived; // re-attaching
+            }
+            (LinkState::AttachSent, true) | (LinkState::IncompleteAttachSent, true) => {
+                self.local_state = LinkState::IncompleteAttachExchanged;
+            }
+            (LinkState::Unattached, true) | (LinkState::Detached, true) => {
+                self.local_state = LinkState::IncompleteAttachReceived; // re-attaching
+            }
+            _ => return Err(SenderAttachError::IllegalState),
+        };
+
+        self.input_handle = Some(InputHandle::from(remote_attach.handle));
+
+        // In this case, the sender is considered to hold the authoritative version of the
+        // version of the source properties
+        //
+        // Only need to check the target
+        //
+        // If there is no pre-existing terminus, and the peer does not wish to create a new one,
+        // this is indicated by setting the local terminus (source or target as appropriate) to null.
+        if self.verify_incoming_source {
+            if let (Some(local_source), Some(remote_source)) = (&self.source, &remote_attach.source)
+            {
+                local_source.verify_as_sender(remote_source)?;
+            }
+        }
+
+        let target = remote_attach
+            .target
+            .map(|t| T::try_from(*t))
+            .transpose()
+            .map_err(|_| SenderAttachError::CoordinatorIsNotImplemented)?;
+
+        // Note that it is the responsibility of the transaction controller to
+        // verify that the capabilities of the controller meet its requirements.
+        //
+        // the receiver is considered to hold the authoritative version of the target properties
+        match (&self.target, &target) {
+            (Some(local_target), Some(remote_target)) => {
+                if self.verify_incoming_target {
+                    local_target.verify_as_sender(remote_target)?
+                }
+            }
+            // Only need to check the target
+            //
+            // If there is no pre-existing terminus, and the peer does not wish to create a new one,
+            // this is indicated by setting the local terminus (source or target as appropriate) to null.
+            (_, None) => return Err(SenderAttachError::IncomingTargetIsNone),
+            _ => {}
+        }
+        self.target = target;
+
+        // The `rcv-settle-mode` field in the attach response from the receiver is the
+        // receiver's *actual* settlement mode in use ("when set at the receiver this
+        // indicates the actual settlement mode in use"). The sender must adapt its
+        // settlement handshake accordingly: with `second`, the receiver settles only
+        // after receiving the sender's confirming disposition. The session already
+        // propagates the actual mode to the link relay (`SessionInner::on_incoming_attach`),
+        // which drives the confirming echo at delivery time, so no strict validation
+        // is needed here. The local value is still updated with the receiver's actual
+        // mode so that it reflects the negotiated state (e.g. on reattach and through
+        // the `rcv_settle_mode` accessor), mirroring how the receiver side records the
+        // sender's actual `snd-settle-mode`.
+        self.rcv_settle_mode = remote_attach.rcv_settle_mode;
+
+        // The `snd-settle-mode` field in the attach response from the receiver only
+        // expresses the receiver's *desired* settlement mode for the sender. When the
+        // sender initiates the attach, the sender's own choice is the settlement mode in
+        // use and the receiver SHOULD respect it, failing the attach if it cannot.
+        //
+        // A definite conflict (neither side is `mixed`) is still treated as an error
+        // because it signals a receiver that expects a settlement behavior the sender
+        // will not provide; a `mixed` response is tolerated either way.
+        if let (SenderSettleMode::Settled, SenderSettleMode::Unsettled)
+        | (SenderSettleMode::Unsettled, SenderSettleMode::Settled) =
+            (&self.snd_settle_mode, &remote_attach.snd_settle_mode)
+        {
+            return Err(SenderAttachError::SndSettleModeNotSupported);
+        }
+
+        self.max_message_size =
+            get_max_message_size(self.max_message_size, remote_attach.max_message_size);
+
+        if let Some(remote_properties) = remote_attach.properties {
+            self.properties_mut(|local_properties| {
+                local_properties
+                    .get_or_insert_with(Default::default)
+                    .as_inner_mut()
+                    .extend(remote_properties.into_inner());
+            })
+        }
+
+        if matches!(purpose, AttachPurpose::CloseOnly) {
+            if remote_attach.incomplete_unsettled
+                || matches!(
+                    self.local_state,
+                    LinkState::IncompleteAttachSent
+                        | LinkState::IncompleteAttachReceived
+                        | LinkState::IncompleteAttachExchanged
+                )
+            {
+                return Err(SenderAttachError::IllegalState);
+            }
+            return Ok(SenderAttachExchange::Complete);
+        }
+
+        self.handle_unsettled_in_attach(remote_attach.unsettled)
+    }
+
+    async fn exchange_attach_inner(
+        &mut self,
+        writer: &crate::session::transfer_queue::Sender,
+        reader: &mut mpsc::Receiver<LinkFrame>,
+        is_reattaching: bool,
+        purpose: AttachPurpose,
+    ) -> Result<SenderAttachExchange, SenderAttachError> {
+        // Send out local attach
+        self.send_attach_inner(writer, is_reattaching, &purpose)
+            .await?;
+
+        // Wait for remote attach
+        let remote_attach =
+            match reader
+                .recv()
+                .await
+                .ok_or_else(|| match self.session_stop_reason.get() {
+                    Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
+                    None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                })? {
+                LinkFrame::Attach(attach) => attach,
+                _ => return Err(SenderAttachError::NonAttachFrameReceived),
+            };
+
+        match purpose {
+            AttachPurpose::Ordinary => {
+                endpoint::LinkAttach::on_incoming_attach(self, remote_attach)
+            }
+            AttachPurpose::CloseOnly => {
+                endpoint::LinkAttach::on_incoming_attach_for_close(self, remote_attach)?;
+                Ok(SenderAttachExchange::Complete)
+            }
+        }
+    }
 }

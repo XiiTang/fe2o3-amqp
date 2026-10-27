@@ -284,6 +284,19 @@ impl Builder {
             self,
             connection: &mut ConnectionHandle<()>,
         ) -> Result<SessionHandle<()>, BeginError> {
+            self.begin_with_channel(connection, |_| {}).await
+        }
+
+        /// Associate the allocated outgoing channel before any Begin can be sent.
+        /// The synchronous callback runs once after allocation succeeds.
+        pub async fn begin_with_channel<F>(
+            self,
+            connection: &mut ConnectionHandle<()>,
+            before_begin: F,
+        ) -> Result<SessionHandle<()>, BeginError>
+        where
+            F: FnOnce(u16) + Send,
+        {
             let local_state = SessionState::Unmapped;
             let (session_control_tx, session_control_rx) =
                 mpsc::channel::<SessionControl>(DEFAULT_SESSION_CONTROL_BUFFER_SIZE);
@@ -301,6 +314,8 @@ impl Builder {
                     other => return Err(other.into()),
                 },
             };
+
+            before_begin(outgoing_channel.0);
 
             #[cfg(not(all(feature = "transaction", feature = "acceptor")))]
             let (engine_handle, outcome, session_stop_reason, max_frame_size) = {
@@ -529,5 +544,198 @@ impl Builder {
             };
             Ok(handle)
         }
+    }
+}
+
+#[cfg(all(test, feature = "acceptor", not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::{
+        acceptor::{ConnectionAcceptor, ListenerConnectionHandle, SessionAcceptor},
+        link::SessionStopReason,
+        Connection,
+    };
+    use std::{
+        pin::Pin,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
+        task::{Context, Poll},
+    };
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+    use tokio::sync::oneshot;
+
+    #[derive(Debug)]
+    struct Tap {
+        inner: DuplexStream,
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+    impl AsyncRead for Tap {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for Tap {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if let Poll::Ready(Ok(n)) = &result {
+                self.bytes.lock().unwrap().extend_from_slice(&buf[..*n]);
+            }
+            result
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+    async fn connections() -> (
+        ConnectionHandle<()>,
+        ListenerConnectionHandle,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let (client, server) = tokio::io::duplex(8192);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let acceptor = ConnectionAcceptor::new("begin-peer");
+        let (client, server) = tokio::join!(
+            Connection::builder()
+                .container_id("begin-client")
+                .channel_max(0u16)
+                .open_with_stream(Tap {
+                    inner: client,
+                    bytes: bytes.clone()
+                }),
+            acceptor.accept(server)
+        );
+        (client.unwrap(), server.unwrap(), bytes)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_begin_channel_is_associated_before_any_begin_can_escape() {
+        let (mut connection, mut peer, wire) = connections().await;
+        let before = wire.lock().unwrap().len();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let (entered, at) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (returned, at_return) = oneshot::channel();
+        let (take, wait_take) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let result = Builder::new()
+                .begin_with_channel(&mut connection, move |channel| {
+                    count.fetch_add(1, Ordering::AcqRel);
+                    entered.send(channel).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(10))
+                        .expect("callback gate released");
+                })
+                .await;
+            returned.send(()).unwrap();
+            wait_take.await.unwrap();
+            (connection, result)
+        });
+        let channel = tokio::time::timeout(std::time::Duration::from_secs(10), at)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(calls.load(Ordering::Acquire), 1);
+        assert_eq!(wire.lock().unwrap().len(), before);
+        {
+            let incoming = peer.next_incoming_session();
+            tokio::pin!(incoming);
+            tokio_test::assert_pending!(futures_util::poll!(incoming.as_mut()));
+        }
+        release.send(()).unwrap();
+        let incoming = peer.next_incoming_session().await.unwrap();
+        assert_eq!(incoming.channel, channel);
+        let mut peer_session = SessionAcceptor::new()
+            .accept_incoming_session(incoming, &mut peer)
+            .await
+            .unwrap();
+        at_return.await.unwrap();
+        peer_session.end().await.unwrap();
+        take.send(()).unwrap();
+        let (mut connection, result) = task.await.unwrap();
+        let mut session = result.unwrap();
+        assert!(matches!(
+            session.session_stop_reason.get(),
+            Some(SessionStopReason::RemoteEnded)
+        ));
+        assert!(matches!(
+            session.stop_and_join().await,
+            Err(crate::session::Error::RemoteEnded)
+        ));
+        let _ = connection.stop_and_join().await;
+        let _ = peer.stop_and_join().await;
+
+        // Allocation refusal never calls the callback; ordinary begin still works.
+        let (mut connection, mut peer, wire) = connections().await;
+        let acceptor = SessionAcceptor::new();
+        let (session, peer_session) = tokio::join!(
+            Builder::new().begin(&mut connection),
+            acceptor.accept(&mut peer)
+        );
+        let mut session = session.unwrap();
+        let mut peer_session = peer_session.unwrap();
+        let before = wire.lock().unwrap().len();
+        let count = Arc::new(AtomicUsize::new(0));
+        let calls = count.clone();
+        assert!(matches!(
+            Builder::new()
+                .begin_with_channel(&mut connection, move |_| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                })
+                .await,
+            Err(BeginError::LocalChannelMaxReached)
+        ));
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        assert_eq!(wire.lock().unwrap().len(), before);
+        session.stop_and_join().await.unwrap();
+        peer_session.stop_and_join().await.unwrap();
+        let _ = connection.stop_and_join().await;
+        let _ = peer.stop_and_join().await;
+
+        // A stop after allocation still invokes the callback exactly once;
+        // only the native dispatch/answer fails, with its original error.
+        let (mut connection, mut peer, _) = connections().await;
+        let control = connection.control.clone();
+        let count = Arc::new(AtomicUsize::new(0));
+        let calls = count.clone();
+        let (entered, at) = oneshot::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            let result = Builder::new()
+                .begin_with_channel(&mut connection, move |channel| {
+                    calls.fetch_add(1, Ordering::AcqRel);
+                    entered.send(channel).unwrap();
+                    wait.recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                })
+                .await;
+            (connection, result)
+        });
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(10), at)
+            .await
+            .unwrap()
+            .unwrap();
+        peer.stop_and_join().await.unwrap();
+        control.closed().await;
+        release.send(()).unwrap();
+        let (mut connection, result) = task.await.unwrap();
+        assert!(matches!(result, Err(BeginError::ConnectionStopped(_))));
+        assert_eq!(count.load(Ordering::Acquire), 1);
+        let _ = connection.stop_and_join().await;
     }
 }

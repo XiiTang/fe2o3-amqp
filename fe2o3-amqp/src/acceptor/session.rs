@@ -15,7 +15,8 @@ use crate::{
     connection::{AllocSessionError, ConnectionStopReason},
     control::{ConnectionControl, SessionControl},
     endpoint::{
-        self, IncomingChannel, InputHandle, AttachmentId, LinkFlow, OutgoingChannel, OutputAttachment, Session,
+        self, AttachmentId, IncomingChannel, InputHandle, LinkFlow, OutgoingChannel,
+        OutputAttachment, Session,
     },
     link::{LinkFrame, LinkRelay, SessionStopReason},
     session::{
@@ -569,6 +570,10 @@ impl endpoint::Session for ListenerSession {
             }
             Err(e) => Err(e),
         }
+    }
+
+    fn on_refused_incoming_transfer(&mut self) {
+        self.session.on_refused_incoming_transfer();
     }
 
     async fn on_incoming_transfer(

@@ -314,7 +314,9 @@ pub(crate) struct UnsettledMessage {
     pub(crate) payload: Payload,
     pub(crate) state: Option<DeliveryState>,
     pub(crate) message_format: u32,
-    pub(crate) sender: oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>,
+    sender: oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>,
+    #[cfg(feature = "transaction")]
+    tracking: Option<crate::transaction::ControlTracker>,
 }
 
 impl UnsettledMessage {
@@ -329,10 +331,33 @@ impl UnsettledMessage {
             state,
             message_format,
             sender,
+            #[cfg(feature = "transaction")]
+            tracking: None,
+        }
+    }
+
+    #[cfg(feature = "transaction")]
+    pub(crate) fn new_tracked(
+        payload: Payload,
+        state: Option<DeliveryState>,
+        message_format: u32,
+        sender: oneshot::Sender<Result<Option<DeliveryState>, LinkStateError>>,
+        tracking: crate::transaction::ControlTracker,
+    ) -> Self {
+        Self {
+            payload,
+            state,
+            message_format,
+            sender,
+            tracking: Some(tracking),
         }
     }
 
     pub fn settle(self) -> Result<(), Result<Option<DeliveryState>, LinkStateError>> {
+        #[cfg(feature = "transaction")]
+        if let (Some(tracking), Some(state)) = (&self.tracking, &self.state) {
+            tracking.answered_state(state);
+        }
         self.sender.send(Ok(self.state))
     }
 
@@ -340,6 +365,10 @@ impl UnsettledMessage {
         self,
         state: Option<DeliveryState>,
     ) -> Result<(), Result<Option<DeliveryState>, LinkStateError>> {
+        #[cfg(feature = "transaction")]
+        if let (Some(tracking), Some(state)) = (&self.tracking, &state) {
+            tracking.answered_state(state);
+        }
         self.sender.send(Ok(state))
     }
 

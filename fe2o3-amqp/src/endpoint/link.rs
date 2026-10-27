@@ -82,6 +82,8 @@ pub(crate) trait LinkAttach {
         attach: Attach,
     ) -> Result<Self::AttachExchange, Self::AttachError>;
 
+    fn on_incoming_attach_for_close(&mut self, attach: Attach) -> Result<(), Self::AttachError>;
+
     async fn send_attach(
         &mut self,
         writer: &crate::session::transfer_queue::Sender,
@@ -127,6 +129,12 @@ pub(crate) trait LinkExt: Link {
         reader: &mut mpsc::Receiver<LinkFrame>,
         is_reattaching: bool,
     ) -> Result<Self::AttachExchange, Self::AttachError>;
+
+    async fn exchange_attach_for_close(
+        &mut self,
+        writer: &crate::session::transfer_queue::Sender,
+        reader: &mut mpsc::Receiver<LinkFrame>,
+    ) -> Result<(), Self::AttachError>;
 
     async fn handle_attach_error(
         &mut self,

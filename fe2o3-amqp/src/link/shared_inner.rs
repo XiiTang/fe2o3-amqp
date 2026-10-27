@@ -9,7 +9,9 @@ use crate::{
     session::{self, error::AllocLinkError},
 };
 
-use super::{state::LinkState, DetachError, LinkFrame, LinkRelay, SessionStopReason};
+use super::{
+    state::LinkState, DetachError, LinkExchangeError, LinkFrame, LinkRelay, SessionStopReason,
+};
 
 pub(crate) trait LinkEndpointInner
 where
@@ -37,6 +39,10 @@ where
         &mut self,
         is_reattaching: bool,
     ) -> Result<<Self::Link as LinkAttach>::AttachExchange, <Self::Link as LinkAttach>::AttachError>;
+
+    async fn exchange_attach_for_close(
+        &mut self,
+    ) -> Result<(), <Self::Link as LinkAttach>::AttachError>;
 
     async fn handle_attach_error(
         &mut self,
@@ -357,6 +363,174 @@ where
                 #[cfg(feature = "log")]
                 log::debug!("Non-detach frame received: {:?}", _frame);
                 continue;
+            }
+        }
+    }
+}
+
+/// Reallocate and validate an Attach without reconciling unsettled deliveries.
+async fn reattach_for_close<T>(inner: &mut T) -> Result<(), <T::Link as LinkAttach>::AttachError>
+where
+    T: LinkEndpointInner + Send + Sync,
+    <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
+{
+    let result = match inner.reallocate_output_handle().await {
+        Ok(()) => inner.exchange_attach_for_close().await,
+        Err(error) => Err(error),
+    };
+    match result {
+        Ok(()) => Ok(()),
+        Err(error) => Err(inner.handle_attach_error(error).await),
+    }
+}
+
+/// Keep the caller's correlation guard through the entire crossed handshake.
+pub(super) async fn reattach_then_close_exact<T, F, G, E>(
+    inner: &mut T,
+    before: &mut F,
+    error: Option<definitions::Error>,
+) -> Result<(), LinkExchangeError<<T::Link as LinkAttach>::AttachError, E>>
+where
+    T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
+    T::Link: LinkDetach<DetachError = DetachError>,
+    <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
+    F: FnMut() -> Result<G, E> + Send,
+    G: Send,
+    E: Send,
+{
+    let _correlation = before().map_err(LinkExchangeError::Correlation)?;
+    reattach_for_close(inner)
+        .await
+        .map_err(LinkExchangeError::Attach)?;
+    inner
+        .send_detach(true, error)
+        .await
+        .map_err(LinkExchangeError::Detach)?;
+    let reply = recv_remote_detach(inner)
+        .await
+        .map_err(LinkExchangeError::Detach)?;
+    inner
+        .link_mut()
+        .on_detach_reply(reply)
+        .map_err(LinkExchangeError::Detach)
+}
+
+/// Exact close shared by ordinary links and the transaction controller.
+/// Crate visibility is required by transaction::controller; other helpers
+/// stay scoped to the link module.
+pub(crate) async fn close_exact<T, F, G, E>(
+    inner: &mut T,
+    peer_suspended: bool,
+    before: &mut F,
+) -> Result<(), LinkExchangeError<<T::Link as LinkAttach>::AttachError, E>>
+where
+    T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
+    T::Link: LinkDetach<DetachError = DetachError>,
+    <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
+    F: FnMut() -> Result<G, E> + Send,
+    G: Send,
+    E: Send,
+{
+    if peer_suspended
+        && !matches!(
+            inner.link().local_state(),
+            LinkState::Detached | LinkState::Closed
+        )
+    {
+        let reply = recv_remote_detach(inner)
+            .await
+            .map_err(LinkExchangeError::Detach)?;
+        let _ = inner.link_mut().apply_remote_detach_outcome(reply);
+    }
+    match inner.link().local_state() {
+        LinkState::Detached => reattach_then_close_exact(inner, before, None).await,
+        LinkState::Closed => Ok(()),
+        LinkState::DetachSent => {
+            let reply = recv_remote_detach(inner)
+                .await
+                .map_err(LinkExchangeError::Detach)?;
+            if reply.closed {
+                reattach_then_close_exact(inner, before, None).await?;
+                Err(LinkExchangeError::Detach(DetachError::ClosedByRemote))
+            } else {
+                inner
+                    .link_mut()
+                    .apply_remote_detach_outcome(reply)
+                    .map_err(|error| LinkExchangeError::Detach(error.into()))
+            }
+        }
+        state => {
+            if !matches!(state, LinkState::CloseSent) {
+                inner
+                    .send_detach(true, None)
+                    .await
+                    .map_err(|_| LinkExchangeError::Detach(detach_error_from_stop_reason(inner)))?;
+            }
+            let reply = recv_remote_detach(inner)
+                .await
+                .map_err(LinkExchangeError::Detach)?;
+            if reply.closed {
+                inner
+                    .link_mut()
+                    .on_detach_reply(reply)
+                    .map_err(LinkExchangeError::Detach)
+            } else {
+                let _ = inner.link_mut().apply_remote_detach_outcome(reply);
+                reattach_then_close_exact(inner, before, None).await
+            }
+        }
+    }
+}
+
+/// Sender suspension retains the ordinary state machine, with exact crossed close.
+pub(super) async fn detach_exact<T, F, G, E>(
+    inner: &mut T,
+    before: &mut F,
+) -> Result<(), LinkExchangeError<<T::Link as LinkAttach>::AttachError, E>>
+where
+    T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
+    T::Link: LinkDetach<DetachError = DetachError>,
+    <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
+    F: FnMut() -> Result<G, E> + Send,
+    G: Send,
+    E: Send,
+{
+    match inner.link().local_state() {
+        LinkState::Detached => Ok(()),
+        LinkState::Closed => Err(LinkExchangeError::Detach(DetachError::ClosedByRemote)),
+        LinkState::CloseSent => {
+            let reply = recv_remote_detach(inner)
+                .await
+                .map_err(LinkExchangeError::Detach)?;
+            if reply.closed {
+                inner
+                    .link_mut()
+                    .on_detach_reply(reply)
+                    .map_err(LinkExchangeError::Detach)?;
+            } else {
+                let _ = inner.link_mut().apply_remote_detach_outcome(reply);
+                reattach_then_close_exact(inner, before, None).await?;
+            }
+            Err(LinkExchangeError::Detach(DetachError::ClosedByRemote))
+        }
+        state => {
+            if !matches!(state, LinkState::DetachSent) {
+                inner
+                    .send_detach(false, None)
+                    .await
+                    .map_err(LinkExchangeError::Detach)?;
+            }
+            let reply = recv_remote_detach(inner)
+                .await
+                .map_err(LinkExchangeError::Detach)?;
+            if reply.closed {
+                reattach_then_close_exact(inner, before, None).await?;
+                Err(LinkExchangeError::Detach(DetachError::ClosedByRemote))
+            } else {
+                inner
+                    .link_mut()
+                    .on_detach_reply(reply)
+                    .map_err(LinkExchangeError::Detach)
             }
         }
     }

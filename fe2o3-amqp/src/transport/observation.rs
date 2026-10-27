@@ -3,7 +3,7 @@ use crate::frames::amqp::{Frame, FrameBody};
 use bytes::{BufMut, Bytes, BytesMut};
 use fe2o3_amqp_types::performatives::Performative;
 use std::sync::Arc;
-/// One admitted frame. Raw bytes preserve original constructors and map ordering.
+/// One decoded frame. Raw bytes preserve original constructors and map ordering.
 pub struct IncomingFrame {
     /// Entire wire frame including its four-byte size field.
     pub bytes: Bytes,
@@ -69,6 +69,7 @@ impl IncomingFrame {
             FrameBody::Detach(p) => Some(Performative::Detach(p.clone())),
             FrameBody::End(p) => Some(Performative::End(p.clone())),
             FrameBody::Close(p) => Some(Performative::Close(p.clone())),
+            FrameBody::TransferRefused(_) => unreachable!("observations precede refusal"),
             FrameBody::Empty => None,
         };
         let payload_offset = bytes.len() - payload_len;
@@ -80,18 +81,78 @@ impl IncomingFrame {
         }
     }
 }
+/// The enforced forwarding decision for one decoded incoming frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IncomingFrameAction {
+    /// Preserve normal native forwarding and processing.
+    Forward,
+    /// Consume a Transfer only in physical session accounting, without link parsing.
+    RefuseTransfer,
+}
+
 /// Synchronous observation hook. Implementations must not block or perform I/O.
-/// A bounded observer can end its own delivery while the protocol engine continues.
+/// Transfer refusal is enforced before native link consumption; session counters
+/// still account for the physical Transfer in order.
 /// SASL tokens and TLS material are never delivered through this hook.
 pub trait IncomingFrameObserver: Send + Sync + std::fmt::Debug {
     /// The peer's successfully validated post-SASL AMQP 1.0 protocol header.
     fn protocol_header(&self, _header: [u8; 8]) {}
     /// Observe an admitted incoming AMQP frame before the engine processes it.
-    fn incoming(&self, frame: Arc<IncomingFrame>);
+    fn incoming(&self, frame: Arc<IncomingFrame>) -> IncomingFrameAction;
 }
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn a_refused_transfer_never_leaves_as_a_normal_frame() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Verdict {
+            refuse: bool,
+            calls: AtomicUsize,
+        }
+        impl IncomingFrameObserver for Verdict {
+            fn incoming(&self, frame: Arc<IncomingFrame>) -> IncomingFrameAction {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                if self.refuse && matches!(frame.performative, Some(Performative::Transfer(_))) {
+                    IncomingFrameAction::RefuseTransfer
+                } else {
+                    IncomingFrameAction::Forward
+                }
+            }
+        }
+        for refuse in [false, true] {
+            let raw = [
+                0, 0, 0, 25, 3, 0, 0, 9, 1, 2, 3, 4, 0, 0x53, 0x14, 0xc0, 7, 4, 0x43, 0x43, 0xa0,
+                1, 0x55, 0x43, 0x42,
+            ];
+            let (io, mut peer) = tokio::io::duplex(128);
+            let observer = Arc::new(Verdict {
+                refuse,
+                calls: AtomicUsize::new(0),
+            });
+            let mut transport = super::super::Transport::<_, Frame>::bind(io, 512, None);
+            transport.set_incoming_frame_observer(Some(observer.clone()));
+            peer.write_all(&raw).await.unwrap();
+            peer.write_all(&[0, 0, 0, 8, 2, 0, 0, 9]).await.unwrap();
+            let first = transport.next().await.unwrap().unwrap();
+            assert_eq!(first.channel, 9);
+            if refuse {
+                assert!(matches!(first.body, FrameBody::TransferRefused(_)));
+            } else {
+                let FrameBody::Transfer { payload, .. } = first.body else {
+                    panic!("forwarded Transfer")
+                };
+                assert_eq!(payload.as_ref(), [0x42]);
+            }
+            assert!(matches!(
+                transport.next().await.unwrap().unwrap().body,
+                FrameBody::Empty
+            ));
+            assert_eq!(observer.calls.load(Ordering::Acquire), 2);
+        }
+    }
+
     use super::*;
     use futures_util::StreamExt;
     use std::sync::Mutex;
@@ -99,8 +160,9 @@ mod tests {
     #[derive(Debug, Default)]
     struct Observer(Mutex<Vec<Arc<IncomingFrame>>>);
     impl IncomingFrameObserver for Observer {
-        fn incoming(&self, f: Arc<IncomingFrame>) {
+        fn incoming(&self, f: Arc<IncomingFrame>) -> IncomingFrameAction {
             self.0.lock().unwrap().push(f);
+            IncomingFrameAction::Forward
         }
     }
     #[tokio::test]

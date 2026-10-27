@@ -886,6 +886,11 @@ impl endpoint::Session for Session {
         }
     }
 
+    fn on_refused_incoming_transfer(&mut self) {
+        self.note_incoming_transfer();
+        self.receive_window.consumed_without_hold();
+    }
+
     /// Handle an incoming transfer.
     ///
     /// Always returns `Ok(None)`: settlement of non-transactional deliveries is
@@ -901,8 +906,7 @@ impl endpoint::Session for Session {
         // Upon receiving a transfer, the receiving endpoint will increment the next-incoming-id to
         // match the implicit transfer-id of the incoming transfer plus one, as well as decrementing the
         // remote-outgoing-window, and MAY (depending on policy) decrement its incoming-window.
-        self.next_incoming_id = self.next_incoming_id.wrapping_add(1);
-        self.remote_outgoing_window = self.remote_outgoing_window.saturating_sub(1);
+        self.note_incoming_transfer();
         let slot = self
             .receive_window
             .reserve()
@@ -1399,6 +1403,13 @@ fn consecutive_chunk_indices(delivery_ids: &[DeliveryNumber]) -> Vec<usize> {
             }
         })
         .collect()
+}
+
+impl Session {
+    fn note_incoming_transfer(&mut self) {
+        self.next_incoming_id = self.next_incoming_id.wrapping_add(1);
+        self.remote_outgoing_window = self.remote_outgoing_window.saturating_sub(1);
+    }
 }
 
 #[cfg(test)]

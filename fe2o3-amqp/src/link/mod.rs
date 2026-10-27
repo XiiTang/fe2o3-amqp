@@ -14,7 +14,11 @@ use fe2o3_amqp_types::{
 
 pub use error::*;
 
-pub use receiver::{CreditMode, Receiver, ReceiverDisposer};
+pub use receiver::{
+    CreditMode, Receiver, ReceiverCollectionStep, ReceiverDetachError, ReceiverDetachStep,
+    ReceiverDisposer, ReceiverReadStep, ReceiverTransferEffect, ReceiverTransferHeader,
+    ReceiverTransferObserver, ReceiverTransferProgress,
+};
 pub use sender::Sender;
 use serde_amqp::serialized_size;
 use tokio::sync::{mpsc, oneshot};
@@ -22,8 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     control::SessionControl,
     endpoint::{
-        self, AttachmentId, InputHandle, LinkAttach, LinkDetach, LinkFlow, OutputAttachment,
-        Settlement,
+        self, AttachmentId, InputHandle, LinkDetach, LinkFlow, OutputAttachment, Settlement,
     },
     link::delivery::UnsettledMessage,
     util::{AsDeliveryState, Consumer, Produce, Producer},
@@ -60,6 +63,12 @@ mod source;
 pub(crate) mod state;
 pub mod target_archetype;
 pub(crate) mod unsettled_store;
+
+/// Internal purpose of Attach validation; close-only never reconciles deliveries.
+pub(crate) enum AttachPurpose {
+    Ordinary,
+    CloseOnly,
+}
 
 /// Default amount of link credit
 pub const DEFAULT_CREDIT: SequenceNo = 200;
@@ -339,6 +348,7 @@ where
         &mut self,
         writer: &crate::session::transfer_queue::Sender,
         is_reattaching: bool,
+        purpose: &AttachPurpose,
     ) -> Result<(), SendAttachErrorKind> {
         // Create Attach frame
         let handle = match &self.output_handle {
@@ -351,7 +361,9 @@ where
             //
             // It is ok to clear the map here because link will always try to send attach
             // before it handles the remote attach.
-            self.unsettled.clear_for_reattach();
+            if matches!(purpose, AttachPurpose::Ordinary) {
+                self.unsettled.clear_for_reattach();
+            }
             None
         } else {
             let guard = self.unsettled.read();
@@ -1045,6 +1057,58 @@ pub(crate) mod test_util {
         }
 
         (saw_attach, detaches)
+    }
+    /// Drive exact end handshakes, including an already-detached endpoint.
+    pub(crate) async fn drive_exact_end(
+        mut control: mpsc::Receiver<SessionControl>,
+        mut outgoing: mpsc::Receiver<LinkFrame>,
+        mut incoming: mpsc::Sender<LinkFrame>,
+        peer_attach: Attach,
+        mut at_attach: impl FnMut(),
+        mut at_close: impl FnMut() -> Option<fe2o3_amqp_types::definitions::Error>,
+    ) -> usize {
+        let mut attached = false;
+        let mut detaches = 0;
+        loop {
+            tokio::select! {
+                next=control.recv()=>match next {
+                    Some(SessionControl::GetIncomingWindow(reply))=>{reply.send(16).unwrap();},
+                    Some(SessionControl::AllocateLink { link_relay,responder,.. })=>{
+                        incoming=match link_relay { LinkRelay::Sender{tx,..}|LinkRelay::Receiver{tx,..}=>tx };
+                        responder.send(Ok(OutputAttachment::for_tests(7))).unwrap();
+                    }
+                    Some(_) => {},
+                    None=>panic!("native session disappeared before end completed"),
+                },
+                frame=outgoing.recv()=>match frame.expect("owned outgoing link queue") {
+                    LinkFrame::Attach(attach)=>{
+                        assert!(attach.unsettled.is_none());
+                        assert!(!attach.incomplete_unsettled);
+                        at_attach();attached=true;
+                        incoming.send(LinkFrame::Attach(peer_attach.clone())).await.unwrap();
+                        if peer_attach.incomplete_unsettled {return detaches;}
+                    }
+                    LinkFrame::Detach(detach,_)=>{
+                        detaches+=1;
+                        let error=if attached {
+                            assert!(detach.closed);assert_eq!(detach.handle,7u32.into());
+                            at_close()
+                        } else {None};
+                        incoming.send(LinkFrame::Detach(Detach {handle:peer_attach.handle.clone(),
+                            closed:attached || !detach.closed,error},AttachmentId::allocate())).await.unwrap();
+                        if attached {return detaches;}
+                    }
+                    frame=>panic!("unexpected work in close-only exchange: {frame:?}"),
+                },
+            }
+        }
+    }
+
+    pub(crate) struct CorrelationGuard(pub std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CorrelationGuard {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 }
 

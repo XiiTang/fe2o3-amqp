@@ -498,7 +498,7 @@ and queues force the interleavings; no sleeping supplies an assertion.
 The old unit observation hook could not refuse forwarding, and Transfers that
 abort, are ignored on resume, or only update retained delivery state yield no
 Delivery with which the host could retire a provisional receipt.
-`IncomingFrameObserver::incoming(&self,IncomingFrame<'_>)->IncomingFrameAction`
+`IncomingFrameObserver::incoming(&self,Arc<IncomingFrame>)->IncomingFrameAction`
 now returns Forward or RefuseTransfer. Transport checks that verdict before
 forwarding: only it can construct the opaque payload-free refused marker, on
 the same channel. Connection/session routing quietly consumes retired or

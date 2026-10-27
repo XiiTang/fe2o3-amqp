@@ -424,3 +424,149 @@ preceding pin the four failure cases fail, ending with the "Expecting remote
 close" end of the stream instead. The library and the in-memory integration
 suites under Validation pass, and strict Clippy passes, on macOS arm64 /
 Rust 1.97.0.
+
+
+## Exact suspended/crossed link end exchanges and tracked coordinator Detach completion (Boundless W1-D1)
+
+The host must correlate every internal Attach used to finish an AMQP 1.0
+§2.6.6 crossed end, retain that correlation until actual exit, and preserve
+which exchange failed. The ordinary recovery Attach path also clears or
+reconciles local unsettled entries; a close-only reattach must do neither.
+Both roles keep one outgoing Attach implementation and one validation body,
+selected by private `AttachPurpose::{Ordinary,CloseOnly}`. The borrowed final
+`purpose` argument to `send_attach_inner` leaves ordinary behavior unchanged;
+CloseOnly advertises null unsettled without clearing its nonempty native
+store, validates terminus/role/handle/settle fields, and rejects incomplete
+reconciliation rather than replaying a delivery. This extends the earlier
+partial-transfer and detached-attachment patches above.
+
+The public sender entries are `close_in_place_exact<F,G,E>(&mut self,
+peer_suspended:bool,before:F)` and `detach_borrowed_exact<F,G,E>(&mut self,
+before:F)`, returning `Result<(),LinkExchangeError<SenderAttachError,E>>`;
+the receiver has the corresponding exact close and the receive/suspension
+entries below. The callback is `FnMut()->Result<G,E>+Send`, with G/E Send;
+it runs before reallocation and its guard stays owned through actual closing
+reply or failure. `LinkExchangeError<A,E>` retains Attach, Detach and
+Correlation phases, with phase-only Display and typed sources. Only the shared
+`close_exact` is pub(crate), for the transaction module; other shared exact
+helpers remain pub(super). `Controller::close_retained_tracked_exact` takes
+`&self`, the original `Arc<AtomicBool>` dispatch flag and the same callback,
+returns the sender phase error, and holds its existing native inner mutex
+through the exchange. It performs no business resume or Discharge.
+
+The public receiver `recv_detaching_exact<T,O,F,G,E>(&mut self,&mut O,&mut F)`
+returns `Result<ReceiverDetachStep<T>,ReceiverDetachError<E>>`. Its Delivery,
+SelfClosing, Suspended and Closed steps keep normal Transfer and partial-body
+processing during suspension; no generic frame-discarding wait is used there.
+`recv_collecting_stopped<T,O>(&mut self,&mut O)` checks the original native
+session stop before any queue movement, drains through that same parser and
+returns Delivery/Drained/Closed or the actual receive fault without new wire
+work. `recv_observed` signals SelfClosing before sending a protocol close;
+`self_close_cause` borrows its saved cause and `finish_self_close_exact` consumes
+the exact close handshake with the scoped callback. Legacy recv preserves its
+contract. Existing suspended same-session dispositions remain unchanged.
+
+A dispatched tracked Declare/Discharge must also finish if its control link
+is detached without closing. `SharedTransaction::{declare_tracked,
+discharge_tracked}` use the existing bodies with a construction-bound public
+`ControlTracker::new(request,Arc<dyn ControlProbe>)`; ordinary entries pass
+None. Its opaque ControlAttachment/ControlReceipt bind the original request,
+attachment, delivery tag, first admission, complete dispatch fence, optional
+Detach sequence and actual terminal answer. The private immutable receipt
+payload is boxed, with read-only getters. Probe calls run outside its snapshot
+mutex. Native send registers unsettled state before first admission, and
+writes terminal answered state before notifying the original oneshot in both
+settlement paths; failure writes no invented answer. Only a tracked fragmented
+send returns its consumed Detach through the control-only completion path,
+including actual closed/error and an incomplete receipt. Ordinary None send
+and resume keep their pending-settlement behavior. `ControlDetached` preserves
+these facts without retrying, replaying or implicitly rolling back anything;
+the host remains the sole command-causality classifier.
+
+Regression fixtures at source revision
+`3455283d7b90c1e12817cffa05b83951a278df47` include nonempty local stores for both
+roles, already-suspended and crossed close, complete null/nonempty peer maps,
+incomplete/terminus/allocation/callback failures, in-flight complete and partial
+receives during detach, checked stopped drain, protocol faults before wire,
+exact current native disposition identity, Declare/Discharge with both closed
+flags, genuinely fragmented controls and answer-before-oneshot gates. The
+controller regression invokes its public retained exact close. Native gates
+and queues force the interleavings; no sleeping supplies an assertion.
+
+## Receive admission verdict and per-Transfer semantic progress (Boundless W1-D1)
+
+The old unit observation hook could not refuse forwarding, and Transfers that
+abort, are ignored on resume, or only update retained delivery state yield no
+Delivery with which the host could retire a provisional receipt.
+`IncomingFrameObserver::incoming(&self,IncomingFrame<'_>)->IncomingFrameAction`
+now returns Forward or RefuseTransfer. Transport checks that verdict before
+forwarding: only it can construct the opaque payload-free refused marker, on
+the same channel. Connection/session routing quietly consumes retired or
+missing routes; a live mapped session advances its physical Transfer id/window
+and wakes its ordinary automatic window update, without LinkRelay, body,
+transaction-manager or listener work. Plain, TxnSession, ListenerSession and
+TxnSession<ListenerSession> delegate to that single session implementation.
+The marker is incoming-only and has no wire encoding or payload exposure.
+
+`ReceiverTransferObserver::{begin,transfer}` receives original read-only
+ReceiverTransferHeader and one ReceiverTransferProgress per consumed Transfer.
+The native parser alone commits PayloadIncomplete, Delivered{info}, Aborted,
+Ignored{more}, StateOnly{info,retained,more}, or Failed. A state-only initial
+fragment snapshots the exact DeliveryInfo under the native map write; later
+fragments carry no new identity. A settlement removing it before that write
+produces None/false. All normal, exact-suspension and stopped receive loops use
+this same parser and callback contract; the observer never reclassifies raw
+Transfers and no new record or body surface is added. Four private no-await
+parser helpers are synchronous, preserving their no-yield ordering.
+
+Regressions are `a_refused_transfer_never_leaves_as_a_normal_frame`,
+`refused_transfer_keeps_only_physical_session_progress`,
+`a_refused_transfer_on_a_retired_session_is_consumed_quietly`,
+`observed_abort_then_delivery_retires_only_the_partial`,
+`observed_ignored_resume_consumes_every_fragment_without_a_delivery`,
+`observed_state_only_supplies_the_exact_native_identity_once`, and
+`state_only_settlement_before_the_native_write_supplies_no_identity`. They
+exercise actual transport verdicts, bounded connection forwarding, automatic
+session-only Flow, all wrapper kinds, omitted continuation fields and an actual
+native settlement at the state-only map-write gate. Boundless W1-D1 supplies
+the corresponding router/ingress integration tests; those are not claimed by
+these native-only fixtures.
+
+## Associate an allocated Begin channel before dispatch (Boundless W1-D1)
+
+On native targets `Session::builder().begin_with_channel<F>(connection,
+allocated)` retains begin's result and bounds and adds a final
+`F:FnOnce(u16)+Send` callback. It runs exactly once after successful session
+allocation and before any engine/native Begin send. Allocation refusal never
+calls it; later dispatch failure retains that one association. Ordinary begin
+delegates with a no-op and the wasm/local signatures stay unchanged.
+`a_begin_channel_is_associated_before_any_begin_can_escape` gates the real
+callback and wire writer, checks the peer's actual channel and following End,
+and covers allocation refusal, dispatch failure and the default entry.
+
+### W1-D1 regression evidence
+
+All commands below passed (exit 0) on macOS 27.2 arm64, Rust 1.97.0, at the source
+revision above; the following documentation-only commit changes no tested code.
+Every compile/test used the machine build-slot wrapper. This fork has no
+upstream tracked Cargo.lock; none is added.
+
+```text
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib link::sender::tests::
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib link::receiver::tests::
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib transaction::controller::tests::
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib a_begin_channel_is_associated_before_any_begin_can_escape
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib a_refused_transfer_never_leaves_as_a_normal_frame
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib refused_transfer_keeps_only_physical_session_progress
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib a_refused_transfer_on_a_retired_session_is_consumed_quietly
+cargo test -p fe2o3-amqp --features transaction,acceptor --test clean_teardown --test link_stop_reason --test detached_link_frames --test engine_first_failure
+cargo check -p fe2o3-amqp --no-default-features
+cargo clippy -p fe2o3-amqp --features transaction,acceptor --lib --tests -- -D warnings
+cargo fmt --all --check
+```
+
+The selected native unit filters passed 78 tests; the four existing integration
+suites passed 25. This is targeted regression evidence, not a complete crate or
+platform acceptance run. The work branch is based on pinned 44afcb79; the landing
+owner reconciles its other fork line and fast-forwards boundless. No push or
+boundless-branch movement is part of this patch.

@@ -737,15 +737,23 @@ async fn a_sender_s_disposition_for_a_detached_link_leaves_the_handle_s_next_rec
     stop_and_join(connection, session).await;
 }
 
-/// A cancelled caller does not retract its Attach. The owned resume must consume
-/// the late answer and finish suspension before its endpoint can be resumed again.
-#[tokio::test]
+/// Cancellation or timeout cannot retract an Attach. The owned resume consumes
+/// its late answer and completes suspension before explicit retry; a peer's
+/// cleanup failure retains its original typed condition instead of Timeout.
+#[tokio::test(start_paused = true)]
 async fn interrupted_resume_consumes_the_late_attach_and_returns_resumable_custody() {
     use fe2o3_amqp::link::{ReceiverResumeErrorKind, SenderResumeErrorKind};
 
-    for receiving in [false, true] {
+    for (receiving, timed, peer_error) in [false, true].into_iter().flat_map(|receiving| {
+        [false, true].into_iter().flat_map(move |timed| {
+            [false, true]
+                .into_iter()
+                .map(move |peer_error| (receiving, timed, peer_error))
+        })
+    }) {
         let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
         let (interrupt, interrupted) = oneshot::channel();
+        let (resumed_peer, resume_complete) = oneshot::channel();
         let client = async move {
             let mut connection = Connection::builder()
                 .container_id("client")
@@ -761,17 +769,31 @@ async fn interrupted_resume_consumes_the_late_attach_and_returns_resumable_custo
                     .await
                     .unwrap_err();
                 assert!(matches!(before.kind, ReceiverResumeErrorKind::Interrupted));
-                let after = before
-                    .detached_recver
-                    .resume_on_session_until(&session, async { interrupted.await.unwrap() })
-                    .await
-                    .unwrap_err();
-                assert!(
-                    matches!(after.kind, ReceiverResumeErrorKind::Interrupted),
-                    "actual receiver cleanup: {:?}",
-                    after.kind
-                );
+                let after = if timed {
+                    before
+                        .detached_recver
+                        .resume_on_session_with_timeout(&session, Duration::from_secs(1))
+                        .await
+                } else {
+                    before
+                        .detached_recver
+                        .resume_on_session_until(&session, async { interrupted.await.unwrap() })
+                        .await
+                }
+                .unwrap_err();
+                if peer_error {
+                    assert!(matches!(&after.kind,
+                        ReceiverResumeErrorKind::DetachError(DetachError::RemoteDetachedWithError(error))
+                        if error.condition == AmqpError::InternalError.into()));
+                } else if timed {
+                    assert!(matches!(after.kind, ReceiverResumeErrorKind::Timeout));
+                } else {
+                    assert!(matches!(after.kind, ReceiverResumeErrorKind::Interrupted));
+                }
                 let resumed = after.detached_recver.resume().await.unwrap();
+                // Keep the engine live until the peer saw the resumed credit;
+                // stopping the fixture must not drop that queued Flow.
+                resume_complete.await.unwrap();
                 stop_and_join(connection, session).await;
                 drop(resumed);
             } else {
@@ -782,17 +804,31 @@ async fn interrupted_resume_consumes_the_late_attach_and_returns_resumable_custo
                     .await
                     .unwrap_err();
                 assert!(matches!(before.kind, SenderResumeErrorKind::Interrupted));
-                let after = before
-                    .detached_sender
-                    .resume_on_session_until(&session, async { interrupted.await.unwrap() })
-                    .await
-                    .unwrap_err();
-                assert!(
-                    matches!(after.kind, SenderResumeErrorKind::Interrupted),
-                    "actual sender cleanup: {:?}",
-                    after.kind
-                );
+                let after = if timed {
+                    before
+                        .detached_sender
+                        .resume_on_session_with_timeout(&session, Duration::from_secs(1))
+                        .await
+                } else {
+                    before
+                        .detached_sender
+                        .resume_on_session_until(&session, async { interrupted.await.unwrap() })
+                        .await
+                }
+                .unwrap_err();
+                if peer_error {
+                    assert!(matches!(&after.kind,
+                        SenderResumeErrorKind::DetachError(DetachError::RemoteDetachedWithError(error))
+                        if error.condition == AmqpError::InternalError.into()));
+                } else if timed {
+                    assert!(matches!(after.kind, SenderResumeErrorKind::Timeout));
+                } else {
+                    assert!(matches!(after.kind, SenderResumeErrorKind::Interrupted));
+                }
                 let resumed = after.detached_sender.resume().await.unwrap();
+                // Keep the engine live until the peer saw the resumed credit;
+                // stopping the fixture must not drop that queued Flow.
+                resume_complete.await.unwrap();
                 stop_and_join(connection, session).await;
                 drop(resumed);
             }
@@ -810,7 +846,13 @@ async fn interrupted_resume_consumes_the_late_attach_and_returns_resumable_custo
             let FrameBody::Attach(attach) = peer.read().await else {
                 panic!("expected only the next admitted resume Attach")
             };
-            interrupt.send(()).unwrap();
+            if timed {
+                // Advance the actual native deadline while the late Attach
+                // answer is held, with no elapsed wall-clock assumption.
+                tokio::time::advance(Duration::from_secs(1)).await;
+            } else {
+                interrupt.send(()).unwrap();
+            }
             // Hold its answering Attach until cleanup has actually admitted
             // the nonclosing Detach; no sleep or timing assumption is needed.
             let detach = peer
@@ -838,12 +880,20 @@ async fn interrupted_resume_consumes_the_late_attach_and_returns_resumable_custo
                 },
             )
             .await;
-            peer.write(0, &detach).await;
+            peer.write(
+                0,
+                &Detach {
+                    error: peer_error.then(|| Error::new(AmqpError::InternalError, None, None)),
+                    ..detach
+                },
+            )
+            .await;
             if receiving {
                 peer.answer_receiver_attach(None).await;
             } else {
                 peer.answer_attach(None).await;
             }
+            resumed_peer.send(()).unwrap();
             peer
         };
         let (_, _peer) = tokio::time::timeout(Duration::from_secs(10), async {

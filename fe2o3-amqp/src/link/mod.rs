@@ -464,7 +464,10 @@ where
     ) -> Result<(), Self::DetachError> {
         // Preserve the attached state if queuing is cancelled or refused before dispatch.
         let next_state = match (&self.local_state, closed) {
-            (LinkState::Attached, false) => LinkState::DetachSent,
+            (
+                LinkState::Attached | LinkState::AttachSent | LinkState::IncompleteAttachSent,
+                false,
+            ) => LinkState::DetachSent,
             (LinkState::Attached, true) => LinkState::CloseSent,
             _ => return Err(DetachError::IllegalState),
         };

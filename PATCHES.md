@@ -648,6 +648,15 @@ each frame, outgoing admission is closed, no later frame is written, and normal
 versus error-bearing peer Close keep their results. Existing clean_teardown and
 engine_first_failure cover clean shutdown and real protocol/transport failures.
 
+Upstream 8fd06bc3 comparison for the paths this patch reaches:
+
+| Path | Upstream behavior | This patch / regression |
+| --- | --- | --- |
+| Normal local Close with session input crossing its reply | engine.rs::forward_to_session accepts only Opened; connection Begin/End similarly reject CloseSent, so legal input returns IllegalState. | Change to consume legal CloseSent input through the same relay until peer Close, required by transport §2.4.6. The real-Close-gated crossing regression drives Begin/Attach/Flow/End and asserts no later output. |
+| Outgoing work after local Close | on_control closes and drains outgoing admission before writing Close. | Kept; the same regression asserts the outgoing writer is closed and no post-Close frame escapes. |
+| Peer Close and actual errors | on_incoming_close retains a normal or error-bearing peer result; malformed frames/channel errors retain their error path, and Discarding rejects ordinary session input. | Kept; crossing regression runs normal/error peer Close, engine_first_failure drives real invalid-frame and transport errors. No EOF normalization. |
+| Cancellation, timeout and retry | ConnectionHandle::close sends its control then waits on on_close; dropping the wait cannot retract an already sent control. There is no autonomous close retry or built-in close timer here. | Kept: this patch changes no handle wait/bounds/retry path; the engine still owns the issued Close. No new retry, timer or cancellation policy. |
+
 Validation on macOS arm64 / Rust 1.97.0 uses the consumer's tokio-util 0.7.19 in a local,
 uncommitted fork lock (fresh resolution selects 0.7.20, whose new Encoder<&[u8]>
 implementation makes pre-existing transport calls ambiguous). The fork still
@@ -719,16 +728,70 @@ No new signal, state, cell, replay or fallback owner. Apply the same original
 sender/receiver timeout class, preserving native unsettled/partial custody.
 
 The deterministic detached_link_frames regression covers interruption before
-and after real Attach admission for both roles, late Attach followed by Detach,
-and an actual subsequent resume; the existing partial-receiver pre-dispatch
+and after real Attach admission, actual paused-clock timeout expiry, successful
+and error-bearing cleanup answers for both roles, and an actual subsequent resume; the existing partial-receiver pre-dispatch
 regression retains its original no-frame and partial-body assertions. The
 consumer keeps its original successful logical Close and joined-pumps assertion.
-Candidate validation on macOS arm64, Darwin 27.2.0, Rust 1.97.0:
-`cargo test -p fe2o3-amqp --features transaction,acceptor --lib --test clean_teardown --test link_stop_reason --test detached_link_frames --test engine_first_failure --test large_message_split --test relay_remote_detach`
-through build-slot exits 101: all 167 library tests pass, but the new after-attach
-sender arm returns DetachError(IllegalState). The existing shared cleanup accepts
-AttachSent while Link::send_detach permits only Attached; upstream 8fd06bc3 has
-the same mismatch. Sending first also requires preserving the pending name/relay
-that session detach currently deallocates. This candidate is blocked on that
-separately proposed native correction, not validated for landing. No wider state
-admission or binding-lifetime change is made here.
+Upstream 8fd06bc3 comparison for each changed or retained resume path:
+
+| Path | Upstream behavior | This patch / regression |
+| --- | --- | --- |
+| Native timeout | All timed sender/receiver resume variants cancel their in-progress exchange, call detach_with_error(None), then return Timeout with detached custody; cleanup failure is returned instead. | Restore that cleanup in every timed variant. The shared regression uses an actual resume_on_session_with_timeout for both roles, pauses Tokio time, holds the late Attach and advances its deadline. |
+| Explicit cancellation | Upstream has no interrupt-future entry; dropping its owning resume future drops its endpoint custody. | Keep the existing fork's ownership-returning Interrupted API, but use the same native suspension cleanup before returning custody. The regression signals that exact entry after real Attach admission; no dropping of the native owner is substituted. |
+| Interruption before dispatch | Native detached state makes detach_with_error a no-op. | Kept; regression's ready interruption sees no Detach before the next real Attach, and the existing partial receiver fixture keeps its no-frame/body-custody assertions. |
+| Half-open cleanup | The helper selects AttachSent but send_detach rejects it; outgoing session Detach also deletes the pending relay before the late Attach can bind. | Correct this upstream defect as P9 below, using the same state admission and close_pending/attachment owner. Regression withholds the Attach reply until it observes nonclosing Detach. |
+| Cleanup error | try_as_sender/try_as_recver return actual Detach error rather than substituting Timeout; cleanup never implies commit/replay. | Kept; the shared regression answers cleanup with a nonclosing error Detach and asserts the original typed error condition for both interruption and timer expiry, then explicitly resumes the retained endpoint. |
+| Retry | Detached custody is returned to the caller; another resume is explicit. | Kept; regression explicitly invokes a subsequent resume and the peer sees its actual Attach/credit. No automatic replay, retry or Discharge. |
+
+The fixture enables Tokio test-util only for dev dependencies to advance the real
+native timeout while the actual late-answer gate is held; no product clock or
+new cancellation signal is introduced.
+
+The class includes both explicit interruption entries and every timed resume
+entry. Restore the same cleanup in sender resume_with_timeout_inner and
+resume_incoming_attach_with_timeout_inner (including their public on-session
+wrappers), and receiver resume_with_timeout_inner,
+resume_incoming_attach_with_timeout and
+resume_incoming_attach_on_session_with_timeout. The shared after-dispatch
+regression covers both roles; all wrappers use the same existing native state
+and attachment path rather than independent recovery behavior.
+
+The first deterministic run exposed the upstream 8fd06bc3 half-open defect:
+shared_inner::detach_with_error selects AttachSent, but Link::send_detach
+accepted only Attached and returned IllegalState. The session also removed its
+pending name/relay as soon as Detach was sent, before the late Attach could bind.
+The consumer owner approved correcting that native path (P9 A).
+
+Allow nonclosing Detach for AttachSent/IncompleteAttachSent, with the existing
+state transition committed only after queue admission. Session::on_outgoing_detach
+retains a still-pending relay/name and original attachment allocation, using the
+same close_pending owner. The current-output checkpoint excludes close_pending,
+so Transfers and link Flow remain suppressed after Detach, even while its native
+binding is retained for answers. The original incoming Attach binds that relay;
+the answering Detach removes close_pending and releases the exact allocation.
+Attached detach, ordinary duplicate/name checks, actual errors and existing
+attachment-id checks keep their behavior. No new signal, cell, history or owner.
+
+AMQP 1.0 Part 2 sections 2.6.4 and 2.6.5 describe Attach then Detach; a local
+endpoint need not wait for an answering Attach before detaching. Mature source
+checks match this: azure-amqp/src/StateTransition.cs sendClose permits OpenSent
+to ClosePipe (lines 26–32), and rhea/lib/link.js::_process sends its Detach after
+its Attach without waiting for the peer (lines 118–132). The regression holds
+that late Attach until it sees the nonclosing Detach and then verifies an actual
+subsequent resume, for both roles; its next expected Attach also catches any
+post-Detach Transfer/Flow. Before-dispatch interruption sends nothing.
+
+Final source validation at 24977d12 on macOS arm64, Darwin 27.2.0, Rust 1.97.0,
+using the consumer-compatible uncommitted local lock (tokio-util 0.7.19):
+all 167 library tests and 35 regressions pass, exit 0; strict Clippy and fmt pass,
+exit 0. All commands run through build-slot on 2026-10-28:
+
+```sh
+cargo test -p fe2o3-amqp --features transaction,acceptor --no-fail-fast --lib --test clean_teardown --test link_stop_reason --test detached_link_frames --test engine_first_failure --test large_message_split --test relay_remote_detach
+cargo clippy -p fe2o3-amqp --features transaction,acceptor --lib --tests -- -D warnings
+cargo fmt --all --check
+```
+
+Only this validation note changed after those checks. The consuming change
+records its independent Artemis and Boundless checks; no local lock, temporary
+diagnostic or dependency override is committed.

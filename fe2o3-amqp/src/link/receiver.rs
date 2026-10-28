@@ -2862,8 +2862,7 @@ impl DetachedReceiver {
                     kind,
                 }),
                 Err(_) => {
-                    // Keep ownership and the actual in-progress state. A timeout
-                    // does not authorize a new protocol exchange.
+                    try_as_recver!(self, self.inner.detach_with_error(None).await);
                     Err(ReceiverResumeError {
                         detached_recver: self,
                         kind: ReceiverResumeErrorKind::Timeout,
@@ -2903,8 +2902,7 @@ impl DetachedReceiver {
                     kind,
                 }),
                 Err(_) => {
-                    // Keep ownership and the actual in-progress state. A timeout
-                    // does not authorize a new protocol exchange.
+                    try_as_recver!(self, self.inner.detach_with_error(None).await);
                     Err(ReceiverResumeError {
                         detached_recver: self,
                         kind: ReceiverResumeErrorKind::Timeout,

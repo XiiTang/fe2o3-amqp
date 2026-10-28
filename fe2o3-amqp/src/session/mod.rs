@@ -467,7 +467,8 @@ impl Session {
     /// reply to the peer's), the handle is released, and a frame the link
     /// made for that attachment, still queued or waiting for the peer's
     /// window, must not go out, even when a later attachment reuses the
-    /// handle number.
+    /// handle number. A half-open attachment retains its allocation only
+    /// for the late Attach/Detach answer; close_pending forbids output meanwhile.
     pub(crate) fn is_current_output_attachment(
         &self,
         handle: &OutputHandle,
@@ -476,6 +477,10 @@ impl Session {
         self.link_name_by_output_handle
             .get(handle.0 as usize)
             .is_some_and(|(_, current)| *current == id)
+            && !self.close_pending.contains(&OutputAttachment {
+                handle: handle.clone(),
+                id,
+            })
     }
 
     /// The frame for an outgoing transfer, or `None` when its attachment no
@@ -791,7 +796,13 @@ impl endpoint::Session for Session {
     /// so they are dropped and their queue room released; other links'
     /// keep their order.
     fn deallocate_link(&mut self, attachment: &OutputAttachment) -> bool {
-        if !self.is_current_output_attachment(&attachment.handle, attachment.id) {
+        // A half-open detach retains its allocation until its late Attach and
+        // Detach answer arrive, but close_pending already forbids output.
+        if !self
+            .link_name_by_output_handle
+            .get(attachment.handle.0 as usize)
+            .is_some_and(|(_, current)| *current == attachment.id)
+        {
             return false;
         }
         let (name, _) = self
@@ -1043,6 +1054,11 @@ impl endpoint::Session for Session {
                 // one the link sent itself; otherwise the peer detached the
                 // link on its own.
                 let remote_initiated = !self.close_pending.remove(&output_handle);
+                if !remote_initiated {
+                    // Ordinary detach already released its allocation on send;
+                    // a half-open one kept this exact name/relay until now.
+                    self.deallocate_link(&output_handle);
+                }
 
                 // Forward the detach into the link engine. If the peer
                 // detached the link on its own, the relay returns the reply
@@ -1335,7 +1351,7 @@ impl endpoint::Session for Session {
             handle: detach.handle.clone().into(),
             id: attachment,
         };
-        if !self.deallocate_link(&attachment) {
+        if !self.is_current_output_attachment(&attachment.handle, attachment.id) {
             // The attachment already ended: both sides closed at the same
             // time and the relay already answered the peer's detach, so this
             // one would only repeat it, or the handle now belongs to a later
@@ -1346,6 +1362,18 @@ impl endpoint::Session for Session {
             #[cfg(feature = "log")]
             log::debug!("Suppressing a detach for an attachment that already ended");
             return None;
+        }
+        // Before its answering Attach, the relay still lives by name. Keep
+        // that existing allocation for the late Attach/Detach, while the same
+        // close_pending entry blocks every queued Transfer and link Flow.
+        let pending_attach = expects_echo
+            && self
+                .link_name_by_output_handle
+                .get(attachment.handle.0 as usize)
+                .and_then(|(name, _)| self.link_by_name.get(name))
+                .is_some_and(Option::is_some);
+        if !pending_attach {
+            self.deallocate_link(&attachment);
         }
         if expects_echo {
             // Only a detach the link sent itself will be answered by the

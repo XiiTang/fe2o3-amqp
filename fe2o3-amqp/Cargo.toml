@@ -94,8 +94,8 @@ testcontainers.workspace = true
 fe2o3-amqp-ext = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "parking_lot"] }
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "parking_lot", "test-util"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
-tokio = { workspace = true, features = ["rt", "macros", "parking_lot"]}
+tokio = { workspace = true, features = ["rt", "macros", "parking_lot", "test-util"]}
 getrandom = { workspace = true, features = ["wasm_js"] }

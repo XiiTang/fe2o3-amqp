@@ -1336,8 +1336,7 @@ impl DetachedSender {
                     kind,
                 }),
                 Err(_) => {
-                    // Keep ownership and the actual in-progress state. A timeout
-                    // does not authorize a new protocol exchange.
+                    try_as_sender!(self, self.inner.detach_with_error(None).await);
                     Err(SenderResumeError {
                         detached_sender: self,
                         kind: SenderResumeErrorKind::Timeout,

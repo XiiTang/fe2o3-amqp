@@ -300,9 +300,6 @@ where
                 // delivery before this task resumes.
                 open.register(delivery_tag.clone(), unsettled);
             }
-            #[cfg(feature = "transaction")]
-            let first_fence =
-                tracking.map(|tracker| tracker.before_first(attachment.id, &delivery_tag));
             room.send(LinkFrame::Transfer {
                 window_slot: None,
                 queue_slot: None,
@@ -312,8 +309,8 @@ where
                 payload: first_payload,
             });
             #[cfg(feature = "transaction")]
-            if let (Some(tracker), Some(fence)) = (tracking, first_fence) {
-                tracker.first_admitted(attachment.id, &delivery_tag, fence);
+            if let Some(tracker) = tracking {
+                tracker.first_admitted(attachment.id);
             }
             drop(open);
             break delivery_tag;

@@ -16,8 +16,8 @@ pub use error::*;
 
 pub use receiver::{
     CreditMode, Receiver, ReceiverCollectionStep, ReceiverDetachError, ReceiverDetachStep,
-    ReceiverDisposer, ReceiverReadStep, ReceiverTransferEffect, ReceiverTransferHeader,
-    ReceiverTransferObserver, ReceiverTransferProgress,
+    ReceiverDisposer, ReceiverReadStep, ReceiverTransferEffect, ReceiverTransferObserver,
+    ReceiverTransferProgress,
 };
 pub use sender::Sender;
 use serde_amqp::serialized_size;
@@ -348,7 +348,7 @@ where
         &mut self,
         writer: &crate::session::transfer_queue::Sender,
         is_reattaching: bool,
-        purpose: &AttachPurpose,
+        _purpose: &AttachPurpose,
     ) -> Result<(), SendAttachErrorKind> {
         // Create Attach frame
         let handle = match &self.output_handle {
@@ -361,9 +361,7 @@ where
             //
             // It is ok to clear the map here because link will always try to send attach
             // before it handles the remote attach.
-            if matches!(purpose, AttachPurpose::Ordinary) {
-                self.unsettled.clear_for_reattach();
-            }
+            self.unsettled.clear_for_reattach();
             None
         } else {
             let guard = self.unsettled.read();
@@ -497,9 +495,12 @@ where
                 if let Some(flag) = &self.operation_dispatch {
                     flag.store(true, std::sync::atomic::Ordering::Release);
                 }
-                // Retain the identity while a non-closing Detach is in flight:
-                // preceding Transfer frames still belong to this endpoint.
-                if !matches!(self.local_state, LinkState::DetachSent) {
+                // The receiver must parse the original attachment's admitted
+                // prefix until its first native Detach, including after Close.
+                // Sender/controller close retain their existing release rule.
+                if !matches!(self.local_state, LinkState::DetachSent)
+                    && R::into_role() != Role::Receiver
+                {
                     self.output_handle.take();
                 }
                 Ok(())

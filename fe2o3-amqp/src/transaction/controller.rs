@@ -38,8 +38,6 @@ impl std::fmt::Debug for ControlAttachment {
 
 /// Incoming-frame fences from the fixed owner of this command.
 pub trait ControlProbe: Send + Sync {
-    /// Capture the fence before the first native Transfer admission.
-    fn first_fence(&self, attachment: &ControlAttachment, delivery_tag: &[u8]) -> u64;
     /// Capture a fence after all command fragments were admitted.
     fn dispatch_fence(&self) -> u64;
     /// The matching observed Detach sequence, if available.
@@ -53,39 +51,22 @@ pub struct ControlReceipt {
 }
 #[derive(Clone)]
 struct ControlReceiptFacts {
-    request: u64,
     attachment: Option<ControlAttachment>,
-    delivery_tag: Option<Vec<u8>>,
-    first_fence: Option<u64>,
     complete_fence: Option<u64>,
-    complete: bool,
     detach_sequence: Option<u64>,
     answered: Option<DeliveryState>,
 }
 impl std::fmt::Debug for ControlReceipt {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ControlReceipt")
-            .field("request", &self.facts.request)
-            .field("complete", &self.facts.complete)
+            .field("complete", &self.complete())
             .finish_non_exhaustive()
     }
 }
 impl ControlReceipt {
-    /// The immutable request ordinal.
-    pub fn request(&self) -> u64 {
-        self.facts.request
-    }
     /// The native attachment fixed at first admission.
     pub fn attachment(&self) -> Option<&ControlAttachment> {
         self.facts.attachment.as_ref()
-    }
-    /// The actual native credit-assigned delivery tag.
-    pub fn delivery_tag(&self) -> Option<&[u8]> {
-        self.facts.delivery_tag.as_deref()
-    }
-    /// Incoming fence before first admission.
-    pub fn first_fence(&self) -> Option<u64> {
-        self.facts.first_fence
     }
     /// Incoming fence after final admission.
     pub fn complete_fence(&self) -> Option<u64> {
@@ -93,7 +74,7 @@ impl ControlReceipt {
     }
     /// Whether the final command fragment was admitted.
     pub fn complete(&self) -> bool {
-        self.facts.complete
+        self.facts.complete_fence.is_some()
     }
     /// The fixed attachment's observed Detach sequence.
     pub fn detach_sequence(&self) -> Option<u64> {
@@ -109,7 +90,6 @@ impl ControlReceipt {
 #[derive(Clone)]
 pub struct ControlTracker(Arc<ControlTrackingState>);
 struct ControlTrackingState {
-    request: u64,
     probe: Arc<dyn ControlProbe>,
     snapshot: std::sync::Mutex<ControlReceipt>,
     #[cfg(test)]
@@ -119,27 +99,20 @@ struct ControlTrackingState {
 type AfterAnswer = Arc<dyn Fn() + Send + Sync>;
 impl std::fmt::Debug for ControlTracker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ControlTracker")
-            .field("request", &self.0.request)
-            .finish_non_exhaustive()
+        f.debug_struct("ControlTracker").finish_non_exhaustive()
     }
 }
 impl ControlTracker {
-    /// Fix the request and probe before dispatch; neither can be replaced.
-    pub fn new(request: u64, probe: Arc<dyn ControlProbe>) -> Self {
+    /// Fix the original command's probe before dispatch; it cannot be replaced.
+    pub fn new(probe: Arc<dyn ControlProbe>) -> Self {
         Self(Arc::new(ControlTrackingState {
-            request,
             probe,
             #[cfg(test)]
             after_answer: std::sync::Mutex::new(None),
             snapshot: std::sync::Mutex::new(ControlReceipt {
                 facts: Box::new(ControlReceiptFacts {
-                    request,
-                    attachment: None,
-                    delivery_tag: None,
-                    first_fence: None,
+                            attachment: None,
                     complete_fence: None,
-                    complete: false,
                     detach_sequence: None,
                     answered: None,
                 }),
@@ -156,39 +129,19 @@ impl ControlTracker {
             .and_then(|a| self.0.probe.detach_sequence(a));
         receipt
     }
-    pub(crate) fn before_first(
-        &self,
-        attachment: crate::endpoint::AttachmentId,
-        tag: &[u8],
-    ) -> u64 {
-        self.0
-            .probe
-            .first_fence(&ControlAttachment(attachment), tag)
-    }
-    pub(crate) fn first_admitted(
-        &self,
-        attachment: crate::endpoint::AttachmentId,
-        tag: &[u8],
-        fence: u64,
-    ) {
+    pub(crate) fn first_admitted(&self, attachment: crate::endpoint::AttachmentId) {
         let mut snapshot = self.0.snapshot.lock().unwrap();
-        assert!(
-            snapshot.facts.first_fence.is_none(),
-            "one first admission per control request"
-        );
+        assert!(snapshot.facts.attachment.is_none(), "one attachment per control command");
         snapshot.facts.attachment = Some(ControlAttachment(attachment));
-        snapshot.facts.delivery_tag = Some(tag.to_vec());
-        snapshot.facts.first_fence = Some(fence);
     }
     pub(crate) fn complete_admitted(&self) {
         let fence = self.0.probe.dispatch_fence();
         let mut snapshot = self.0.snapshot.lock().unwrap();
         assert!(
-            snapshot.facts.first_fence.is_some() && !snapshot.facts.complete,
+            snapshot.facts.attachment.is_some() && snapshot.facts.complete_fence.is_none(),
             "one complete admission per request"
         );
         snapshot.facts.complete_fence = Some(fence);
-        snapshot.facts.complete = true;
     }
     pub(crate) fn answered_state(&self, state: &DeliveryState) {
         if !state.is_terminal() {
@@ -833,9 +786,6 @@ mod tests {
 
     struct Probe(AtomicU64);
     impl ControlProbe for Probe {
-        fn first_fence(&self, _: &ControlAttachment, _: &[u8]) -> u64 {
-            self.0.fetch_add(1, Ordering::AcqRel)
-        }
         fn dispatch_fence(&self) -> u64 {
             self.0.fetch_add(1, Ordering::AcqRel)
         }
@@ -844,7 +794,7 @@ mod tests {
         }
     }
     fn tracking() -> ControlTracker {
-        ControlTracker::new(1, Arc::new(Probe(AtomicU64::new(0))))
+        ControlTracker::new(Arc::new(Probe(AtomicU64::new(0))))
     }
     fn fixture(
         max_frame: usize,
@@ -1001,7 +951,7 @@ mod tests {
         };
         tokio::pin!(work);
         tokio_test::assert_pending!(futures_util::poll!(work.as_mut()));
-        let LinkFrame::Transfer { performative, .. } = sent.recv().await.unwrap() else {
+        let LinkFrame::Transfer { .. } = sent.recv().await.unwrap() else {
             panic!("control Transfer")
         };
         assert!(dispatched.load(Ordering::Acquire));
@@ -1025,7 +975,7 @@ mod tests {
             .unwrap();
         let result = work.await;
         assert!(
-            matches!(result,Err(ControllerSendError::ControlDetached {closed:actual,error:actual_error,receipt:Some(receipt)}) if actual==closed && actual_error==error && receipt.complete() && receipt.delivery_tag()==performative.delivery_tag.as_ref().map(|t|t.as_ref()))
+            matches!(result,Err(ControllerSendError::ControlDetached {closed:actual,error:actual_error,receipt:Some(receipt)}) if actual==closed && actual_error==error && receipt.complete() && receipt.attachment().is_some())
         );
         assert!(controller.inner.try_lock().is_ok());
         if !closed {
@@ -1098,7 +1048,7 @@ mod tests {
                     matches!(result,Err(ControllerSendError::ControlDetached {closed:actual,error:None,..}) if actual==closed)
                 );
                 assert!(!dispatched.load(Ordering::Acquire));
-                assert!(tracker.receipt().first_fence().is_none());
+                assert!(tracker.receipt().attachment().is_none());
                 assert!(tracker.receipt().complete_fence().is_none());
                 assert!(tracker.receipt().answered().is_none());
                 assert!(sent.try_recv().is_err());
@@ -1182,7 +1132,7 @@ mod tests {
                     assert_eq!(sent.len(), 1);
                     assert!(dispatched.load(Ordering::Acquire));
                     let receipt = tracker.receipt();
-                    assert!(receipt.first_fence().is_some());
+                    assert!(receipt.attachment().is_some());
                     assert!(!receipt.complete());
                     assert!(receipt.complete_fence().is_none());
                     let error = with_error.then(|| {
@@ -1205,7 +1155,7 @@ mod tests {
                         .unwrap();
                     let result = work.await;
                     assert!(
-                        matches!(result,Err(ControllerSendError::ControlDetached {closed:actual,error:actual_error,receipt:Some(receipt)}) if actual==closed && actual_error==error && receipt.first_fence().is_some() && !receipt.complete())
+                        matches!(result,Err(ControllerSendError::ControlDetached {closed:actual,error:actual_error,receipt:Some(receipt)}) if actual==closed && actual_error==error && receipt.attachment().is_some() && !receipt.complete())
                     );
                     assert!(controller.inner.try_lock().is_ok());
                     let LinkFrame::Transfer { performative, .. } = sent.try_recv().unwrap() else {

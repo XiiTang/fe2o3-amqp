@@ -167,66 +167,13 @@ pub enum ReceiverTransferEffect {
     Failed,
 }
 
-/// Original framing identity, before continuation normalization.
-pub struct ReceiverTransferHeader {
-    handle: u32,
-    delivery_id: Option<u32>,
-    delivery_tag: Option<DeliveryTag>,
-    message_format: Option<u32>,
-    more: bool,
-    aborted: bool,
-    resume: bool,
-}
-
-impl std::fmt::Debug for ReceiverTransferHeader {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("ReceiverTransferHeader")
-    }
-}
-
-impl ReceiverTransferHeader {
-    /// The original incoming link handle.
-    pub fn handle(&self) -> u32 {
-        self.handle
-    }
-    /// The unnormalized delivery id, including omission.
-    pub fn delivery_id(&self) -> Option<u32> {
-        self.delivery_id
-    }
-    /// The unnormalized delivery tag, including omission.
-    pub fn delivery_tag(&self) -> Option<&DeliveryTag> {
-        self.delivery_tag.as_ref()
-    }
-    /// The unnormalized message format, including omission.
-    pub fn message_format(&self) -> Option<u32> {
-        self.message_format
-    }
-    /// The original more bit.
-    pub fn more(&self) -> bool {
-        self.more
-    }
-    /// The original aborted bit.
-    pub fn aborted(&self) -> bool {
-        self.aborted
-    }
-    /// The original resume bit.
-    pub fn resume(&self) -> bool {
-        self.resume
-    }
-}
-
-/// One native decision tied to the exact original Transfer header.
+/// One native decision for the next admitted Transfer.
 #[derive(Debug)]
 pub struct ReceiverTransferProgress {
-    original: ReceiverTransferHeader,
     effect: ReceiverTransferEffect,
 }
 
 impl ReceiverTransferProgress {
-    /// Original, unnormalized framing identity.
-    pub fn original(&self) -> &ReceiverTransferHeader {
-        &self.original
-    }
     /// The native parser's authoritative decision.
     pub fn effect(&self) -> &ReceiverTransferEffect {
         &self.effect
@@ -235,15 +182,12 @@ impl ReceiverTransferProgress {
 
 /// Synchronous progress sink; callbacks run outside native map and flow locks.
 pub trait ReceiverTransferObserver: Send {
-    /// Runs before this frame changes native parser state.
-    fn begin(&mut self, original: &ReceiverTransferHeader);
     /// Runs once after the native semantic decision, before another frame.
     fn transfer(&mut self, progress: ReceiverTransferProgress);
 }
 
 struct NoopTransferObserver;
 impl ReceiverTransferObserver for NoopTransferObserver {
-    fn begin(&mut self, _: &ReceiverTransferHeader) {}
     fn transfer(&mut self, _: ReceiverTransferProgress) {}
 }
 
@@ -265,7 +209,7 @@ impl From<RecvError> for ReceiveFault {
 }
 
 struct TransferCommit {
-    original: Option<ReceiverTransferHeader>,
+    committed: bool,
 }
 impl TransferCommit {
     fn commit<O: ReceiverTransferObserver + ?Sized>(
@@ -273,8 +217,9 @@ impl TransferCommit {
         effect: ReceiverTransferEffect,
         observer: &mut O,
     ) {
-        let original = self.original.take().expect("each Transfer commits once");
-        observer.transfer(ReceiverTransferProgress { original, effect });
+        assert!(!self.committed, "each Transfer commits once");
+        self.committed = true;
+        observer.transfer(ReceiverTransferProgress { effect });
     }
 }
 
@@ -426,14 +371,34 @@ impl Receiver {
         G: Send,
         E: Send,
     {
+        self.recv_end_prefix(observer, before, false).await
+    }
+
+    async fn recv_end_prefix<T, O, F, G, E>(
+        &mut self,
+        observer: &mut O,
+        before: &mut F,
+        closing: bool,
+    ) -> Result<ReceiverDetachStep<T>, ReceiverDetachError<E>>
+    where
+        for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
+        F: FnMut() -> Result<G, E> + Send,
+        G: Send,
+        E: Send,
+    {
         loop {
             if self.inner.self_close.is_some() {
                 return Ok(ReceiverDetachStep::SelfClosing);
             }
-            if !matches!(
-                self.inner.link.local_state(),
-                super::state::LinkState::DetachSent
-            ) {
+            let state = self.inner.link.local_state();
+            if !(matches!(state, super::state::LinkState::DetachSent)
+                || closing
+                    && matches!(
+                        state,
+                        super::state::LinkState::Attached | super::state::LinkState::CloseSent
+                    ))
+            {
                 return Err(ReceiverDetachError::Receive(
                     LinkStateError::IllegalState.into(),
                 ));
@@ -476,6 +441,23 @@ impl Receiver {
                     let closed = detach.closed;
                     let error = detach.error.clone();
                     if closed {
+                        if closing && matches!(state, super::state::LinkState::CloseSent) {
+                            self.inner.link.on_detach_reply(detach).map_err(|error| {
+                                ReceiverDetachError::Exchange(super::LinkExchangeError::Detach(
+                                    error,
+                                ))
+                            })?;
+                            return Ok(ReceiverDetachStep::Closed { error });
+                        }
+                        if closing && matches!(state, super::state::LinkState::Attached) {
+                            let applied = self.inner.link.apply_remote_detach_outcome(detach);
+                            if matches!(applied, Err(super::ApplyRemoteDetachError::IllegalState)) {
+                                return Err(ReceiverDetachError::Receive(
+                                    LinkStateError::IllegalState.into(),
+                                ));
+                            }
+                            return Ok(ReceiverDetachStep::Closed { error });
+                        }
                         super::shared_inner::reattach_then_close_exact(
                             &mut self.inner,
                             before,
@@ -594,18 +576,40 @@ impl Receiver {
         }
     }
 
-    /// Close in place, arming correlation before every internal reattachment.
-    pub async fn close_in_place_exact<F, G, E>(
+    /// Close while preserving input admitted on the original attachment.
+    ///
+    /// Each Delivery must be accounted before requesting another step. A
+    /// Suspended boundary ends the old receiving attachment before CloseOnly.
+    pub async fn close_in_place_exact<T, O, F, G, E>(
         &mut self,
         peer_suspended: bool,
-        mut before: F,
-    ) -> Result<(), super::LinkExchangeError<ReceiverAttachError, E>>
+        observer: &mut O,
+        before: &mut F,
+    ) -> Result<ReceiverDetachStep<T>, ReceiverDetachError<E>>
     where
+        for<'de> T: FromBody<'de> + Send,
+        O: ReceiverTransferObserver + ?Sized,
         F: FnMut() -> Result<G, E> + Send,
         G: Send,
         E: Send,
     {
-        super::shared_inner::close_exact(&mut self.inner, peer_suspended, &mut before).await
+        use super::state::LinkState;
+        match self.inner.link.local_state() {
+            LinkState::Closed => return Ok(ReceiverDetachStep::Closed { error: None }),
+            LinkState::Detached => {
+                super::shared_inner::close_exact(&mut self.inner, false, before)
+                    .await
+                    .map_err(ReceiverDetachError::Exchange)?;
+                return Ok(ReceiverDetachStep::Closed { error: None });
+            }
+            LinkState::Attached if !peer_suspended => {
+                self.inner.send_detach(true, None).await.map_err(|error| {
+                    ReceiverDetachError::Exchange(super::LinkExchangeError::Detach(error))
+                })?;
+            }
+            _ => {}
+        }
+        self.recv_end_prefix(observer, before, true).await
     }
 
     /// Creates a builder for the [`Receiver`]
@@ -1740,23 +1744,11 @@ where
         for<'de> T: FromBody<'de> + Send,
         O: ReceiverTransferObserver + ?Sized,
     {
-        let original = ReceiverTransferHeader {
-            handle: performative.handle.0,
-            delivery_id: performative.delivery_id,
-            delivery_tag: performative.delivery_tag.clone(),
-            message_format: performative.message_format,
-            more: performative.more,
-            aborted: performative.aborted,
-            resume: performative.resume,
-        };
-        observer.begin(&original);
-        let mut commit = TransferCommit {
-            original: Some(original),
-        };
+        let mut commit = TransferCommit { committed: false };
         let result = self
             .on_incoming_transfer(performative, payload, context, observer, &mut commit)
             .await;
-        if result.is_err() && commit.original.is_some() {
+        if result.is_err() && !commit.committed {
             commit.commit(ReceiverTransferEffect::Failed, observer);
         }
         drop(window_slot);
@@ -2992,7 +2984,7 @@ mod tests {
         let mut progress = Progress::default();
         let delivery = observed_delivery(0, &mut receiver, &mut progress).await;
         assert_eq!(*delivery.delivery_id(), 10);
-        assert_eq!(progress.begins, 2);
+
         assert!(matches!(
             progress.steps[0].effect(),
             ReceiverTransferEffect::StateOnly {
@@ -3180,7 +3172,7 @@ mod tests {
                 assert_eq!(calls.load(Ordering::Acquire), 0);
                 assert!(outgoing.try_recv().is_err());
             }
-            assert_eq!(progress.begins, 4);
+
             assert_eq!(progress.steps.len(), 4);
             assert!(receiver.inner.incomplete_transfer.is_some());
             assert_eq!(receiver.inner.receive_budget.retained_bytes(), 6);
@@ -3198,18 +3190,19 @@ mod tests {
         inner.link.output_handle.take();
         let mut endpoint = Receiver { inner };
         assert!(matches!(
-            endpoint
-                .close_in_place_exact(false, || Err::<(), _>(std::io::Error::other("refused")))
-                .await,
+            close_receiver_exact(&mut endpoint, false, || Err::<(), _>(
+                std::io::Error::other("refused")
+            ))
+            .await,
             Err(LinkExchangeError::Correlation(_))
         ));
         assert!(controls.try_recv().is_err());
         assert!(outgoing.try_recv().is_err());
         let dropped = Arc::new(AtomicBool::new(false));
         let (result, ()) = tokio::join!(
-            endpoint.close_in_place_exact(false, || Ok::<_, std::io::Error>(CorrelationGuard(
-                dropped.clone()
-            ))),
+            close_receiver_exact(&mut endpoint, false, || Ok::<_, std::io::Error>(
+                CorrelationGuard(dropped.clone())
+            )),
             async {
                 let SessionControl::GetIncomingWindow(reply) = controls.recv().await.unwrap()
                 else {
@@ -3254,9 +3247,9 @@ mod tests {
             }
             let error = definitions::Error::new(definitions::AmqpError::NotFound, None, None);
             let (result, _) = tokio::join!(
-                endpoint.close_in_place_exact(false, || Ok::<_, std::io::Error>(CorrelationGuard(
-                    dropped.clone()
-                ))),
+                close_receiver_exact(&mut endpoint, false, || Ok::<_, std::io::Error>(
+                    CorrelationGuard(dropped.clone())
+                )),
                 drive_exact_end(
                     control,
                     outgoing,
@@ -3284,15 +3277,175 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn exact_close_preserves_the_original_receiving_prefix() {
+        use crate::link::test_util::{drive_exact_end, CorrelationGuard};
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+        // Active Close with closing reply, active Close crossed by suspension,
+        // and a suspension observed before Close but still queued natively.
+        for mode in 0..3 {
+            let (mut inner, control, mut outgoing, incoming) =
+                make_receiver_inner_with_channels(4096);
+            inner.credit_mode = CreditMode::Manual;
+            let original_handle: fe2o3_amqp_types::definitions::Handle = inner
+                .link
+                .output_handle
+                .as_ref()
+                .unwrap()
+                .handle
+                .clone()
+                .into();
+            let body = Payload::from_static(&[0, 0x53, 0x75, 0xa0, 2, 7, 8]);
+            for (id, more, payload) in [
+                (1, false, body.clone()),
+                (2, true, body.slice(..6)),
+                (2, false, body.slice(6..)),
+                (3, true, body.slice(..6)),
+            ] {
+                let mut transfer = make_incoming_transfer(
+                    id,
+                    (id != 2 || more).then_some(vec![id as u8]),
+                    more,
+                    false,
+                );
+                if id == 2 && !more {
+                    transfer.message_format = None;
+                }
+                incoming
+                    .send(queued_transfer(transfer, payload))
+                    .await
+                    .unwrap();
+            }
+            // Hold the peer's Detach until both complete deliveries escape the
+            // real Close parser; the closing frame has already been admitted.
+            let mut receiver = Receiver { inner };
+            let mut progress = Progress::default();
+            let calls = AtomicUsize::new(0);
+            let dropped = Arc::new(AtomicBool::new(false));
+            let mut before = || {
+                calls.fetch_add(1, Ordering::AcqRel);
+                Ok::<_, std::io::Error>(CorrelationGuard(dropped.clone()))
+            };
+            for id in [1, 2] {
+                let ReceiverDetachStep::Delivery(delivery) = receiver.close_in_place_exact::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_,_,_,_>(mode == 2, &mut progress, &mut before).await.unwrap() else { panic!("admitted complete delivery"); };
+                assert_eq!(*delivery.delivery_id(), id);
+                assert_eq!(delivery.handle(), &original_handle);
+                assert_eq!(
+                    delivery
+                        .body()
+                        .try_as_data()
+                        .unwrap()
+                        .flat_map(|b| b.iter().copied())
+                        .collect::<Vec<_>>(),
+                    [7, 8]
+                );
+                assert!(if mode == 2 {
+                    matches!(receiver.inner.link.local_state, LinkState::Attached)
+                } else {
+                    matches!(receiver.inner.link.local_state, LinkState::CloseSent)
+                });
+            }
+            if mode != 2 {
+                let LinkFrame::Detach(detach, _) = outgoing.recv().await.unwrap() else {
+                    panic!("actual closing Detach");
+                };
+                assert!(detach.closed);
+                assert_eq!(detach.handle, original_handle);
+            } else {
+                assert!(outgoing.try_recv().is_err());
+            }
+            incoming
+                .send(LinkFrame::Detach(
+                    Detach {
+                        handle: 0u32.into(),
+                        closed: mode == 0,
+                        error: None,
+                    },
+                    crate::endpoint::AttachmentId::allocate(),
+                ))
+                .await
+                .unwrap();
+            let boundary = receiver.close_in_place_exact::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_,_,_,_>(mode == 2, &mut progress, &mut before).await.unwrap();
+            assert_eq!(progress.steps.len(), 4);
+            if mode == 0 {
+                assert!(matches!(
+                    boundary,
+                    ReceiverDetachStep::Closed { error: None }
+                ));
+            } else {
+                assert!(matches!(
+                    boundary,
+                    ReceiverDetachStep::Suspended { error: None }
+                ));
+                let (result, count) = tokio::join!(
+                    receiver.close_in_place_exact::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_,_,_,_>(true, &mut progress, &mut before),
+                    drive_exact_end(control, outgoing, incoming, peer_sender_attach(), || assert!(!dropped.load(Ordering::Acquire)), || None)
+                );
+                assert!(matches!(
+                    result.unwrap(),
+                    ReceiverDetachStep::Closed { error: None }
+                ));
+                assert_eq!(count, 1);
+                assert!(dropped.load(Ordering::Acquire));
+            }
+            assert!(receiver.is_closed());
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_close_attach_is_not_business_recovery() {
+        let (mut inner, control, outgoing, incoming) = make_receiver_inner_with_channels(4096);
+        seed_unsettled(inner.link.unsettled(), &[vec![9]]);
+        inner.link.local_state = LinkState::Detached;
+        inner.link.output_handle.take();
+        let mut receiver = Receiver { inner };
+        let mut attach = peer_sender_attach();
+        attach.incomplete_unsettled = true;
+        let (result, _) = tokio::join!(
+            close_receiver_exact(&mut receiver, true, || Ok::<_, std::io::Error>(())),
+            crate::link::test_util::drive_exact_end(
+                control,
+                outgoing,
+                incoming,
+                attach,
+                || {},
+                || None
+            )
+        );
+        assert!(matches!(
+            result,
+            Err(super::super::LinkExchangeError::Attach(
+                ReceiverAttachError::IllegalState
+            ))
+        ));
+    }
+
+    async fn close_receiver_exact<F, G, E>(
+        receiver: &mut Receiver,
+        suspended: bool,
+        mut before: F,
+    ) -> Result<(), super::super::LinkExchangeError<ReceiverAttachError, E>>
+    where
+        F: FnMut() -> Result<G, E> + Send,
+        G: Send,
+        E: Send,
+    {
+        loop {
+            match receiver.close_in_place_exact::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_,_,_,_>(suspended, &mut NoopTransferObserver, &mut before).await {
+                Ok(ReceiverDetachStep::Closed { .. }) => return Ok(()),
+                Ok(ReceiverDetachStep::Suspended { .. }) => {},
+                Ok(_) => panic!("fixture has no deliveries or protocol fault"),
+                Err(ReceiverDetachError::Exchange(error)) => return Err(error),
+                Err(ReceiverDetachError::Receive(_)) => panic!("fixture has no receive error"),
+            }
+        }
+    }
+
     #[derive(Default)]
     struct Progress {
-        begins: usize,
         steps: Vec<ReceiverTransferProgress>,
     }
     impl ReceiverTransferObserver for Progress {
-        fn begin(&mut self, _: &ReceiverTransferHeader) {
-            self.begins += 1;
-        }
         fn transfer(&mut self, progress: ReceiverTransferProgress) {
             self.steps.push(progress);
         }
@@ -3382,7 +3535,7 @@ mod tests {
                 let delivery = observed_delivery(mode, &mut receiver, &mut progress).await;
                 assert_eq!(*delivery.delivery_id(), 2);
                 assert_eq!(budget.retained_bytes(), 0);
-                assert_eq!(progress.begins, if standalone { 2 } else { 3 });
+
                 let abort_index = usize::from(!standalone);
                 assert!(matches!(
                     progress.steps[abort_index].effect(),
@@ -3393,8 +3546,6 @@ mod tests {
                         progress.steps[0].effect(),
                         ReceiverTransferEffect::PayloadIncomplete
                     ));
-                    assert!(progress.steps[1].original().delivery_id().is_none());
-                    assert!(progress.steps[1].original().delivery_tag().is_none());
                 }
                 assert!(
                     matches!(progress.steps.last().unwrap().effect(),ReceiverTransferEffect::Delivered {info} if info.same_delivery(&DeliveryInfo::from(&delivery)))
@@ -3446,7 +3597,7 @@ mod tests {
             let mut progress = Progress::default();
             let delivery = observed_delivery(mode, &mut receiver, &mut progress).await;
             assert_eq!(*delivery.delivery_id(), 10);
-            assert_eq!(progress.begins, 3);
+
             assert!(matches!(
                 progress.steps[0].effect(),
                 ReceiverTransferEffect::Ignored { more: true }
@@ -3455,8 +3606,7 @@ mod tests {
                 progress.steps[1].effect(),
                 ReceiverTransferEffect::Ignored { more: false }
             ));
-            assert!(progress.steps[1].original().delivery_id().is_none());
-            assert!(progress.steps[1].original().delivery_tag().is_none());
+
             assert!(receiver.inner.incomplete_transfer.is_none());
             assert_eq!(receiver.inner.receive_budget.retained_bytes(), 0);
         }
@@ -3520,7 +3670,7 @@ mod tests {
                 let mut progress = Progress::default();
                 let delivery = observed_delivery(mode, &mut receiver, &mut progress).await;
                 assert_eq!(*delivery.delivery_id(), 10);
-                assert_eq!(progress.begins, 3);
+
                 let ReceiverTransferEffect::StateOnly {
                     info: Some(info),
                     retained: true,
@@ -3546,7 +3696,7 @@ mod tests {
                         .unwrap();
                     assert!(info.same_delivery(native));
                 }
-                assert!(progress.steps[1].original().delivery_id().is_none());
+
                 assert!(receiver.inner.incomplete_transfer.is_none());
             }
         }
@@ -3595,7 +3745,7 @@ mod tests {
             Err(RecvError::LinkStateError(LinkStateError::IllegalState))
         ));
         assert_eq!(receiver.inner.incoming.len(), 4);
-        assert_eq!(progress.begins, 0);
+
         receiver
             .inner
             .link
@@ -3628,7 +3778,7 @@ mod tests {
         ));
         assert!(receiver.inner.incomplete_transfer.is_some());
         assert!(receiver.inner.receive_budget.retained_bytes() > 0);
-        assert_eq!(progress.begins, 4);
+
         assert!(outgoing.try_recv().is_err());
     }
 
@@ -3672,7 +3822,7 @@ mod tests {
                         }
                     ));
                 }
-                assert_eq!(progress.begins, 0);
+
                 assert!(progress.steps.is_empty());
                 assert!(outgoing.try_recv().is_err());
             }
@@ -3805,16 +3955,6 @@ mod tests {
                     assert_eq!(calls.load(Ordering::Acquire), 1);
                     assert!(receiver.self_close_cause().is_none());
                 }
-                assert_eq!(
-                    progress.begins,
-                    if fault == 2 {
-                        0
-                    } else if fault == 3 {
-                        2
-                    } else {
-                        1
-                    }
-                );
                 if fault == 2 {
                     assert!(progress.steps.is_empty());
                 } else {
@@ -3849,92 +3989,6 @@ mod tests {
                 Ok(delivery) => Ok(delivery),
                 Err(ReceiveFault::Error(error)) => Err(error),
                 Err(ReceiveFault::SelfClosing) => Err(self.finish_self_close().await),
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn closing_a_detached_endpoint_reattaches_without_replay() {
-        use crate::link::test_util::{drive_exact_end, CorrelationGuard};
-        use std::sync::atomic::{AtomicBool, AtomicUsize};
-        for initially_detached in [false, true] {
-            for incomplete in [false, true] {
-                for peer_has_map in [false, true] {
-                    let (mut inner, control, outgoing, incoming) =
-                        make_receiver_inner_with_channels(4096);
-                    let c: DeliveryTag = vec![42].into();
-                    let q: DeliveryTag = vec![43].into();
-                    seed_unsettled(inner.link.unsettled(), &[c.to_vec(), q.to_vec()]);
-                    let info = make_delivery_info(42, c.to_vec());
-                    {
-                        let mut map = inner.link.unsettled().write();
-                        let entry = map.as_mut().unwrap().get_mut(&c).unwrap();
-                        entry.received = true;
-                        entry.info = Some(info.clone());
-                    }
-                    let transfer = make_incoming_transfer(43, Some(q.to_vec()), true, false);
-                    inner.receive_transfer::<fe2o3_amqp_types::messaging::Body<serde_amqp::Value>,_>(transfer,
-                        Payload::from_static(&[0,0x53,0x75,0xa0,2,0]),None,ReceiveContext::Live,&mut NoopTransferObserver).await.unwrap();
-                    let store = inner.link.unsettled.clone();
-                    let budget = inner.receive_budget.clone();
-                    let retained = budget.retained_bytes();
-                    assert!(retained > 0);
-                    if initially_detached {
-                        inner.link.local_state = LinkState::Detached;
-                        inner.link.output_handle.take();
-                    }
-                    let mut receiver = Receiver { inner };
-                    let calls = Arc::new(AtomicUsize::new(0));
-                    let dropped = Arc::new(AtomicBool::new(false));
-                    let mut attach = peer_sender_attach();
-                    attach.handle = 17u32.into();
-                    attach.incomplete_unsettled = incomplete;
-                    if peer_has_map {
-                        let mut map = super::super::UnsettledMap::new();
-                        map.insert(c.clone(), Some(Accepted {}.into()));
-                        attach.unsettled = Some(map);
-                    }
-                    let assert_live = || {
-                        assert_eq!(calls.load(Ordering::Acquire), 1);
-                        assert!(!dropped.load(Ordering::Acquire));
-                        let guard = store.read();
-                        let map = guard.as_ref().unwrap();
-                        assert_eq!(map.len(), 2);
-                        assert!(map
-                            .get(&c)
-                            .unwrap()
-                            .info
-                            .as_ref()
-                            .unwrap()
-                            .same_delivery(&info));
-                        assert!(map.contains_key(&q));
-                        assert_eq!(budget.retained_bytes(), retained);
-                    };
-                    let (result, detaches) = tokio::join!(
-                        receiver.close_in_place_exact(false, || {
-                            calls.fetch_add(1, Ordering::AcqRel);
-                            Ok::<_, std::io::Error>(CorrelationGuard(dropped.clone()))
-                        }),
-                        drive_exact_end(control, outgoing, incoming, attach, assert_live, || {
-                            assert_live();
-                            None
-                        })
-                    );
-                    if incomplete {
-                        assert!(matches!(
-                            result,
-                            Err(super::super::LinkExchangeError::Attach(
-                                ReceiverAttachError::IllegalState
-                            ))
-                        ));
-                    } else {
-                        result.unwrap();
-                        assert_eq!(detaches, if initially_detached { 1 } else { 2 });
-                    }
-                    assert!(dropped.load(Ordering::Acquire));
-                    assert_eq!(budget.retained_bytes(), retained);
-                    assert!(receiver.inner.incomplete_transfer.is_some());
-                }
             }
         }
     }

@@ -430,13 +430,13 @@ Rust 1.97.0.
 
 The host must correlate every internal Attach used to finish an AMQP 1.0
 §2.6.6 crossed end, retain that correlation until actual exit, and preserve
-which exchange failed. The ordinary recovery Attach path also clears or
-reconciles local unsettled entries; a close-only reattach must do neither.
+which exchange failed. The ordinary recovery Attach path also reconciles local unsettled entries;
+a close-only reattach must not replay or reconcile business deliveries.
 Both roles keep one outgoing Attach implementation and one validation body,
 selected by private `AttachPurpose::{Ordinary,CloseOnly}`. The borrowed final
 `purpose` argument to `send_attach_inner` leaves ordinary behavior unchanged;
-CloseOnly advertises null unsettled without clearing its nonempty native
-store, validates terminus/role/handle/settle fields, and rejects incomplete
+CloseOnly advertises null unsettled and may clear the local native store,
+validates terminus/role/handle/settle fields, and rejects incomplete
 reconciliation rather than replaying a delivery. This extends the earlier
 partial-transfer and detached-attachment patches above.
 
@@ -469,10 +469,11 @@ contract. Existing suspended same-session dispositions remain unchanged.
 A dispatched tracked Declare/Discharge must also finish if its control link
 is detached without closing. `SharedTransaction::{declare_tracked,
 discharge_tracked}` use the existing bodies with a construction-bound public
-`ControlTracker::new(request,Arc<dyn ControlProbe>)`; ordinary entries pass
-None. Its opaque ControlAttachment/ControlReceipt bind the original request,
-attachment, delivery tag, first admission, complete dispatch fence, optional
-Detach sequence and actual terminal answer. The private immutable receipt
+`ControlTracker::new(Arc<dyn ControlProbe>)`; ordinary entries pass None.
+Its opaque ControlAttachment/ControlReceipt retain the actual attachment,
+final-fragment admission fence, fresh Detach sequence and actual terminal
+answer. Original command identity and causal classification belong to the
+host; there is no duplicate native request ordinal, tag or first-fragment fence. The private immutable receipt
 payload is boxed, with read-only getters. Probe calls run outside its snapshot
 mutex. Native send registers unsettled state before first admission, and
 writes terminal answered state before notifying the original oneshot in both
@@ -493,6 +494,28 @@ flags, genuinely fragmented controls and answer-before-oneshot gates. The
 controller regression invokes its public retained exact close. Native gates
 and queues force the interleavings; no sleeping supplies an assertion.
 
+### Receiver Close preserves the admitted prefix (necessity correction)
+
+`Receiver::close_in_place_exact<T,O,F,G,E>(&mut self,peer_suspended:bool,
+observer:&mut O,before:&mut F)` returns the same
+`Result<ReceiverDetachStep<T>,ReceiverDetachError<E>>` and parser bounds as
+`recv_detaching_exact`. Active Close sends closed=true once, then returns each
+complete Delivery through the original attachment before consuming its first
+native Detach. In receiver CloseSent the existing output_handle remains held;
+`on_complete_transfer` accepts that truthful state and constructs the Delivery
+with that original handle. Sender/controller release behavior is unchanged.
+First-Detach application releases the handle. Observed-but-unconsumed suspension
+first drains this same prefix without another outgoing Detach and returns
+Suspended. Only after that boundary may CloseOnly use the shared discard wait;
+it allocates no new receiving admission. Faults remain errors, not empty success.
+
+Regression `exact_close_preserves_the_original_receiving_prefix` holds the peer
+Detach until complete and fragmented deliveries have escaped the actual Close
+parser, checks their bodies, original handle and the actual outgoing close, then
+finishes closing, crossed suspension and already-observed suspension arms. It
+also admits an incomplete trailing delivery. The sender's nonempty-store fixture
+checks the actual scoped null-map close without preserving store/oneshot identity.
+
 ## Receive admission verdict and per-Transfer semantic progress (Boundless W1-D1)
 
 The old unit observation hook could not refuse forwarding, and Transfers that
@@ -508,13 +531,13 @@ transaction-manager or listener work. Plain, TxnSession, ListenerSession and
 TxnSession<ListenerSession> delegate to that single session implementation.
 The marker is incoming-only and has no wire encoding or payload exposure.
 
-`ReceiverTransferObserver::{begin,transfer}` receives original read-only
-ReceiverTransferHeader and one ReceiverTransferProgress per consumed Transfer.
+`ReceiverTransferObserver::transfer` receives one ReceiverTransferProgress
+per consumed Transfer after the native semantic decision, outside native locks.
 The native parser alone commits PayloadIncomplete, Delivered{info}, Aborted,
 Ignored{more}, StateOnly{info,retained,more}, or Failed. A state-only initial
 fragment snapshots the exact DeliveryInfo under the native map write; later
 fragments carry no new identity. A settlement removing it before that write
-produces None/false. All normal, exact-suspension and stopped receive loops use
+produces None/false. All normal, exact-suspension, Close-prefix and stopped receive loops use
 this same parser and callback contract; the observer never reclassifies raw
 Transfers and no new record or body surface is added. Four private no-await
 parser helpers are synchronous, preserving their no-yield ordering.
@@ -570,3 +593,9 @@ suites passed 25. This is targeted regression evidence, not a complete crate or
 platform acceptance run. The work branch is based on pinned 44afcb79; the landing
 owner reconciles its other fork line and fast-forwards boundless. No push or
 boundless-branch movement is part of this patch.
+
+### Necessity revision validation
+
+The earlier W1-D1 commands above describe historical dfc0c449 behavior. The
+trimmed revision removes completed-future/store-identity contracts and duplicate
+receipt facts; fresh regression commands and results are recorded below when run.

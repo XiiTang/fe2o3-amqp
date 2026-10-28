@@ -117,6 +117,7 @@ where
     {
         match self.local_state {
             LinkState::Attached | LinkState::IncompleteAttachExchanged | LinkState::DetachSent => {}
+            LinkState::CloseSent if self.output_handle.is_some() => {}
             _ => return Err(ReceiverTransferError::IllegalState),
         }
 

@@ -1397,7 +1397,7 @@ mod detach_admission_tests {
             link.send_detach(&writer, closed, None).await.unwrap();
             if closed {
                 assert!(matches!(link.local_state, LinkState::CloseSent));
-                assert!(link.output_handle.is_none());
+                assert_eq!(link.output_handle.as_ref().unwrap().handle.0, 7);
             } else {
                 assert!(matches!(link.local_state, LinkState::DetachSent));
                 assert_eq!(link.output_handle.as_ref().unwrap().handle.0, 7);
@@ -1420,7 +1420,7 @@ mod detach_admission_tests {
                 receiver.try_recv(),
                 Err(mpsc::error::TryRecvError::Empty)
             ));
-            assert_eq!(link.output_handle.is_none(), closed);
+            assert_eq!(link.output_handle.as_ref().unwrap().handle.0, 7);
         }
     }
 }

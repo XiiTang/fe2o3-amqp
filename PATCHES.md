@@ -672,3 +672,26 @@ That unrelated assertion is unchanged by this patch; its correction was referred
 to the consumer owner. The deterministic real-Artemis reproduction and final
 consumer checks are retained by the consuming change. No temporary diagnostic,
 local lock or dependency override is part of this commit.
+
+
+## Receiver Close admission assertion (2026-10-28)
+
+Update the pre-existing accepted_detach_commits_one_frame_and_one_state_transition
+assertions to retain the receiver's original output handle 7 after its closing
+Detach is admitted and after a rejected duplicate Detach. W1-D1's landed receive-preserving Close requires that binding
+until the first native Detach, as send_detach already implements. State, exact
+frame, dispatch and nonclosing assertions stay unchanged; no runtime change.
+The consumer owner explicitly approved this test correction. On macOS arm64,
+Darwin 27.2.0, Rust 1.97.0, the final source tree passes the complete library
+(167 tests), the six regression binaries (34 tests), strict Clippy and fmt,
+each with exit 0. Commands, run through build-slot on 2026-10-28, using the same
+uncommitted local lock described above (the fork has no tracked Cargo.lock):
+
+```sh
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib --test clean_teardown --test link_stop_reason --test detached_link_frames --test engine_first_failure --test large_message_split --test relay_remote_detach
+cargo clippy -p fe2o3-amqp --features transaction,acceptor --lib --tests -- -D warnings
+cargo fmt --all --check
+```
+
+These results apply to this assertion-correction commit on top of 66bed4b8;
+only this validation note changed after the checks. No runtime change.

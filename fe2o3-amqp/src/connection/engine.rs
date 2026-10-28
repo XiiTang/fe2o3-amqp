@@ -279,7 +279,10 @@ where
         frame: SessionFrame,
     ) -> Result<(), ConnectionInnerError> {
         match &self.connection.local_state() {
-            ConnectionState::Opened => {}
+            // A peer's session frames can cross our Close (AMQP 1.0
+            // section 2.4.6). Keep receiving until its Close; on_control has
+            // already closed and drained the outgoing queue before our Close.
+            ConnectionState::Opened | ConnectionState::CloseSent => {}
             _ => return Err(ConnectionInnerError::IllegalState),
         };
 
@@ -715,8 +718,9 @@ where
 }
 
 #[cfg(test)]
-mod refused_transfer_tests {
+mod incoming_tests {
     use super::*;
+    use crate::endpoint::Connection as _;
     use crate::{frames::amqp::RefusedTransfer, Connection};
     use fe2o3_amqp_types::performatives::Open;
     use tokio::sync::mpsc;
@@ -725,9 +729,8 @@ mod refused_transfer_tests {
         Frame::new(3u16, FrameBody::TransferRefused(RefusedTransfer::new()))
     }
 
-    #[tokio::test]
-    async fn a_refused_transfer_on_a_retired_session_is_consumed_quietly() {
-        let open = Open {
+    fn test_open() -> Open {
+        Open {
             container_id: "refusal".into(),
             hostname: None,
             max_frame_size: Default::default(),
@@ -738,8 +741,12 @@ mod refused_transfer_tests {
             offered_capabilities: None,
             desired_capabilities: None,
             properties: None,
-        };
-        let mut connection = Connection::new(ConnectionState::Opened, open);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_transfer_on_a_retired_session_is_consumed_quietly() {
+        let mut connection = Connection::new(ConnectionState::Opened, test_open());
         let (to_session, mut session) = mpsc::channel(1);
         connection
             .session_by_incoming_channel
@@ -801,6 +808,152 @@ mod refused_transfer_tests {
                         Running::Continue
                     )
             ));
+        }
+    }
+
+    /// The real Close control closes outbound admission before writing Close.
+    /// Its receipt by the peer gates already-in-flight session input: it must
+    /// still reach the original relay, without any frame following our Close.
+    #[tokio::test]
+    async fn a_local_close_keeps_crossing_session_frames_without_later_output() {
+        use fe2o3_amqp_types::{
+            definitions::Role,
+            performatives::{Attach, Begin, End, Flow},
+        };
+
+        for peer_error in [
+            None,
+            Some(definitions::Error::new(
+                AmqpError::InternalError,
+                None,
+                None,
+            )),
+        ] {
+            let mut connection = Connection::new(ConnectionState::Opened, test_open());
+            let (to_session, mut session) = mpsc::channel(8);
+            let outgoing_channel = connection.allocate_session(to_session).unwrap();
+            let (io, peer_io) = tokio::io::duplex(4096);
+            let mut peer = Transport::<_, Frame>::bind(peer_io, 4096, None);
+            let (_control, controls) = mpsc::channel(1);
+            let (out, outgoing) = mpsc::channel(1);
+            let mut engine = ConnectionEngine {
+                transport: Transport::bind(io, 4096, None),
+                connection,
+                control: controls,
+                outgoing_session_frames: outgoing,
+                heartbeat: HeartBeat::never(),
+                write_pending: false,
+            };
+            assert!(matches!(
+                engine
+                    .on_control(ConnectionControl::Close(None))
+                    .await
+                    .unwrap(),
+                Running::Continue
+            ));
+            assert!(matches!(
+                engine.connection.local_state(),
+                ConnectionState::CloseSent
+            ));
+            assert!(matches!(
+                peer.next().await.unwrap().unwrap().body,
+                FrameBody::Close(Close { error: None })
+            ));
+            assert!(out.is_closed());
+
+            let frames = [
+                FrameBody::Begin(Begin {
+                    remote_channel: Some(outgoing_channel.0),
+                    next_outgoing_id: 0,
+                    incoming_window: 8,
+                    outgoing_window: 8,
+                    handle_max: Default::default(),
+                    offered_capabilities: None,
+                    desired_capabilities: None,
+                    properties: None,
+                }),
+                FrameBody::Attach(Attach {
+                    name: "crossing-attach".into(),
+                    handle: 0.into(),
+                    role: Role::Receiver,
+                    snd_settle_mode: Default::default(),
+                    rcv_settle_mode: Default::default(),
+                    source: None,
+                    target: None,
+                    unsettled: None,
+                    incomplete_unsettled: false,
+                    initial_delivery_count: None,
+                    max_message_size: None,
+                    offered_capabilities: None,
+                    desired_capabilities: None,
+                    properties: None,
+                }),
+                FrameBody::Flow(Flow {
+                    next_incoming_id: Some(0),
+                    incoming_window: 8,
+                    next_outgoing_id: 0,
+                    outgoing_window: 8,
+                    handle: None,
+                    delivery_count: None,
+                    link_credit: None,
+                    available: None,
+                    drain: false,
+                    echo: false,
+                    properties: None,
+                }),
+                FrameBody::End(End { error: None }),
+            ];
+            for (index, frame) in frames.into_iter().enumerate() {
+                peer.send(Frame::new(3u16, frame)).await.unwrap();
+                let frame = engine.transport.next().await.unwrap().unwrap();
+                assert!(matches!(
+                    engine.on_incoming(frame).await.unwrap(),
+                    Running::Continue
+                ));
+                let received = session.recv().await.unwrap();
+                assert_eq!(received.channel, 3);
+                assert!(matches!(
+                    (index, received.body),
+                    (0, SessionFrameBody::Begin(_))
+                        | (1, SessionFrameBody::Attach(_))
+                        | (2, SessionFrameBody::Flow(_))
+                        | (3, SessionFrameBody::End(_))
+                ));
+                assert!(matches!(
+                    engine.connection.local_state(),
+                    ConnectionState::CloseSent
+                ));
+            }
+            // Closed outbound admission also refuses new session output.
+            assert!(out
+                .send(SessionFrame::new(
+                    0u16,
+                    SessionFrameBody::End(End { error: None })
+                ))
+                .await
+                .is_err());
+            {
+                let next = peer.next();
+                tokio::pin!(next);
+                tokio_test::assert_pending!(futures_util::poll!(next.as_mut()));
+            }
+
+            peer.send(Frame::new(
+                0u16,
+                FrameBody::Close(Close {
+                    error: peer_error.clone(),
+                }),
+            ))
+            .await
+            .unwrap();
+            let frame = engine.transport.next().await.unwrap().unwrap();
+            let result = engine.on_incoming(frame).await;
+            match peer_error {
+                None => assert!(matches!(result.unwrap(), Running::Stop)),
+                Some(expected) => assert!(
+                    matches!(result, Err(ConnectionInnerError::RemoteClosedWithError(actual)) if actual == expected)
+                ),
+            }
         }
     }
 }

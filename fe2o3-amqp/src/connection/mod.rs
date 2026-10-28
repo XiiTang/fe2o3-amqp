@@ -719,7 +719,7 @@ impl endpoint::Connection for Connection {
         end: End,
     ) -> Result<(), Self::Error> {
         match &self.local_state {
-            ConnectionState::Opened => {}
+            ConnectionState::Opened | ConnectionState::CloseSent => {}
             _ => return Err(ConnectionInnerError::IllegalState),
         }
 
@@ -866,7 +866,7 @@ impl Connection {
         begin: &Begin,
     ) -> Result<Option<&SessionRelay>, ConnectionInnerError> {
         match &self.local_state {
-            ConnectionState::Opened => {}
+            ConnectionState::Opened | ConnectionState::CloseSent => {}
             // TODO: what about pipelined
             _ => return Err(ConnectionInnerError::IllegalState),
         }

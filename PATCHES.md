@@ -622,3 +622,53 @@ was committed. Every following Cargo command ran through `build-slot`, without
 Exploratory checks exposed a test-edit delimiter, stale receipt getter and fixture
 type comparisons; these were corrected before the successful regressions above.
 The native source and callback contract are unchanged after those runs.
+
+
+## Incoming session frames crossing normal connection Close (2026-10-28)
+
+AMQP 1.0 Part 2 section 2.4.6 permits incoming frames in CLOSE_SENT until the
+peer's Close. The independent Artemis reconnect case reproduced an answering
+Attach on channel 0 followed by Flow after local Close; forward_to_session's
+Opened-only check returned IllegalState. Temporary state/frame-kind/site
+instrumentation identified this check and excluded the other connection
+IllegalState producers; no diagnostic code is retained.
+
+Allow CloseSent at the existing incoming session forwarding, Begin-response
+binding and End entries. Keep the original session relay and all channel/error
+validation. The existing Close control closes and drains outbound admission
+before sending Close, so no session output can be emitted afterward. Error-close
+Discarding and the peer's actual error-bearing Close retain their behavior.
+No public API, new state, queue, retry or lifecycle owner is added.
+
+The deterministic native regression is
+connection::engine::incoming_tests::a_local_close_keeps_crossing_session_frames_without_later_output:
+receipt of the real Close gates Begin/Attach/Flow/End input; the same relay gets
+each frame, outgoing admission is closed, no later frame is written, and normal
+versus error-bearing peer Close keep their results. Existing clean_teardown and
+engine_first_failure cover clean shutdown and real protocol/transport failures.
+
+Validation on macOS arm64 / Rust 1.97.0 uses the consumer's tokio-util 0.7.19 in a local,
+uncommitted fork lock (fresh resolution selects 0.7.20, whose new Encoder<&[u8]>
+implementation makes pre-existing transport calls ambiguous). The fork still
+carries no committed Cargo.lock.
+
+Commands (through build-slot):
+
+```sh
+cargo update -p tokio-util --precise 0.7.19 --offline
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib --test engine_first_failure --test clean_teardown
+cargo clippy -p fe2o3-amqp --features transaction,acceptor --lib --tests -- -D warnings
+cargo fmt --all --check
+```
+
+Results at this source tree (before commit): the two incoming-engine unit tests
+pass (exit 0), clean_teardown's four tests and engine_first_failure's five tests
+pass (exit 0); strict Clippy and fmt pass (exit 0). The broader library run is
+166 passed / 1 failed (exit 101): the existing receiver test
+accepted_detach_commits_one_frame_and_one_state_transition still asserts that
+Close removes its output handle (link/mod.rs:1400), contradicting the previously
+landed receiver Close-prefix preservation at the same file's send_detach entry.
+That unrelated assertion is unchanged by this patch; its correction was referred
+to the consumer owner. The deterministic real-Artemis reproduction and final
+consumer checks are retained by the consuming change. No temporary diagnostic,
+local lock or dependency override is part of this commit.

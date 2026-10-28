@@ -21,7 +21,8 @@ The previous branch remains historical evidence, not a second maintenance line.
 - Native settlement observation, separate local/remote delivery state, and
   retained receiver progress across explicitly requested recovery.
 - Joined connection/session shutdown and ownership-returning interrupted
-  recovery, without inferred detach, disposition, reconnect, or retry.
+  recovery; after an admitted Attach, upstream's nonclosing Detach cleanup
+  completes before custody returns. No inferred disposition, reconnect or retry.
 - Explicit transaction lifetime without automatic rollback on drop.
 - Original-frame observation without a second Runtime wire parser.
 
@@ -695,3 +696,39 @@ cargo fmt --all --check
 
 These results apply to this assertion-correction commit on top of 66bed4b8;
 only this validation note changed after the checks. No runtime change.
+
+
+## Interrupted resume uses upstream suspension cleanup (2026-10-28)
+
+The Boundless interruption/timeout adaptation returned the endpoint immediately,
+while an admitted Attach still had an unanswered peer response. On the real
+Artemis reconnect case, the consumer restored its old router binding, then
+rejected that late Attach as a duplicate and aborted an unrelated normal Close.
+The capture shows local Attach/Close, remote Attach/Flow, consumer refusal, then
+remote normal Close and a successful proxy copy; it is not a broker EOF first.
+
+Restore the standard cleanup from upstream 0.18.1 (8fd06bc3,
+Sender::resume_with_timeout_inner): the ownership-returning explicit interruption
+entries and native timeout entries call existing detach_with_error(None) before
+returning the detached endpoint. Its existing LinkState match sends nothing for
+Detached (before Attach admission), and sends/completes a nonclosing Detach for
+an admitted half-open Attach, consuming the late Attach and Detach answer. Keep
+upstream's actual cleanup error on failure. The consumer's existing owned resume
+retains its recovering scope until this completion; the caller's wait is separate.
+No new signal, state, cell, replay or fallback owner. Apply the same original
+sender/receiver timeout class, preserving native unsettled/partial custody.
+
+The deterministic detached_link_frames regression covers interruption before
+and after real Attach admission for both roles, late Attach followed by Detach,
+and an actual subsequent resume; the existing partial-receiver pre-dispatch
+regression retains its original no-frame and partial-body assertions. The
+consumer keeps its original successful logical Close and joined-pumps assertion.
+Candidate validation on macOS arm64, Darwin 27.2.0, Rust 1.97.0:
+`cargo test -p fe2o3-amqp --features transaction,acceptor --lib --test clean_teardown --test link_stop_reason --test detached_link_frames --test engine_first_failure --test large_message_split --test relay_remote_detach`
+through build-slot exits 101: all 167 library tests pass, but the new after-attach
+sender arm returns DetachError(IllegalState). The existing shared cleanup accepts
+AttachSent while Link::send_detach permits only Attached; upstream 8fd06bc3 has
+the same mismatch. Sending first also requires preserving the pending name/relay
+that session detach currently deallocates. This candidate is blocked on that
+separately proposed native correction, not validated for landing. No wider state
+admission or binding-lifetime change is made here.

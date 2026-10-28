@@ -2610,7 +2610,8 @@ impl From<ResumingReceiver> for Receiver {
 
 impl DetachedReceiver {
     /// Resume with an explicit interruption future while retaining ownership.
-    /// No Detach, settlement, or additional exchange is inferred on interruption.
+    /// An interrupted admitted Attach completes upstream's nonclosing Detach
+    /// cleanup before custody returns; an already Detached link sends nothing.
     pub async fn resume_on_session_until<R>(
         mut self,
         session: &SessionHandle<R>,
@@ -2634,6 +2635,9 @@ impl DetachedReceiver {
             _ = interrupt => Err(ReceiverResumeErrorKind::Interrupted),
             result = self.inner.resume_incoming_attach(None, false) => result,
         };
+        if matches!(&result, Err(ReceiverResumeErrorKind::Interrupted)) {
+            try_as_recver!(self, self.inner.detach_with_error(None).await);
+        }
         match result {
             Ok(exchange) => {
                 let receiver = Receiver { inner: *self.inner };
@@ -2726,8 +2730,7 @@ impl DetachedReceiver {
                     kind,
                 }),
                 Err(_) => {
-                    // Keep ownership and the actual in-progress state. A timeout
-                    // does not authorize a new protocol exchange.
+                    try_as_recver!(self, self.inner.detach_with_error(None).await);
                     Err(ReceiverResumeError {
                         detached_recver: self,
                         kind: ReceiverResumeErrorKind::Timeout,

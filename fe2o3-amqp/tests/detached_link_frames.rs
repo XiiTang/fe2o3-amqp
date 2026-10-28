@@ -736,3 +736,120 @@ async fn a_sender_s_disposition_for_a_detached_link_leaves_the_handle_s_next_rec
         .expect("the exchange stalled");
     stop_and_join(connection, session).await;
 }
+
+/// A cancelled caller does not retract its Attach. The owned resume must consume
+/// the late answer and finish suspension before its endpoint can be resumed again.
+#[tokio::test]
+async fn interrupted_resume_consumes_the_late_attach_and_returns_resumable_custody() {
+    use fe2o3_amqp::link::{ReceiverResumeErrorKind, SenderResumeErrorKind};
+
+    for receiving in [false, true] {
+        let (client_io, peer_io) = tokio::io::duplex(64 * 1024);
+        let (interrupt, interrupted) = oneshot::channel();
+        let client = async move {
+            let mut connection = Connection::builder()
+                .container_id("client")
+                .open_with_stream(client_io)
+                .await
+                .unwrap();
+            let mut session = Session::begin(&mut connection).await.unwrap();
+            if receiving {
+                let receiver = Receiver::attach(&mut session, "resume", "q").await.unwrap();
+                let detached = receiver.detach().await.unwrap();
+                let before = detached
+                    .resume_on_session_until(&session, std::future::ready(()))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(before.kind, ReceiverResumeErrorKind::Interrupted));
+                let after = before
+                    .detached_recver
+                    .resume_on_session_until(&session, async { interrupted.await.unwrap() })
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(after.kind, ReceiverResumeErrorKind::Interrupted),
+                    "actual receiver cleanup: {:?}",
+                    after.kind
+                );
+                let resumed = after.detached_recver.resume().await.unwrap();
+                stop_and_join(connection, session).await;
+                drop(resumed);
+            } else {
+                let sender = Sender::attach(&mut session, "resume", "q").await.unwrap();
+                let detached = sender.detach().await.unwrap();
+                let before = detached
+                    .resume_on_session_until(&session, std::future::ready(()))
+                    .await
+                    .unwrap_err();
+                assert!(matches!(before.kind, SenderResumeErrorKind::Interrupted));
+                let after = before
+                    .detached_sender
+                    .resume_on_session_until(&session, async { interrupted.await.unwrap() })
+                    .await
+                    .unwrap_err();
+                assert!(
+                    matches!(after.kind, SenderResumeErrorKind::Interrupted),
+                    "actual sender cleanup: {:?}",
+                    after.kind
+                );
+                let resumed = after.detached_sender.resume().await.unwrap();
+                stop_and_join(connection, session).await;
+                drop(resumed);
+            }
+        };
+        let peer = async move {
+            let mut peer = Peer::open(peer_io, None, 10).await;
+            if receiving {
+                peer.answer_receiver_attach(None).await;
+            } else {
+                peer.answer_attach(None).await;
+            }
+            assert!(peer.answer_detach().await.is_empty());
+            // A pre-dispatch interruption sends nothing: the next frame is
+            // the subsequent attempt's Attach, never an unsolicited Detach.
+            let FrameBody::Attach(attach) = peer.read().await else {
+                panic!("expected only the next admitted resume Attach")
+            };
+            interrupt.send(()).unwrap();
+            // Hold its answering Attach until cleanup has actually admitted
+            // the nonclosing Detach; no sleep or timing assumption is needed.
+            let detach = peer
+                .read_until(
+                    |frame| match frame {
+                        FrameBody::Detach(detach) => Some(detach.clone()),
+                        _ => None,
+                    },
+                    |frame| matches!(frame, FrameBody::Transfer { .. }),
+                )
+                .await;
+            assert_eq!(detach.handle, attach.handle);
+            assert!(!detach.closed);
+            assert!(detach.error.is_none());
+            peer.write(
+                0,
+                &Attach {
+                    role: if receiving {
+                        Role::Sender
+                    } else {
+                        Role::Receiver
+                    },
+                    initial_delivery_count: receiving.then_some(0),
+                    ..attach
+                },
+            )
+            .await;
+            peer.write(0, &detach).await;
+            if receiving {
+                peer.answer_receiver_attach(None).await;
+            } else {
+                peer.answer_attach(None).await;
+            }
+            peer
+        };
+        let (_, _peer) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(client, peer)
+        })
+        .await
+        .expect("the interrupted-resume cleanup stalled");
+    }
+}

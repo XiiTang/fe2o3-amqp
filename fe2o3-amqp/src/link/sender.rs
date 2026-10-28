@@ -1195,8 +1195,9 @@ macro_rules! try_as_sender {
 }
 
 impl DetachedSender {
-    /// Resume with an explicit interruption future. Both success and failure
-    /// return the native endpoint; interruption performs no protocol cleanup.
+    /// Resume with an explicit interruption future, returning the native endpoint.
+    /// An interrupted admitted Attach completes upstream's nonclosing Detach
+    /// cleanup before custody returns; an already Detached link sends nothing.
     pub async fn resume_on_session_until<R>(
         mut self,
         session: &SessionHandle<R>,
@@ -1220,6 +1221,9 @@ impl DetachedSender {
             _ = interrupt => Err(SenderResumeErrorKind::Interrupted),
             result = self.inner.resume_incoming_attach(None, false) => result,
         };
+        if matches!(&result, Err(SenderResumeErrorKind::Interrupted)) {
+            try_as_sender!(self, self.inner.detach_with_error(None).await);
+        }
         match result {
             Ok(()) => Ok(Sender { inner: *self.inner }),
             Err(kind) => Err(SenderResumeError {
@@ -1299,8 +1303,7 @@ impl DetachedSender {
                     kind,
                 }),
                 Err(_) => {
-                    // Keep ownership and the actual in-progress state. A timeout
-                    // does not authorize a new protocol exchange.
+                    try_as_sender!(self, self.inner.detach_with_error(None).await);
                     Err(SenderResumeError {
                         detached_sender: self,
                         kind: SenderResumeErrorKind::Timeout,

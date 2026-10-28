@@ -597,5 +597,28 @@ boundless-branch movement is part of this patch.
 ### Necessity revision validation
 
 The earlier W1-D1 commands above describe historical dfc0c449 behavior. The
-trimmed revision removes completed-future/store-identity contracts and duplicate
-receipt facts; fresh regression commands and results are recorded below when run.
+trimmed source is `b64f555c60adf3fb8b5e6e23da762caff6254ed8`, tested on
+macOS 27.2 arm64 with Rust 1.97.0 (the identical source tree before commit).
+It removes store-identity contracts and duplicate receipt facts; no fork lockfile
+was committed. Every following Cargo command ran through `build-slot`, without
+`--locked`. Unit test commands share
+`cargo test -p fe2o3-amqp --features transaction,acceptor --lib`.
+
+| Command/filter | Exit | Result |
+|---|---:|---|
+| `link::receiver::tests::` | 0 | 50 passed, including the actual Close-prefix fixture in three end schedules. |
+| `incomplete_close_attach_is_not_business_recovery` | 0 | 1 later-added full-validation control passed. |
+| `link::sender::tests::` | 0 | 19 passed, with nonempty local unsettled state and null-map close. |
+| `transaction::controller::tests::` | 0 | 5 passed, including both command types/closed flags, final admission and outcome-first completion. |
+| `a_begin_channel_is_associated_before_any_begin_can_escape` | 0 | 1 passed. |
+| `a_refused_transfer_never_leaves_as_a_normal_frame` | 0 | 1 passed. |
+| `refused_transfer_keeps_only_physical_session_progress` | 0 | 1 passed. |
+| `a_refused_transfer_on_a_retired_session_is_consumed_quietly` | 0 | 1 passed. |
+| `cargo test -p fe2o3-amqp --features transaction,acceptor --test clean_teardown --test link_stop_reason --test detached_link_frames --test engine_first_failure` | 0 | 25 passed. |
+| `cargo check -p fe2o3-amqp --no-default-features` | 0 | Passed. |
+| `cargo clippy -p fe2o3-amqp --features transaction,acceptor --lib --tests -- -D warnings` | 0 | Passed. |
+| `cargo fmt --all --check` | 0 | Passed. |
+
+Exploratory checks exposed a test-edit delimiter, stale receipt getter and fixture
+type comparisons; these were corrected before the successful regressions above.
+The native source and callback contract are unchanged after those runs.

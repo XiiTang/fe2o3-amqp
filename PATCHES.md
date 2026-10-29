@@ -1146,9 +1146,35 @@ resume, pre-dispatch and actual peer cleanup-error arms remain. Both old endpoin
 Detach-cap early-return tests and obsolete relay early-drop assertions are gone;
 no ordering-only replacements were added.
 
-Current validation on macOS Darwin 27.2.0 arm64, Rust 1.97.0, through build-slot.
+Validated source tip: 2dd8f15a. On macOS Darwin 27.2.0 arm64 / Rust 1.97.0,
+all following commands ran through build-slot and exited 0:
+
+| cargo arguments | Result |
+| --- | --- |
+| test -p fe2o3-amqp --features transaction,acceptor --lib cap | 22 passed |
+| test -p fe2o3-amqp --features transaction,acceptor --lib unsettled_store | 5 passed |
+| test -p fe2o3-amqp --features transaction,acceptor --lib completion | 5 passed |
+| test -p fe2o3-amqp --features transaction,acceptor --lib link::sender::tests:: | 29 passed |
+| test -p fe2o3-amqp --features transaction,acceptor --lib link::receiver::tests:: | 58 passed |
+| test -p fe2o3-amqp --features transaction,acceptor --test detached_link_frames | 7 passed |
+| test -p fe2o3-amqp --features transaction,acceptor --test unsettled_limits | 1 passed |
+| clippy -p fe2o3-amqp --features transaction,acceptor --lib --tests -- -D warnings | passed |
+| fmt --all --check | passed |
+
+The A6 regression fails (exit 101, "Store exhaustion cancelled admitted cleanup")
+when the old `recv_remote_detach` Store race is restored temporarily; restoring
+the reviewed implementation passes. The initial expanded fixture also exposed
+its ordinary cleanup helper's expected RemoteEnded assertion on the deliberately
+ended-Session arm (exit 101); the arm now asserts the actual RemoteEnded result.
+The cap-filter rerun initially caught the two historical relay early-drop
+assertions (exit 101); their superseded assertions were removed, with the real
+Transfer refusal still tested. The first Clippy check used the fork's default
+Rust 1.98.1 and reported pre-existing inline-frame result-size diagnostics;
+consumer-pinned 1.97.0 strict Clippy passes, without new result-size exceptions.
+
 Local untracked Cargo.lock selects tokio-util 0.7.19, matching the consumer lock;
-no transport/manifest workaround is added. The consuming implementation ledger
-records complete commands and exits. Review-ready tip and final focused results
-will be recorded after the remaining checks; the branch has not been pushed or
-fast-forwarded to boundless.
+no transport/manifest workaround is added. Earlier exploratory compiles found
+port fixture mismatches and latest tokio-util codec ambiguity; the pinned focused
+results above supersede those failures. The consuming implementation ledger
+retains the exact command/exit logs. This documentation-only evidence commit
+follows the tested source tip; no push or boundless-branch movement occurred.

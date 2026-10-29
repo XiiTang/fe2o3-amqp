@@ -1386,6 +1386,7 @@ mod refused_transfer_tests {
             outgoing,
             outgoing_link_frames,
             session: wrap(native),
+            retired_allocations: Default::default(),
         };
         engine
             .on_incoming(SessionFrame::new(0u16, SessionFrameBody::TransferRefused))

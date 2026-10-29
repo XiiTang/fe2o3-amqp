@@ -643,6 +643,7 @@ fn control_link_error(
 
 #[cfg(test)]
 mod tests {
+    use tokio::sync::oneshot;
     #[test]
     fn tracked_terminal_state_precedes_oneshot_and_survives_control_end() {
         use crate::{

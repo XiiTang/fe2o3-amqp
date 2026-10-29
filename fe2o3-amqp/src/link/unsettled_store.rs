@@ -79,6 +79,17 @@ pub(crate) struct Store<T> {
     fail: fn(T, LinkStateError),
     #[cfg(test)]
     before_receiver_write: BeforeReceiverWrite,
+    #[cfg(any(test, feature = "test-util"))]
+    test_hooks: [TestHook; 3],
+}
+#[cfg(any(test, feature = "test-util"))]
+#[derive(Default)]
+struct TestHook(parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>);
+#[cfg(any(test, feature = "test-util"))]
+impl std::fmt::Debug for TestHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TestHook")
+    }
 }
 #[cfg(test)]
 #[derive(Default)]
@@ -107,6 +118,8 @@ impl<T> Store<T> {
             revision: watch::channel(0).0,
             #[cfg(test)]
             before_receiver_write: BeforeReceiverWrite::default(),
+            #[cfg(any(test, feature = "test-util"))]
+            test_hooks: Default::default(),
             size: T::bytes,
             fail: T::fail,
         };
@@ -128,6 +141,21 @@ impl<T> Store<T> {
             write.entries().bytes = bytes;
         }
         Ok(store)
+    }
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn set_test_hook(&self, point: usize, callback: impl FnOnce() + Send + 'static) {
+        assert!(self.test_hooks[point]
+            .0
+            .lock()
+            .replace(Box::new(callback))
+            .is_none());
+    }
+    #[cfg(any(test, feature = "test-util"))]
+    pub(crate) fn test_hook(&self, point: usize) {
+        let callback = self.test_hooks[point].0.lock().take();
+        if let Some(callback) = callback {
+            callback();
+        }
     }
     pub fn read(&self) -> MappedRwLockReadGuard<'_, Option<UnsettledMap<T>>> {
         RwLockReadGuard::map(self.entries.read(), |entries| &entries.map)

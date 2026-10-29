@@ -1380,6 +1380,18 @@ pub struct ReceiverSettlementView {
     changed: tokio::sync::watch::Receiver<u64>,
 }
 impl ReceiverSettlementView {
+    /// Pause the next recovery classification (false) or retention query (true).
+    /// Runs outside the Store lock; enabled only for deterministic regressions.
+    #[cfg(feature = "test-util")]
+    pub fn before_recovery_query_for_tests(
+        &self,
+        retained: bool,
+        callback: impl FnOnce() + Send + 'static,
+    ) {
+        self.unsettled
+            .set_test_hook(usize::from(retained), callback);
+    }
+
     /// Return the retained terminal cause. After finding a missing binding,
     /// check this before interpreting its disappearance as peer settlement.
     pub fn check(&self) -> Result<(), LinkStateError> {
@@ -2135,6 +2147,8 @@ where
                     .map(|()| None);
             }
             let tag = transfer.delivery_tag.as_ref().unwrap();
+            #[cfg(any(test, feature = "test-util"))]
+            self.link.unsettled().test_hook(0);
             let known = self
                 .link
                 .unsettled()
@@ -2175,6 +2189,9 @@ where
                 .start(&transfer, kind.expect("resume classification"));
         }
         if kind == Some(Kind::Ignore) {
+            // Missing after a cap purge is local failure, not peer completion.
+            // The latch cannot clear between the query and this publication.
+            self.link.unsettled().check().map_err(RecvError::from)?;
             commit.commit(
                 ReceiverTransferEffect::Ignored {
                     more: transfer.more,
@@ -2219,6 +2236,8 @@ where
                     commit,
                 )?;
             }
+            #[cfg(any(test, feature = "test-util"))]
+            self.link.unsettled().test_hook(1);
             let retained = transfer.delivery_tag.as_ref().is_some_and(|tag| {
                 self.link
                     .unsettled()
@@ -2226,6 +2245,9 @@ where
                     .as_ref()
                     .is_some_and(|map| map.contains_key(tag))
             });
+            // Retention is map-derived. Check the irreversible cause before
+            // the observer can retire a public receipt from an absent binding.
+            self.link.unsettled().check().map_err(RecvError::from)?;
             commit.commit(
                 ReceiverTransferEffect::StateOnly {
                     info,
@@ -2916,6 +2938,73 @@ impl DetachedReceiver {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cap_purge_cannot_commit_absence_as_peer_recovery() {
+        use crate::link::{
+            receiver_delivery::ReceiverDelivery, unsettled_store::Store, UnsettledLimits,
+        };
+        for retained_query in [false, true] {
+            let (mut inner, _control, _outgoing, incoming) =
+                make_receiver_inner_with_channels(4096);
+            let store = Arc::new(Store::new(None, Some(UnsettledLimits::new(2, 64))).unwrap());
+            inner.link.unsettled = store.clone();
+            let tag: DeliveryTag = vec![9].into();
+            let mut entry = ReceiverDelivery::new(None);
+            entry.received = true;
+            entry.info = Some(make_delivery_info(1, tag.to_vec()));
+            store.insert(tag.clone(), entry).unwrap();
+            store
+                .insert(vec![8].into(), ReceiverDelivery::new(None))
+                .unwrap();
+            let (frames, _inbox) = mpsc::channel(2);
+            let mut relay = LinkRelay::new_receiver(
+                frames,
+                inner.link.flow_state.clone(),
+                store.clone(),
+                ReceiverSettleMode::Second,
+            )
+            .with_output_handle(crate::endpoint::OutputAttachment::for_tests(0));
+            store.set_test_hook(usize::from(retained_query), move || {
+                // A real remote nonterminal state growth purges the Store while
+                // the parser is between its outer check and the queried effect.
+                let state = fe2o3_amqp_types::messaging::Rejected {
+                    error: Some(definitions::Error::new(
+                        AmqpError::InternalError,
+                        Some("x".repeat(128)),
+                        None,
+                    )),
+                };
+                assert!(relay
+                    .on_incoming_disposition(
+                        Role::Sender,
+                        false,
+                        Some(state.into()),
+                        vec![8].into()
+                    )
+                    .is_err());
+            });
+            let mut resumed = make_incoming_transfer(9, Some(tag.to_vec()), false, false);
+            resumed.resume = true;
+            incoming
+                .send(queued_transfer(resumed, Payload::new()))
+                .await
+                .unwrap();
+            let mut receiver = Receiver { inner };
+            let mut progress = Progress::default();
+            let error = receiver
+                .recv_observed::<String, _>(&mut progress)
+                .await
+                .unwrap_err();
+            assert_recv_capacity(error, &store.check().unwrap_err());
+            assert_eq!(progress.steps.len(), 1);
+            assert!(
+                matches!(progress.steps[0].effect(), ReceiverTransferEffect::Failed),
+                "{retained_query}: {:?}",
+                progress.steps
+            );
+        }
+    }
+
     #[tokio::test]
     async fn state_only_settlement_before_the_native_write_supplies_no_identity() {
         use crate::{

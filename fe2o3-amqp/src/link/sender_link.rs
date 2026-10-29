@@ -259,38 +259,6 @@ where
         detached: Fut,
         transfer: Transfer,
         payload: Payload,
-        registration: Registration,
-        dispatched: Option<&AtomicBool>,
-        #[cfg(feature = "transaction")] tracking: Option<&crate::transaction::ControlTracker>,
-    ) -> Result<Option<DeliveryTag>, LinkStateError>
-    where
-        Fut: Future<Output = Option<LinkFrame>> + Send,
-    {
-        let unsettled = self.unsettled.clone();
-        unsettled
-            .until_terminated(self.deliver_inner(
-                writer,
-                detached,
-                transfer,
-                payload,
-                registration,
-                dispatched,
-                #[cfg(feature = "transaction")]
-                tracking,
-            ))
-            .await?
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the checked send implementation retains the outer entry's native admission and control provenance"
-    )]
-    async fn deliver_inner<Fut>(
-        &mut self,
-        writer: &crate::session::transfer_queue::Sender,
-        detached: Fut,
-        transfer: Transfer,
-        payload: Payload,
         mut registration: Registration,
         dispatched: Option<&AtomicBool>,
         #[cfg(feature = "transaction")] tracking: Option<&crate::transaction::ControlTracker>,
@@ -323,17 +291,24 @@ where
             }
         }
         let delivery_tag = loop {
-            self.credit_or_detached(&mut detached).await?;
-            // The detach branch is polled first, as for credit.
-            let room = tokio::select! {
-                biased;
-                frame = detached.as_mut() => { // cancel safe
-                    return Err(self.interrupted(Stopped::Detached(frame)));
-                }
-                room = writer.reserve(first_payload.len()) => { // cancel safe
-                    room.map_err(|_| stopped(&self.session_stop_reason))?
-                }
-            };
+            // Only pending credit/queue waits are cap-interruptible. Once the
+            // final handoff succeeds, send_new_payload must return its outcome
+            // receiver: the relay may already have confirmed its settlement.
+            let unsettled = self.unsettled.clone();
+            let room = unsettled
+                .until_terminated(async {
+                    self.credit_or_detached(&mut detached).await?;
+                    tokio::select! {
+                        biased;
+                        frame = detached.as_mut() => { // cancel safe
+                            Err(self.interrupted(Stopped::Detached(frame)))
+                        }
+                        room = writer.reserve(first_payload.len()) => { // cancel safe
+                            room.map_err(|_| stopped(&self.session_stop_reason))
+                        }
+                    }
+                })
+                .await??;
             let mut open = match registered {
                 // The relay closed the store for the peer's closing detach,
                 // which the link has yet to read, when this fails.
@@ -395,6 +370,7 @@ where
             delivery_tag: (!moved).then(|| delivery_tag.clone()),
         });
         for (transfer, payload) in frames {
+            let payload_len = payload.len();
             let frame = LinkFrame::Transfer {
                 window_slot: None,
                 queue_slot: None,
@@ -403,24 +379,39 @@ where
                 performative: transfer,
                 payload,
             };
-            if let Err(cause) = self.hand_over(writer, &mut detached, frame).await {
-                let error = self.interrupted(cause);
-                return match (registration, &error) {
-                    (
-                        Some(registration),
-                        LinkStateError::RemoteDetached | LinkStateError::RemoteDetachedWithError(_),
-                    ) => {
-                        // Suspended: the delivery waits for an explicit resume.
-                        registration.keep();
-                        #[cfg(feature = "transaction")]
-                        if tracking.is_some() {
-                            return Err(error);
-                        }
-                        Ok(Some(delivery_tag))
+            let unsettled = self.unsettled.clone();
+            let room = unsettled
+                .until_terminated(async {
+                    tokio::select! {
+                        biased;
+                        frame = detached.as_mut() => Err(Stopped::Detached(frame)), // cancel safe
+                        room = writer.reserve(payload_len) => room.map_err(|_| Stopped::Session), // cancel safe
                     }
-                    _ => Err(error),
-                };
-            }
+                })
+                .await?;
+            let room = match room {
+                Ok(room) => room,
+                Err(cause) => {
+                    let error = self.interrupted(cause);
+                    return match (registration, &error) {
+                        (
+                            Some(registration),
+                            LinkStateError::RemoteDetached
+                            | LinkStateError::RemoteDetachedWithError(_),
+                        ) => {
+                            // Suspended: the delivery waits for an explicit resume.
+                            registration.keep();
+                            #[cfg(feature = "transaction")]
+                            if tracking.is_some() {
+                                return Err(error);
+                            }
+                            Ok(Some(delivery_tag))
+                        }
+                        _ => Err(error),
+                    };
+                }
+            };
+            room.send(frame);
             if let Some(dispatched) = dispatched {
                 dispatched.store(true, Ordering::Release);
             }
@@ -432,6 +423,8 @@ where
         if let Some(tracker) = tracking {
             tracker.complete_admitted();
         }
+        #[cfg(any(test, feature = "test-util"))]
+        self.unsettled.test_hook(2);
         Ok(Some(delivery_tag))
     }
 

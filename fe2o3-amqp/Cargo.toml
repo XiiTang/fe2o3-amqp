@@ -39,6 +39,9 @@ native-tls = ["tokio-native-tls", "libnative-tls"]
 # Listener implementation
 acceptor = []
 
+# Deterministic consumer regressions at native ownership/query boundaries.
+test-util = []
+
 # SASL SCRAM
 scram = ["sha1", "sha2", "rand", "base64", "stringprep", "hmac", "pbkdf2"]
 

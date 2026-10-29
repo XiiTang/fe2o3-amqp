@@ -1187,3 +1187,44 @@ compile/check or cleanup deletion was attempted after that stop.
 Pinned-toolchain formatting recheck (2026-10-29, macOS arm64):
 `RUSTUP_TOOLCHAIN=1.97.0 build-slot cargo fmt --all --check` exited 0
 on source tip `2dd8f15a006691c57955eda11afe3aa1974facdd`. No source changed for this recheck.
+
+## W17c review: preserve peer knowledge across Store exhaustion
+
+Upstream 8fd06bc36f2e3819ba4f01256b6688a2ce0d627a
+`link/receiver.rs::on_incoming_transfer` classifies unknown resumed tags from
+its ordinary unsettled map; it has no semantic-cap purge. The current fork
+adds irreversible purge, so a missing tag is no longer sufficient evidence of
+peer completion. The existing Store latch is now checked after recovery-map
+queries and before publishing Ignored or StateOnly. Actual parsed peer aborts
+and settlements keep their existing meaning. No joint native/consumer lock or
+second status owner is introduced.
+
+Upstream `link/sender_link.rs::send_payload_with_transfer` returns its settlement
+receiver after successful transfer handoff; it has no Store-cap cancellation.
+Keep this result ownership, and this fork's necessary registration-before-send
+repair. The W17c whole-delivery cap guard could replace successful handoff with
+a later capacity error and discard an already ready Accepted. Guard only pending
+credit/queue reservation, before handing the frame to the queue. Keep cap wakeups,
+fragment cancellation/withdrawal and detach precedence; after final handoff the
+original sender gets its settlement receiver even if another delivery exhausts
+the Store. Unresolved outcomes still receive the same retained typed error.
+
+Deterministic regressions use real resumed-Transfer parsing and the native relay
+state-update/settlement paths. `cap_purge_cannot_commit_absence_as_peer_recovery`
+covers both classification and StateOnly retention queries; the old source emits
+Ignored instead of Failed (exit 101). `completed_handoff_keeps_accepted_before_another_delivery_caps`
+holds the final handoff, confirms A, then grows B's actual Received state; the
+old guard drops A's ready outcome with UnsettledCapacityExceeded (exit 101).
+The existing pending-credit, queue and fragment cap tests continue to pass.
+The optional `test-util` feature exposes only one-shot, lock-free callback
+checkpoints at these exact boundaries for consumer effect regressions; normal
+builds contain neither the callbacks nor their storage.
+
+Validation on macOS arm64, Rust 1.97.0, from c129a992 plus this change, all via
+build-slot (exit 0):
+
+- `cargo test -p fe2o3-amqp --lib --features transaction,acceptor -- cap`: 24 passed.
+- `cargo test -p fe2o3-amqp --lib --features transaction,acceptor,test-util -- link::receiver::tests::`: 59 passed.
+- `cargo test -p fe2o3-amqp --lib --features transaction,acceptor,test-util -- link::sender::tests::`: 30 passed.
+- `cargo clippy -p fe2o3-amqp --lib --tests --features transaction,acceptor,test-util -- -D warnings`.
+- `cargo fmt --all --check`.

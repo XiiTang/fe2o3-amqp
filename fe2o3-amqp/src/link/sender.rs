@@ -105,6 +105,13 @@ impl std::fmt::Debug for Sender {
 }
 
 impl Sender {
+    /// Pause after the final native queue handoff, outside the Store lock.
+    /// Enabled only for deterministic consumer regressions.
+    #[cfg(feature = "test-util")]
+    pub fn after_delivery_handoff_for_tests(&self, callback: impl FnOnce() + Send + 'static) {
+        self.inner.link.unsettled.set_test_hook(2, callback);
+    }
+
     /// Close in place, arming correlation before every internal reattachment.
     pub async fn close_in_place_exact<F, G, E>(
         &mut self,
@@ -1871,6 +1878,80 @@ mod tests {
     ///
     /// The delivery spans frames and the session's channel holds one, so the send is pending on
     /// its second frame with the first in the session's hands.
+    #[tokio::test]
+    async fn completed_handoff_keeps_accepted_before_another_delivery_caps() {
+        use crate::link::{unsettled_store::Store, UnsettledLimits};
+        let mut inner = credited_sender(4096);
+        let per_delivery = 4 + 1 + serde_amqp::serialized_size(&None::<DeliveryState>).unwrap();
+        let store =
+            Arc::new(Store::new(None, Some(UnsettledLimits::new(2, per_delivery * 2))).unwrap());
+        inner.link.unsettled = store.clone();
+        let b = DeliveryTag::from([9; 4]);
+        let mut b_outcome = pending_delivery(&b, &inner);
+        let (frames, _inbox) = mpsc::channel(2);
+        let mut relay =
+            LinkRelay::new_sender(frames, inner.link.flow_state.producer(), store.clone())
+                .with_output_handle(crate::endpoint::OutputAttachment::for_tests(0));
+        store.set_test_hook(2, move || {
+            relay
+                .on_incoming_disposition(
+                    definitions::Role::Receiver,
+                    true,
+                    Some(fe2o3_amqp_types::messaging::Accepted {}.into()),
+                    DeliveryTag::from([0; 4]),
+                )
+                .unwrap();
+            let cause = relay
+                .on_incoming_disposition(
+                    definitions::Role::Receiver,
+                    false,
+                    Some(
+                        fe2o3_amqp_types::messaging::Received {
+                            section_number: u32::MAX,
+                            section_offset: u64::MAX,
+                        }
+                        .into(),
+                    ),
+                    b,
+                )
+                .unwrap_err();
+            assert!(cause.bytes.unwrap() > cause.limits.max_bytes);
+        });
+        let (writer, mut frames) = mpsc::channel(2);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
+        let settlement = inner
+            .link
+            .send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from_static(b"m"),
+                0,
+                Some(false),
+                None,
+                false,
+            )
+            .await
+            .expect("completed handoff keeps its settlement owner");
+        assert!(
+            matches!(frames.try_recv(), Ok(LinkFrame::Transfer { performative, .. }) if !performative.more)
+        );
+        let Settlement::Unsettled {
+            delivery_tag,
+            mut outcome,
+        } = settlement
+        else {
+            panic!("unsettled send")
+        };
+        assert_eq!(delivery_tag, DeliveryTag::from([0; 4]));
+        assert!(matches!(
+            outcome.try_recv(),
+            Ok(Ok(Some(DeliveryState::Accepted(_))))
+        ));
+        assert!(
+            matches!(b_outcome.try_recv(), Ok(Err(LinkStateError::UnsettledCapacityExceeded(error))) if error == store.check().unwrap_err())
+        );
+    }
+
     #[tokio::test]
     async fn a_delivery_is_registered_when_its_first_frame_reaches_the_session() {
         let mut inner = credited_sender(512);

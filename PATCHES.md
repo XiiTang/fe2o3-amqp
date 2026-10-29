@@ -1183,3 +1183,7 @@ follows the tested source tip; no push or boundless-branch movement occurred.
 Consumer implementation stopped on its required disk preflight at 29 GiB free
 on 2026-10-29. The pinned formatter recheck is not claimed complete. No additional
 compile/check or cleanup deletion was attempted after that stop.
+
+Pinned-toolchain formatting recheck (2026-10-29, macOS arm64):
+`RUSTUP_TOOLCHAIN=1.97.0 build-slot cargo fmt --all --check` exited 0
+on source tip `2dd8f15a006691c57955eda11afe3aa1974facdd`. No source changed for this recheck.

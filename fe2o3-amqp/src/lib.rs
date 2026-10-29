@@ -263,3 +263,6 @@ cfg_wasm32! {
     pub trait SendBound {}
     impl<T> SendBound for T {}
 }
+
+#[cfg(test)]
+extern crate self as fe2o3_amqp;

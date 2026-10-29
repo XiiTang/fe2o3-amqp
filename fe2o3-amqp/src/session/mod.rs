@@ -333,7 +333,9 @@ pub(crate) async fn allocate_link(
 }
 
 #[derive(Clone)]
-pub(crate) struct CapacityReporter(Arc<dyn Fn(&crate::link::UnsettledCapacityExceeded) + Send + Sync>);
+pub(crate) struct CapacityReporter(
+    Arc<dyn Fn(&crate::link::UnsettledCapacityExceeded) + Send + Sync>,
+);
 impl std::fmt::Debug for CapacityReporter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("CapacityReporter")
@@ -699,7 +701,9 @@ impl endpoint::Session for Session {
     }
 
     fn report_unsettled_capacity(&self, cause: &crate::link::UnsettledCapacityExceeded) {
-        if let Some(report) = &self.unsettled_capacity_reporter { (report.0)(cause); }
+        if let Some(report) = &self.unsettled_capacity_reporter {
+            (report.0)(cause);
+        }
     }
 
     fn set_session_stop_reason(&mut self, reason: SessionStopReason) {

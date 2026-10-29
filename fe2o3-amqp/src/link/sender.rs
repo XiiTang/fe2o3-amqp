@@ -32,9 +32,7 @@ use super::{
     error::DetachError,
     resumption::ResumingDelivery,
     role,
-    shared_inner::{
-        recv_remote_detach, LinkEndpointInner, LinkEndpointInnerDetach, LinkEndpointInnerReattach,
-    },
+    shared_inner::{recv_remote_detach, LinkEndpointInner, LinkEndpointInnerDetach},
     ArcSenderUnsettledMap, DetachThenResumeSenderError, LinkFrame, LinkRelay, LinkStateError,
     MessageSizeExceeded, SendError, SenderAttachError, SenderAttachExchange, SenderFlowState,
     SenderLink, SenderResumeError, SenderResumeErrorKind, SessionStopReason,
@@ -772,28 +770,6 @@ where
         error: Option<definitions::Error>,
     ) -> Result<(), <Self::Link as LinkDetach>::DetachError> {
         self.link.send_detach(&self.outgoing, closed, error).await
-    }
-}
-
-impl<L> LinkEndpointInnerReattach for SenderInner<L>
-where
-    L: endpoint::SenderLink<AttachError = SenderAttachError, DetachError = DetachError>
-        + LinkExt<FlowState = SenderFlowState, Unsettled = ArcSenderUnsettledMap>
-        + LinkAttach<AttachExchange = SenderAttachExchange>
-        + Send
-        + Sync,
-{
-    fn handle_reattach_outcome(
-        &mut self,
-        outcome: SenderAttachExchange,
-    ) -> Result<&mut Self, L::AttachError> {
-        match outcome {
-            SenderAttachExchange::Complete => Ok(self),
-            //  Re-attach should have None valued unsettled, so this should be invalid
-            SenderAttachExchange::IncompleteUnsettled(_) | SenderAttachExchange::Resume(_) => {
-                Err(SenderAttachError::IllegalState)
-            }
-        }
     }
 }
 
@@ -3078,19 +3054,6 @@ mod tests {
         let cause = exhaust_recovery_store(&store);
         assert!(
             matches!(futures_util::poll!(&mut waiting), std::task::Poll::Ready(Err(SendError::LinkStateError(LinkStateError::UnsettledCapacityExceeded(error)))) if error == cause)
-        );
-    }
-
-    #[tokio::test]
-    async fn cap_control_detach_wait_returns_retained_cause() {
-        let (mut inner, _session, _frames, _incoming) = make_sender_inner_with_channels(4096);
-        let store = capped_recovery_store();
-        inner.link.unsettled = store.clone();
-        let mut waiting = Box::pin(inner.detach_with_error(None));
-        assert!(futures_util::poll!(&mut waiting).is_pending());
-        let cause = exhaust_recovery_store(&store);
-        assert!(
-            matches!(futures_util::poll!(&mut waiting), std::task::Poll::Ready(Err(DetachError::UnsettledCapacityExceeded(error))) if error == cause)
         );
     }
 }

@@ -1014,8 +1014,9 @@ receiver allocation, Attach admission and Attach-reply waits could also cross a
 new terminal transition and lose its cause.
 
 Both role Attach handlers check the retained Store before reconciliation.
-Both role send/exchange Attach methods, resume operations, and the shared
-reallocation/reattach helpers use `Store::until_terminated`. The private endpoint
+Both role business send/exchange Attach methods and resume operations use
+`Store::until_terminated`. Already-admitted teardown uses the cap-safe shared
+control passage described in the W17c2 section below. The private endpoint
 trait ties its unsettled associated type to that Store, so generic recovery
 cannot bypass the same checkpoint. Recovery on another session checks termination
 before altering the endpoint; sender resend also checks before an empty-map return.
@@ -1038,19 +1039,17 @@ shared_inner.rs:334-371; and link/mod.rs:633-640,665-668,802-811,856-879.
 
 The same failure occurs beyond sends/recv/recovery: receiver flow/drain,
 ordinary and batched dispositions on both roles, ReceiverDisposer's disposition
-and automatic credit refresh, and local/remote detach waits can wait on unrelated
-queue room or input. An already-draining receiver also returned Ok after its
-Store ended. Relay Attach/Transfer and transaction-acquisition forwards could
-remain blocked after the native reader observed exhaustion and stopped polling.
+and automatic credit refresh can wait on unrelated queue room or input. An already-draining receiver also returned Ok after its
+Store ended. Transfer and transaction-acquisition forwards could remain blocked after the
+native reader observed exhaustion and stopped polling.
 The receiver settlement view woke with Ok on a cap-purged map, exposing only
 absence, which could be mistaken for peer settlement.
 
 These paths now use the same `Store::until_terminated` checkpoint. The drain
-short circuit checks the retained cause. Relay Attach forwarding propagates the
+short circuit checks the retained cause. Transfer forwarding propagates the
 typed error through both ordinary and acceptor sessions; ordinary dropped-reader
-errors remain UnattachedHandle. A detach relay still emits the peer's required
-reply while skipping a forward to an exhausted reader, retaining the original
-local Store cause. Existing sender pending outcomes already fail through Store
+errors remain UnattachedHandle. Attach/Detach forwarding and shared cleanup waits
+retain the admitted exchange's actual native result as described below. Existing sender pending outcomes already fail through Store
 outside its lock, preserving W4e's exactly-once handoff.
 
 Public `ReceiverSettlementView::changed` now returns `Result<(), LinkStateError>`
@@ -1063,8 +1062,9 @@ error variant is added; the existing LinkStateError mapper can carry the cause.
 pending DeliveryFut check already passes, exit 101). All nine pass after (exit 0).
 They compare exact typed limits/usage across receiver flow, drain, single/batched
 and cloned-disposer settlement, both automatic-flow paths, sender dispositions,
-both-role detach waits, receiver settlement view in both orders, and relay
-Attach/Transfer/Detach forwarding. The native pending DeliveryFut regression
+receiver settlement view in both orders and relay Transfer forwarding.
+The historical early Detach/Attach refusal assertions are superseded by W17c2's
+shared actual-completion fixture below. The native pending DeliveryFut regression
 continues to pass. Tests use explicit Pending/Ready checkpoints, not elapsed time.
 macOS arm64 / Rust 1.98.1. The full library and portable reruns are recorded in the
 final verification evidence. Boundless semantic integration remains with W4e/W17c.
@@ -1090,48 +1090,65 @@ macOS arm64 / Rust 1.98.1. This is a regression of the new terminal guard;
 W4e's commits and detach routing remain unchanged.
 
 
-## W17c2 port status — incomplete, blocked on crossed cleanup passage
+## W17c2: preserve owned crossed teardown after Store exhaustion
 
 This work branch starts at ea211cd459f12c61f942e1c01ca01e26f64b39cf.
-Historical validation above belongs to its named historical revisions, not this
-port. Current committed tip is 1a488e498b70c2961398bf04e69893eb753f4396;
-the reporter/preflight and D1 reconciliation edits remain uncommitted. This is
-not a review-ready pin and must not be fast-forwarded to boundless.
+The required W4e completion commits were ported first; their original retirement
+queue/channel remains the one owner of abandoned allocation and engine answers.
+ControlTracker's receipt-before-notification, parser-step receiver Close and the
+pin's late half-open Attach/name/relay custody are retained. Historical commands
+above belong to their named revisions, not this port. Checkpoint 14d3bbf1 records
+the reconciled Store/reporter/preflight tree before the crossed amendment.
 
-Upstream 8fd06bc3 sender timed resume calls detach_with_error(None) after its
-actual timeout. Upstream shared_inner::detach_with_error handles a crossed
-closing Detach by reattach_then_close, which uses ordinary Attach reconciliation.
-Pin ea211cd4 preserves that behavior and extends cleanup to the ownership-returning
-interruption entries, including admitted half-open Attach. That native custody,
-late-answer routing, actual cleanup error and explicit-retry behavior must remain.
-The old cap line cancels recv_remote_detach and ordinary reattachment on Store
-termination. It cannot be replayed as a compliant cleanup policy. The consuming
-READY design requires admitted cleanup to complete, but does not select the
-ordinary-versus-CloseOnly reconciliation passage for this crossed case. No new
-passage has been selected here. Both old cap_control_detach_wait tests still
-assert the superseded early-refusal behavior; their passing result is not
-compliance evidence. The consumer implementation report records the blocking
-question and the remaining native/adapter regressions.
+Upstream 8fd06bc36f2e3819ba4f01256b6688a2ce0d627a
+`sender.rs::resume_with_timeout_inner` completes nonclosing suspension after its
+actual timeout. `shared_inner.rs::reattach_then_close` then uses ordinary Attach
+reconciliation for a crossed closing answer, clearing the local map before the
+new answer. The pin extends that owned cleanup to interruption and half-open
+Attach. Keep that cleanup ownership, original late-answer binding and error
+precedence. The deliberate divergence is confined to the *subsequent teardown
+reattachment*: use the existing CloseOnly Attach, with null local map, common
+validation and incomplete-map refusal, then consume the actual closing Detach
+answer. A complete nonempty peer map must not yield Resume/IllegalState or supply
+Accepted/Rejected business knowledge during teardown.
 
-The work in progress ports W4e answer dispositions before Store limits, retains
-D1's ControlTracker receipt-before-notification, introduces the private Store
-mutation transaction and irreversible typed cause, and adds the reviewed
-construction-bound Session reporter and read-only detached recovery checks.
-Required pending error-path validation includes incoming Flow/Transfer/Disposition
-capacity, report-before-End attribution, interrupted/timed late-answer cleanup,
-and actual Boundless source joins. No new sibling-preservation policy is included.
+Mature source comparison: Qpid Proton
+3f263156a9a4ea3fd3c2eb78dbd796314958fd0b `c/src/core/transport.c::pn_do_detach`
+and `python/proton/_handlers.py::on_link_remote_close`; rhea
+d7474da72add1470be23a974ff670cff3d995e7f `lib/link.js::{on_detach,_process}`.
+Their teardown does no unsettled reconciliation. They do not provide fe2o3's
+automatic crossed handshake; that handshake remains necessary here. Teardown
+needs no business reconciliation, and Store-cap cancellation would otherwise
+strand already admitted cleanup.
 
-Focused interim commands on macOS Darwin 27.2.0 arm64 / Rust 1.97.0, all through
-build-slot, with untracked local Cargo.lock selecting tokio-util 0.7.19:
+The private `reattach_for_close` is the common generic/exact teardown door.
+Shared allocation, Attach/Detach forwarding, error cleanup and reply waits do
+not race the Store latch. Actual Session/Connection failure still terminates
+through the ordinary native result. Business admission/resume/receive/flow and
+settlement keep the same irreversible Store check; clearing never reopens it.
+No callback/token/registry, public resume-signature change, sibling-preservation
+policy or second outcome cell was added. Session's construction-bound capacity
+reporter runs synchronously before its normal resource-limit End, and detached
+read-only checks expose the same immutable Store for adapter admission.
 
-| Command | Exit | Limited result |
-| --- | ---: | --- |
-| cargo test -p fe2o3-amqp --features transaction,acceptor --lib completion | 101 then 0 | First compile had porting fixture errors and latest tokio-util codec ambiguity; after fixture fixes/local lock selection, 5 tests passed before the cap port. |
-| cargo update -p tokio-util --precise 0.7.19 | 0 | Local lock only; no manifest or transport workaround. |
-| cargo test -p fe2o3-amqp --features transaction,acceptor --lib unsettled_store | 101 then 0 | First cap compile had old/new API and fixture mismatches; corrected working tree passed 5 Store tests. |
-| cargo test -p fe2o3-amqp --features transaction,acceptor --lib link::receiver::tests:: | 0 | 59 passed, including an old Detach-cap assertion that must be rewritten. |
-| cargo test -p fe2o3-amqp --features transaction,acceptor --lib link::sender::tests:: | 0 | 30 passed, including the corresponding old Detach-cap assertion. |
+Regression fixture: `tests/detached_link_frames.rs::
+interrupted_resume_consumes_the_late_attach_and_returns_resumable_custody` calls
+one shared scripted peer in `tests/support/interrupted_resume.rs`. Its private
+Store wrapper `link::cleanup_capacity_tests::
+admitted_resume_cleanup_outlives_interrupt_and_cap` uses real checked Store
+registration/insertion, with no public test hook. Both roles, real interrupt and
+paused-clock timeout cover held original Attach/first Detach before allocation,
+CloseOnly Attach and final closing Detach answers. They assert retained custody
+through cap, actual completion/Session failure, irreversible cap after clear,
+no business replay or Accepted/Rejected inferred from teardown Attach, and keep
+a previously confirmed delivery's real result. The noncrossed later explicit
+resume, pre-dispatch and actual peer cleanup-error arms remain. Both old endpoint
+Detach-cap early-return tests and obsolete relay early-drop assertions are gone;
+no ordering-only replacements were added.
 
-Strict Clippy, fmt, native integration regressions and Boundless checks have not
-run. Exact commands/exit codes and logs are held by the consuming implementation
-report. No push or boundless-branch movement was performed.
+Current validation on macOS Darwin 27.2.0 arm64, Rust 1.97.0, through build-slot.
+Local untracked Cargo.lock selects tokio-util 0.7.19, matching the consumer lock;
+no transport/manifest workaround is added. The consuming implementation ledger
+records complete commands and exits. Review-ready tip and final focused results
+will be recorded after the remaining checks; the branch has not been pushed or
+fast-forwarded to boundless.

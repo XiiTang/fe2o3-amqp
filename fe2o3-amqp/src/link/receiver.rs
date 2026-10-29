@@ -33,7 +33,7 @@ use super::{
     incomplete_transfer::IncompleteTransfer,
     receiver_link::count_number_of_sections_and_offset,
     role,
-    shared_inner::{LinkEndpointInner, LinkEndpointInnerDetach, LinkEndpointInnerReattach},
+    shared_inner::{LinkEndpointInner, LinkEndpointInnerDetach},
     ArcReceiverUnsettledMap, DetachThenResumeReceiverError, DispositionError, FlowError,
     IllegalLinkStateError, LinkFrame, LinkRelay, LinkStateError, MessageSizeExceeded,
     ReceiverAttachError, ReceiverAttachExchange, ReceiverFlowState, ReceiverLink,
@@ -1615,28 +1615,6 @@ where
     }
 }
 
-impl<L> LinkEndpointInnerReattach for ReceiverInner<L>
-where
-    L: endpoint::ReceiverLink<AttachError = ReceiverAttachError, DetachError = DetachError>
-        + LinkExt<FlowState = ReceiverFlowState, Unsettled = ArcReceiverUnsettledMap>
-        + LinkAttach<AttachExchange = ReceiverAttachExchange>
-        + Send
-        + Sync,
-{
-    fn handle_reattach_outcome(
-        &mut self,
-        outcome: ReceiverAttachExchange,
-    ) -> Result<&mut Self, L::AttachError> {
-        match outcome {
-            ReceiverAttachExchange::Complete => Ok(self),
-            //  Re-attach should have None valued unsettled, so this should be invalid
-            ReceiverAttachExchange::IncompleteUnsettled | ReceiverAttachExchange::Resume => {
-                Err(ReceiverAttachError::IllegalState)
-            }
-        }
-    }
-}
-
 impl<L> ReceiverInner<L>
 where
     L: endpoint::ReceiverLink<
@@ -1670,7 +1648,10 @@ where
     {
         loop {
             let unsettled = self.link.unsettled().clone();
-            match unsettled.until_terminated(self.recv_inner(ReceiveContext::Live, observer)).await? {
+            match unsettled
+                .until_terminated(self.recv_inner(ReceiveContext::Live, observer))
+                .await?
+            {
                 Ok(Some(delivery)) => return Ok(ReceiverReadStep::Delivery(delivery)),
                 Ok(None) => {}
                 Err(ReceiveFault::Error(error)) => return Err(error),
@@ -1922,11 +1903,13 @@ where
 
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
-                    self.link.on_incomplete_transfer(
-                        delivery_tag,
-                        incomplete.section_number.unwrap_or(0),
-                        incomplete.section_offset,
-                    ).map_err(RecvError::from)?;
+                    self.link
+                        .on_incomplete_transfer(
+                            delivery_tag,
+                            incomplete.section_number.unwrap_or(0),
+                            incomplete.section_offset,
+                        )
+                        .map_err(RecvError::from)?;
                 }
             }
             None => {
@@ -1941,11 +1924,13 @@ where
                     };
                 if let Some(delivery_tag) = incomplete.performative.delivery_tag.clone() {
                     // Update unsettled map in the link
-                    self.link.on_incomplete_transfer(
-                        delivery_tag,
-                        incomplete.section_number.unwrap_or(0),
-                        incomplete.section_offset,
-                    ).map_err(RecvError::from)?;
+                    self.link
+                        .on_incomplete_transfer(
+                            delivery_tag,
+                            incomplete.section_number.unwrap_or(0),
+                            incomplete.section_offset,
+                        )
+                        .map_err(RecvError::from)?;
                 }
                 self.incomplete_transfer = Some(Box::new(incomplete));
             }
@@ -2203,16 +2188,21 @@ where
             if continuation.is_none() {
                 if let Some(tag) = &transfer.delivery_tag {
                     let delivery_id = transfer.delivery_id.ok_or(RecvError::DeliveryIdIsNone)?;
-                    info = self.link.unsettled().update(tag, |entry| {
-                        entry.resumed = true;
-                        entry.info = Some(DeliveryInfo {
-                            identity: std::sync::Arc::new(()),
-                            delivery_id,
-                            delivery_tag: tag.clone(),
-                            rcv_settle_mode: transfer.rcv_settle_mode.clone(),
-                            _sealed: crate::util::Sealed {},
-                        });
-                    }).map_err(RecvError::from)?.and_then(|entry| entry.info);
+                    info = self
+                        .link
+                        .unsettled()
+                        .update(tag, |entry| {
+                            entry.resumed = true;
+                            entry.info = Some(DeliveryInfo {
+                                identity: std::sync::Arc::new(()),
+                                delivery_id,
+                                delivery_tag: tag.clone(),
+                                rcv_settle_mode: transfer.rcv_settle_mode.clone(),
+                                _sealed: crate::util::Sealed {},
+                            });
+                        })
+                        .map_err(RecvError::from)?
+                        .and_then(|entry| entry.info);
                 }
             }
             if transfer.aborted || transfer.settled == Some(true) {
@@ -2937,10 +2927,14 @@ mod tests {
         seed_unsettled(inner.link.unsettled(), &[vec![9]]);
         let tag: DeliveryTag = vec![9].into();
         {
-            inner.link.unsettled().update(&tag, |entry| {
-                entry.received = true;
-                entry.info = Some(make_delivery_info(1, tag.to_vec()));
-            }).unwrap();
+            inner
+                .link
+                .unsettled()
+                .update(&tag, |entry| {
+                    entry.received = true;
+                    entry.info = Some(make_delivery_info(1, tag.to_vec()));
+                })
+                .unwrap();
         }
         let mut session = Builder::new().into_session(
             OutgoingChannel(0),
@@ -3028,7 +3022,11 @@ mod tests {
             seed_unsettled(inner.link.unsettled(), &[tag.to_vec()]);
             let info = make_delivery_info(42, tag.to_vec());
             {
-                inner.link.unsettled().update(&tag, |entry| entry.info = Some(info.clone())).unwrap();
+                inner
+                    .link
+                    .unsettled()
+                    .update(&tag, |entry| entry.info = Some(info.clone()))
+                    .unwrap();
             }
             let state = if transactional {
                 #[cfg(feature = "transaction")]
@@ -3063,7 +3061,11 @@ mod tests {
             seed_unsettled(inner.link.unsettled(), &[tag.to_vec()]);
             let fresh = make_delivery_info(42, tag.to_vec());
             {
-                inner.link.unsettled().update(&tag, |entry| entry.info = Some(fresh.clone())).unwrap();
+                inner
+                    .link
+                    .unsettled()
+                    .update(&tag, |entry| entry.info = Some(fresh.clone()))
+                    .unwrap();
             }
             assert!(matches!(
                 inner.dispose(info, None, state.clone()).await,
@@ -3617,10 +3619,14 @@ mod tests {
                 seed_unsettled(inner.link.unsettled(), &[vec![9]]);
                 let old = make_delivery_info(1, vec![9]);
                 {
-                    inner.link.unsettled().update(&DeliveryTag::from(vec![9]), |entry| {
-                        entry.received = true;
-                        entry.info = Some(old.clone());
-                    }).unwrap();
+                    inner
+                        .link
+                        .unsettled()
+                        .update(&DeliveryTag::from(vec![9]), |entry| {
+                            entry.received = true;
+                            entry.info = Some(old.clone());
+                        })
+                        .unwrap();
                 }
                 let mut receiver = Receiver { inner };
                 if mode == 1 {
@@ -6029,18 +6035,5 @@ mod tests {
             Some(LinkStateError::UnsettledCapacityExceeded(error)) => assert_eq!(error, cause),
             _ => panic!("settlement view lost native capacity cause: {error:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn cap_control_detach_wait_returns_retained_cause() {
-        let (mut inner, _session, _frames, _incoming) = make_receiver_inner_with_channels(4096);
-        let store = capped_recovery_store();
-        inner.link.unsettled = store.clone();
-        let mut waiting = Box::pin(inner.detach_with_error(None));
-        assert!(futures_util::poll!(&mut waiting).is_pending());
-        let cause = exhaust_recovery_store(&store);
-        assert!(
-            matches!(futures_util::poll!(&mut waiting), std::task::Poll::Ready(Err(DetachError::UnsettledCapacityExceeded(error))) if error == cause)
-        );
     }
 }

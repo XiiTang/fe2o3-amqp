@@ -646,10 +646,7 @@ impl LinkRelay<()> {
 }
 
 impl LinkRelay<OutputAttachment> {
-    pub(crate) async fn send(
-        &mut self,
-        frame: LinkFrame,
-    ) -> Result<(), LinkRelayError> {
+    pub(crate) async fn send(&mut self, frame: LinkFrame) -> Result<(), LinkRelayError> {
         match self {
             LinkRelay::Sender { tx, .. } => tx.send(frame).await,
             LinkRelay::Receiver { tx, .. } => tx.send(frame).await,
@@ -873,10 +870,8 @@ impl LinkRelay<OutputAttachment> {
                 if remote_initiated && detach.closed {
                     unsettled.close(remote_close_error(&detach));
                 }
-                // A dropped or exhausted reader cannot consume the frame;
-                // the response (if any) must still go out.
-                let forwarded =
-                    matches!(unsettled.until_terminated(tx.send(frame)).await, Ok(Ok(())));
+                // Admitted teardown owns its actual reply even after Store exhaustion.
+                let forwarded = tx.send(frame).await.is_ok();
 
                 if !remote_initiated {
                     // The detach is the response to our own detach/close. The
@@ -897,12 +892,9 @@ impl LinkRelay<OutputAttachment> {
                 })
             }
             LinkRelay::Receiver {
-                tx,
-                output_handle,
-                unsettled,
-                ..
+                tx, output_handle, ..
             } => {
-                let _ = unsettled.until_terminated(tx.send(frame)).await;
+                let _ = tx.send(frame).await;
                 if !remote_initiated {
                     return None;
                 }
@@ -1475,60 +1467,39 @@ mod detach_admission_tests {
             .unwrap_err()
     }
     #[tokio::test]
-    async fn cap_control_relay_attach_and_transfer_waits_keep_capacity_cause() {
-        let mut observed = Vec::new();
-        for transfer_wait in [false, true] {
-            let store = cap_control_relay_store();
-            let link = attached_link();
-            let attachment = crate::endpoint::OutputAttachment::for_tests(0);
-            let (tx, _frames) = mpsc::channel(1);
-            tx.try_send(LinkFrame::Flow(LinkFlow::default(), attachment.id))
-                .unwrap();
-            let mut relay = LinkRelay::new_receiver(
-                tx,
-                link.flow_state.clone(),
-                store.clone(),
-                ReceiverSettleMode::Second,
+    async fn cap_control_relay_transfer_wait_keeps_capacity_cause() {
+        let store = cap_control_relay_store();
+        let link = attached_link();
+        let attachment = crate::endpoint::OutputAttachment::for_tests(0);
+        let (tx, _frames) = mpsc::channel(1);
+        tx.try_send(LinkFrame::Flow(LinkFlow::default(), attachment.id))
+            .unwrap();
+        let mut relay = LinkRelay::new_receiver(
+            tx,
+            link.flow_state.clone(),
+            store.clone(),
+            ReceiverSettleMode::Second,
+        )
+        .with_output_handle(attachment);
+        let performative = Transfer {
+            handle: definitions::Handle(0),
+            delivery_id: Some(0),
+            delivery_tag: Some(vec![1].into()),
+            message_format: Some(0),
+            settled: Some(false),
+            more: false,
+            rcv_settle_mode: None,
+            state: None,
+            resume: false,
+            aborted: false,
+            batchable: false,
+        };
+        assert!(
+            cap_control_observe_relay(
+                &store,
+                relay.on_incoming_transfer(performative, Payload::new(), None)
             )
-            .with_output_handle(attachment);
-            if transfer_wait {
-                let performative = Transfer {
-                    handle: definitions::Handle(0),
-                    delivery_id: Some(0),
-                    delivery_tag: Some(vec![1].into()),
-                    message_format: Some(0),
-                    settled: Some(false),
-                    more: false,
-                    rcv_settle_mode: None,
-                    state: None,
-                    resume: false,
-                    aborted: false,
-                    batchable: false,
-                };
-                observed.push(
-                    cap_control_observe_relay(
-                        &store,
-                        relay.on_incoming_transfer(performative, Payload::new(), None),
-                    )
-                    .await,
-                );
-            } else {
-                store
-                    .insert(
-                        vec![1].into(),
-                        receiver_delivery::ReceiverDelivery::new(None),
-                    )
-                    .unwrap();
-                let attach = link.as_complete_attach(endpoint::OutputHandle(0), false);
-                observed.push(
-                    cap_control_observe_relay(&store, relay.send(LinkFrame::Attach(attach))).await,
-                );
-            }
-        }
-        assert_eq!(
-            observed,
-            [true, true],
-            "relay forwards must retain typed termination"
+            .await
         );
     }
     async fn cap_control_observe_relay<T, E: std::error::Error + 'static>(
@@ -1545,39 +1516,70 @@ mod detach_admission_tests {
             _ => false,
         }
     }
-    #[tokio::test]
-    async fn cap_control_relay_detach_does_not_wait_for_ended_reader() {
-        let store = cap_control_relay_store();
-        store
-            .insert(
-                vec![1].into(),
-                receiver_delivery::ReceiverDelivery::new(None),
-            )
-            .unwrap();
-        let link = attached_link();
-        let attachment = crate::endpoint::OutputAttachment::for_tests(0);
-        let (tx, _frames) = mpsc::channel(1);
-        tx.try_send(LinkFrame::Flow(LinkFlow::default(), attachment.id))
-            .unwrap();
-        let mut relay = LinkRelay::new_receiver(
-            tx,
-            link.flow_state.clone(),
-            store.clone(),
-            ReceiverSettleMode::Second,
-        )
-        .with_output_handle(attachment);
-        let detach = Detach {
-            handle: definitions::Handle(0),
-            closed: true,
-            error: None,
-        };
-        let mut waiting = Box::pin(relay.on_incoming_detach(detach, true));
-        assert!(futures_util::poll!(&mut waiting).is_pending());
-        let cause = cap_control_exhaust_relay(&store);
-        assert!(matches!(
-            futures_util::poll!(&mut waiting),
-            std::task::Poll::Ready(Some(Detach { closed: true, .. }))
-        ));
-        assert_eq!(store.check(), Err(cause));
+}
+
+#[cfg(test)]
+#[path = "../../tests/support/detached_peer.rs"]
+mod detached_peer;
+#[cfg(test)]
+#[path = "../../tests/support/interrupted_resume.rs"]
+mod interrupted_resume;
+#[cfg(test)]
+mod cleanup_capacity_tests {
+    use super::{
+        delivery::UnsettledMessage,
+        interrupted_resume::{CapConstructors, CapState},
+        receiver_delivery::ReceiverDelivery,
+    };
+    use crate::{Payload, Receiver, Sender};
+
+    // Invoke the real Store admission entry at the peer gate. Keeping this
+    // trigger inside the crate avoids a test hook in the native public API.
+    fn sender_cap(sender: &Sender) -> CapState {
+        let store = sender.inner.link.unsettled.clone();
+        let retained = store.clone();
+        CapState {
+            exhaust: Box::new(move || {
+                let (tx, _outcome) = crate::completion::channel();
+                assert!(store
+                    .register(
+                        vec![2].into(),
+                        UnsettledMessage::new(Payload::from(vec![0; 8192]), None, 0, tx)
+                    )
+                    .is_err());
+            }),
+            check: Box::new(move || {
+                assert!(retained.check().is_err());
+            }),
+        }
+    }
+    fn receiver_cap(receiver: &Receiver) -> CapState {
+        let store = receiver.inner.link.unsettled.clone();
+        let retained = store.clone();
+        CapState {
+            exhaust: Box::new(move || {
+                let state = fe2o3_amqp_types::messaging::Rejected {
+                    error: Some(fe2o3_amqp_types::definitions::Error::new(
+                        fe2o3_amqp_types::definitions::AmqpError::InternalError,
+                        Some("x".repeat(8192)),
+                        None,
+                    )),
+                };
+                assert!(store
+                    .insert(vec![2].into(), ReceiverDelivery::new(Some(state.into())))
+                    .is_err());
+            }),
+            check: Box::new(move || {
+                assert!(retained.check().is_err());
+            }),
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn admitted_resume_cleanup_outlives_interrupt_and_cap() {
+        super::interrupted_resume::run(Some(CapConstructors {
+            sender: sender_cap,
+            receiver: receiver_cap,
+        }))
+        .await;
     }
 }

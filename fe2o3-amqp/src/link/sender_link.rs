@@ -281,6 +281,10 @@ where
             .await?
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the checked send implementation retains the outer entry's native admission and control provenance"
+    )]
     async fn deliver_inner<Fut>(
         &mut self,
         writer: &crate::session::transfer_queue::Sender,
@@ -988,10 +992,13 @@ where
         is_reattaching: bool,
     ) -> Result<(), Self::AttachError> {
         let unsettled = self.unsettled.clone();
-        unsettled.until_terminated(async {
-            self.send_attach_inner(writer, is_reattaching, &AttachPurpose::Ordinary).await?;
-            Ok(())
-        }).await?
+        unsettled
+            .until_terminated(async {
+                self.send_attach_inner(writer, is_reattaching, &AttachPurpose::Ordinary)
+                    .await?;
+                Ok(())
+            })
+            .await?
     }
 }
 
@@ -1077,7 +1084,14 @@ where
         is_reattaching: bool,
     ) -> Result<Self::AttachExchange, Self::AttachError> {
         let unsettled = self.unsettled.clone();
-        unsettled.until_terminated(self.exchange_attach_inner(writer, reader, is_reattaching, AttachPurpose::Ordinary)).await?
+        unsettled
+            .until_terminated(self.exchange_attach_inner(
+                writer,
+                reader,
+                is_reattaching,
+                AttachPurpose::Ordinary,
+            ))
+            .await?
     }
 
     async fn exchange_attach_for_close(

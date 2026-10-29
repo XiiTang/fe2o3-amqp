@@ -197,7 +197,9 @@ impl<T> Store<T> {
         #[cfg(test)]
         {
             let callback = self.before_receiver_write.0.lock().take();
-            if let Some(callback) = callback { callback(); }
+            if let Some(callback) = callback {
+                callback();
+            }
         }
         Mutation {
             guard: Some(self.entries.write()),

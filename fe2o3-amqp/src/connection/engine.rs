@@ -862,7 +862,7 @@ mod incoming_tests {
                 outgoing_session_frames: outgoing,
                 heartbeat: HeartBeat::never(),
                 write_pending: false,
-            retired_allocations: Default::default(),
+                retired_allocations: Default::default(),
             };
             assert!(matches!(
                 engine

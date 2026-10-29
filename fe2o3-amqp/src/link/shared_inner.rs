@@ -62,60 +62,25 @@ where
     async fn reallocate_output_handle(
         &mut self,
     ) -> Result<(), <Self::Link as LinkAttach>::AttachError> {
-        let unsettled = self.link().unsettled().clone();
-        unsettled
-            .until_terminated(async {
-                let capacity = session::link_incoming_capacity(
-                    self.session_control(),
-                    self.buffer_size(),
-                    self.session_stop_reason(),
-                )
-                .await?;
-                let (tx, incoming) = mpsc::channel(capacity);
-                let link_relay = self.as_new_link_relay(tx);
-                *self.reader_mut() = incoming;
-                let link_name = self.link().name().to_string();
-                let handle = session::allocate_link(
-                    self.session_control(),
-                    link_name,
-                    link_relay,
-                    self.session_stop_reason(),
-                )
-                .await?; // FIXME: cancel safe?
-                *self.link_mut().output_handle_mut() = Some(handle);
-                Ok(())
-            })
-            .await?
-    }
-}
-
-pub(crate) trait LinkEndpointInnerReattach
-where
-    Self: LinkEndpointInner + Send + Sync,
-    <Self::Link as LinkAttach>::AttachError: From<AllocLinkError> + Send + Sync,
-{
-    fn handle_reattach_outcome(
-        &mut self,
-        outcome: <Self::Link as LinkAttach>::AttachExchange,
-    ) -> Result<&mut Self, <Self::Link as LinkAttach>::AttachError>;
-
-    /// # Cancel safety
-    ///
-    /// This should be cancel safe if oneshot channel is cancel safe
-    async fn reattach_inner(
-        &mut self,
-    ) -> Result<&mut Self, <Self::Link as LinkAttach>::AttachError> {
-        let unsettled = self.link().unsettled().clone();
-        unsettled
-            .until_terminated(async {
-                self.reallocate_output_handle().await?; // FIXME: cancel safe? if oneshot channel is cancel safe
-                                                        // Cancel safe: the exchange only awaits on mpsc operations.
-                match self.exchange_attach(true).await {
-                    Ok(attach_exchange) => self.handle_reattach_outcome(attach_exchange),
-                    Err(attach_error) => Err(self.handle_attach_error(attach_error).await),
-                }
-            })
-            .await?
+        let capacity = session::link_incoming_capacity(
+            self.session_control(),
+            self.buffer_size(),
+            self.session_stop_reason(),
+        )
+        .await?;
+        let (tx, incoming) = mpsc::channel(capacity);
+        let link_relay = self.as_new_link_relay(tx);
+        *self.reader_mut() = incoming;
+        let link_name = self.link().name().to_string();
+        let handle = session::allocate_link(
+            self.session_control(),
+            link_name,
+            link_relay,
+            self.session_stop_reason(),
+        )
+        .await?;
+        *self.link_mut().output_handle_mut() = Some(handle);
+        Ok(())
     }
 }
 
@@ -145,7 +110,7 @@ where
 
 impl<T> LinkEndpointInnerDetach for T
 where
-    T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
+    T: LinkEndpointInner + Send + Sync,
     T::Link: LinkDetach<DetachError = DetachError>,
     <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
 {
@@ -306,11 +271,11 @@ where
 /// This is cancel safe if oneshot channel is cancel safe
 pub(super) async fn reattach_then_close<T>(link_inner: &mut T) -> Result<(), DetachError>
 where
-    T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
+    T: LinkEndpointInner + Send + Sync,
     T::Link: LinkDetach<DetachError = DetachError>,
     <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
 {
-    if let Err(_attach_error) = link_inner.reattach_inner().await {
+    if let Err(_attach_error) = reattach_for_close(link_inner).await {
         // The reattach that completes the AMQP 1.0 §2.6.6 handshake failed.
         // This helper is generic over the link type, so the concrete
         // `AttachError` cannot be inspected here and `DetachError` cannot
@@ -342,9 +307,6 @@ fn detach_error_from_stop_reason<T>(inner: &T) -> DetachError
 where
     T: LinkEndpointInner + ?Sized,
 {
-    if let Err(error) = inner.link().unsettled().check() {
-        return error.into();
-    }
     match inner.session_stop_reason().get() {
         Some(reason) => DetachError::SessionStopped(reason.clone()),
         None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
@@ -356,34 +318,27 @@ where
 /// This is cancel safe because it only `.await` on `recv()` from a `tokio::mpsc::Receiver`
 pub(super) async fn recv_remote_detach<T>(link_inner: &mut T) -> Result<Detach, DetachError>
 where
-    T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
+    T: LinkEndpointInner + Send + Sync,
     T::Link: LinkDetach<DetachError = DetachError>,
     <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
 {
-    let unsettled = link_inner.link().unsettled().clone();
-    unsettled
-        .until_terminated(async {
-            loop {
-                match link_inner
-                    .reader_mut()
-                    .recv()
-                    .await // cancel safe
-                    .ok_or_else(|| detach_error_from_stop_reason(link_inner))?
-                {
-                    LinkFrame::Detach(detach, _) => return Ok(detach),
-                    _frame => {
-                        // The only other frames should be Attach or Detach, (or Transfer if receiver).
-                        // Ignore all other frames
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("Non-detach frame received: {:?}", _frame);
-                        #[cfg(feature = "log")]
-                        log::debug!("Non-detach frame received: {:?}", _frame);
-                        continue;
-                    }
-                }
+    loop {
+        match link_inner
+            .reader_mut()
+            .recv()
+            .await
+            .ok_or_else(|| detach_error_from_stop_reason(link_inner))?
+        {
+            LinkFrame::Detach(detach, _) => return Ok(detach),
+            _frame => {
+                // A late Attach or admitted Transfer can precede the answer.
+                #[cfg(feature = "tracing")]
+                tracing::debug!("Non-detach frame received: {:?}", _frame);
+                #[cfg(feature = "log")]
+                log::debug!("Non-detach frame received: {:?}", _frame);
             }
-        })
-        .await?
+        }
+    }
 }
 
 /// Reallocate and validate an Attach without reconciling unsettled deliveries.
@@ -409,7 +364,7 @@ pub(super) async fn reattach_then_close_exact<T, F, G, E>(
     error: Option<definitions::Error>,
 ) -> Result<(), LinkExchangeError<<T::Link as LinkAttach>::AttachError, E>>
 where
-    T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
+    T: LinkEndpointInner + Send + Sync,
     T::Link: LinkDetach<DetachError = DetachError>,
     <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
     F: FnMut() -> Result<G, E> + Send,
@@ -442,7 +397,7 @@ pub(crate) async fn close_exact<T, F, G, E>(
     before: &mut F,
 ) -> Result<(), LinkExchangeError<<T::Link as LinkAttach>::AttachError, E>>
 where
-    T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
+    T: LinkEndpointInner + Send + Sync,
     T::Link: LinkDetach<DetachError = DetachError>,
     <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
     F: FnMut() -> Result<G, E> + Send,
@@ -506,7 +461,7 @@ pub(super) async fn detach_exact<T, F, G, E>(
     before: &mut F,
 ) -> Result<(), LinkExchangeError<<T::Link as LinkAttach>::AttachError, E>>
 where
-    T: LinkEndpointInner + LinkEndpointInnerReattach + Send + Sync,
+    T: LinkEndpointInner + Send + Sync,
     T::Link: LinkDetach<DetachError = DetachError>,
     <T::Link as LinkAttach>::AttachError: From<AllocLinkError> + Sync,
     F: FnMut() -> Result<G, E> + Send,

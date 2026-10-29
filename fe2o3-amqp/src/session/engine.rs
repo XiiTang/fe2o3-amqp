@@ -747,7 +747,10 @@ where
                     }
                     match self.on_error(&error).await {
                         Ok(running) => {
-                            if !matches!(outcome, Err(SessionInnerError::UnsettledCapacityExceeded(_))) {
+                            if !matches!(
+                                outcome,
+                                Err(SessionInnerError::UnsettledCapacityExceeded(_))
+                            ) {
                                 outcome = Err(error);
                             }
                             running
@@ -755,15 +758,20 @@ where
                         Err(cleanup_error) => {
                             // Exhaustion remains the terminal cause even if the peer
                             // disappears during the End exchange.
-                            if !matches!(outcome, Err(SessionInnerError::UnsettledCapacityExceeded(_))) {
-                            outcome = Err(
-                                if matches!(error, SessionInnerError::UnsettledCapacityExceeded(_))
-                                {
-                                    error
-                                } else {
-                                    cleanup_error
-                                },
-                            );
+                            if !matches!(
+                                outcome,
+                                Err(SessionInnerError::UnsettledCapacityExceeded(_))
+                            ) {
+                                outcome = Err(
+                                    if matches!(
+                                        error,
+                                        SessionInnerError::UnsettledCapacityExceeded(_)
+                                    ) {
+                                        error
+                                    } else {
+                                        cleanup_error
+                                    },
+                                );
                             }
                             Running::Stop
                         }

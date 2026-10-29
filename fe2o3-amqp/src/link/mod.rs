@@ -465,7 +465,6 @@ where
         closed: bool,
         error: Option<definitions::Error>,
     ) -> Result<(), Self::DetachError> {
-<<<<<<< HEAD
         // Preserve the attached state if queuing is cancelled or refused before dispatch.
         let next_state = match (&self.local_state, closed) {
             (
@@ -482,54 +481,26 @@ where
                     handle: handle.handle.clone().into(),
                     closed,
                     error,
-=======
-        let unsettled = self.unsettled.clone();
-        unsettled
-            .until_terminated(async {
-                // Preserve the attached state if queuing is cancelled or refused before dispatch.
-                let next_state = match (&self.local_state, closed) {
-                    (LinkState::Attached, false) => LinkState::DetachSent,
-                    (LinkState::Attached, true) => LinkState::CloseSent,
-                    _ => return Err(DetachError::IllegalState),
->>>>>>> 6ad35fee (Propagate unsettled termination through control and settlement waits)
                 };
 
-                match self.output_handle.clone() {
-                    Some(handle) => {
-                        let detach = Detach {
-                            handle: handle.handle.clone().into(),
-                            closed,
-                            error,
-                        };
+                #[cfg(feature = "tracing")]
+                tracing::debug!("Sending detach: {:?}", detach);
+                #[cfg(feature = "log")]
+                log::debug!("Sending detach: {:?}", detach);
 
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!("Sending detach: {:?}", detach);
-                        #[cfg(feature = "log")]
-                        log::debug!("Sending detach: {:?}", detach);
+                // An error here means the session is already closed, so we can't send a detach
+                writer
+                    .send(LinkFrame::Detach(detach, handle.id))
+                    .await // cancel safe
+                    .map_err(|_| match self.session_stop_reason.get() {
+                        Some(reason) => DetachError::SessionStopped(reason.clone()),
+                        None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                    })?;
 
-                        // An error here means the session is already closed, so we can't send a detach
-                        writer
-                            .send(LinkFrame::Detach(detach, handle.id))
-                            .await // cancel safe
-                            .map_err(|_| match self.session_stop_reason.get() {
-                                Some(reason) => DetachError::SessionStopped(reason.clone()),
-                                None => DetachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                            })?;
-
-                        self.local_state = next_state;
-                        if let Some(flag) = &self.operation_dispatch {
-                            flag.store(true, std::sync::atomic::Ordering::Release);
-                        }
-                        // Retain the identity while a non-closing Detach is in flight:
-                        // preceding Transfer frames still belong to this endpoint.
-                        if !matches!(self.local_state, LinkState::DetachSent) {
-                            self.output_handle.take();
-                        }
-                        Ok(())
-                    }
-                    None => Err(DetachError::IllegalState),
+                self.local_state = next_state;
+                if let Some(flag) = &self.operation_dispatch {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
                 }
-<<<<<<< HEAD
                 // The receiver must parse the original attachment's admitted
                 // prefix until its first native Detach, including after Close.
                 // Sender/controller close retain their existing release rule.
@@ -542,10 +513,6 @@ where
             }
             None => Err(DetachError::IllegalState),
         }
-=======
-            })
-            .await?
->>>>>>> 6ad35fee (Propagate unsettled termination through control and settlement waits)
     }
 
     /// See [`endpoint::LinkDetach::apply_remote_detach_outcome`] for the
@@ -679,14 +646,13 @@ impl LinkRelay<()> {
 }
 
 impl LinkRelay<OutputAttachment> {
-    pub(crate) async fn send(&mut self, frame: LinkFrame) -> Result<(), LinkRelayError> {
+    pub(crate) async fn send(
+        &mut self,
+        frame: LinkFrame,
+    ) -> Result<(), LinkRelayError> {
         match self {
-            LinkRelay::Sender { tx, unsettled, .. } => {
-                unsettled.until_terminated(tx.send(frame)).await?
-            }
-            LinkRelay::Receiver { tx, unsettled, .. } => {
-                unsettled.until_terminated(tx.send(frame)).await?
-            }
+            LinkRelay::Sender { tx, .. } => tx.send(frame).await,
+            LinkRelay::Receiver { tx, .. } => tx.send(frame).await,
         }
         .map_err(|_| LinkRelayError::UnattachedHandle)
     }

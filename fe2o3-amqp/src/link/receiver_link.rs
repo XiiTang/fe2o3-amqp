@@ -950,7 +950,6 @@ where
                     _ => return Err(ReceiverAttachError::NonAttachFrameReceived),
                 };
 
-<<<<<<< HEAD
         match purpose {
             AttachPurpose::Ordinary => {
                 endpoint::LinkAttach::on_incoming_attach(self, remote_attach)
@@ -960,84 +959,6 @@ where
                 Ok(ReceiverAttachExchange::Complete)
             }
         }
-=======
-                self.on_incoming_attach(remote_attach)
-            })
-            .await?
-    }
-
-    async fn handle_attach_error(
-        &mut self,
-        attach_error: ReceiverAttachError,
-        writer: &crate::session::transfer_queue::Sender,
-        reader: &mut mpsc::Receiver<LinkFrame>,
-        session: &mpsc::Sender<SessionControl>,
-    ) -> ReceiverAttachError {
-        let unsettled = self.unsettled.clone();
-        unsettled
-            .until_terminated(async {
-                match attach_error {
-                    // Errors that indicate failed attachment
-                    ReceiverAttachError::SessionStopped(_)
-                    | ReceiverAttachError::IllegalState
-                    | ReceiverAttachError::NonAttachFrameReceived
-                    | ReceiverAttachError::ExpectImmediateDetach
-                    | ReceiverAttachError::RemoteClosedWithError(_) => attach_error,
-
-                    ReceiverAttachError::DuplicatedLinkName => {
-                        let error = definitions::Error::new(
-                            SessionError::HandleInUse,
-                            "Link name is in use".to_string(),
-                            None,
-                        );
-                        session
-                            .send(SessionControl::End(Some(error)))
-                            .await
-                            .map(|_| attach_error)
-                            .unwrap_or(match self.session_stop_reason.get() {
-                                Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
-                                None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                            })
-                    }
-
-                    // ReceiverAttachError::SndSettleModeNotSupported
-                    ReceiverAttachError::IncomingSourceIsNone => {
-                        // Just send detach immediately
-                        let err = self
-                            .send_detach(writer, true, None)
-                            .await
-                            .map(|_| attach_error)
-                            .unwrap_or(match self.session_stop_reason.get() {
-                                Some(reason) => ReceiverAttachError::SessionStopped(reason.clone()),
-                                None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                            });
-                        recv_detach(self, reader, err).await
-                    }
-
-                    ReceiverAttachError::CoordinatorIsNotImplemented
-                    | ReceiverAttachError::InitialDeliveryCountIsNone
-                    | ReceiverAttachError::SourceAddressIsNoneWhenDynamicIsTrue
-                    | ReceiverAttachError::TargetAddressIsSomeWhenDynamicIsTrue
-                    | ReceiverAttachError::DynamicNodePropertiesIsSomeWhenDynamicIsFalse => {
-                        match (&attach_error).try_into() {
-                            Ok(error) => match self.send_detach(writer, true, Some(error)).await {
-                                Ok(_) => recv_detach(self, reader, attach_error).await,
-                                Err(_) => match self.session_stop_reason.get() {
-                                    Some(reason) => {
-                                        ReceiverAttachError::SessionStopped(reason.clone())
-                                    }
-                                    None => ReceiverAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                                },
-                            },
-                            Err(_) => attach_error,
-                        }
-                    }
-                    _ => attach_error,
-                }
-            })
-            .await
-            .unwrap_or_else(ReceiverAttachError::from)
->>>>>>> 6ad35fee (Propagate unsettled termination through control and settlement waits)
     }
 }
 

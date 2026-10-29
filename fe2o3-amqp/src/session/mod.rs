@@ -332,6 +332,14 @@ pub(crate) async fn allocate_link(
         .map_err(|_| AllocLinkError::SessionStopped(reason()))?
 }
 
+#[derive(Clone)]
+pub(crate) struct CapacityReporter(Arc<dyn Fn(&crate::link::UnsettledCapacityExceeded) + Send + Sync>);
+impl std::fmt::Debug for CapacityReporter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CapacityReporter")
+    }
+}
+
 /// AMQP1.0 Session
 ///
 /// # Begin a new Session with default configuration
@@ -369,6 +377,7 @@ pub(crate) async fn allocate_link(
 #[derive(Debug)]
 pub struct Session {
     pub(crate) outgoing_channel: OutgoingChannel,
+    pub(crate) unsettled_capacity_reporter: Option<CapacityReporter>,
 
     /// Why this session (or its connection) stopped, shared with the links
     /// and the session handle
@@ -687,6 +696,10 @@ impl endpoint::Session for Session {
 
     fn local_state(&self) -> &Self::State {
         &self.local_state
+    }
+
+    fn report_unsettled_capacity(&self, cause: &crate::link::UnsettledCapacityExceeded) {
+        if let Some(report) = &self.unsettled_capacity_reporter { (report.0)(cause); }
     }
 
     fn set_session_stop_reason(&mut self, reason: SessionStopReason) {

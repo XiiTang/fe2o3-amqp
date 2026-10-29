@@ -261,6 +261,7 @@ where
         payload: Payload,
         registration: Registration,
         dispatched: Option<&AtomicBool>,
+        #[cfg(feature = "transaction")] tracking: Option<&crate::transaction::ControlTracker>,
     ) -> Result<Option<DeliveryTag>, LinkStateError>
     where
         Fut: Future<Output = Option<LinkFrame>> + Send,
@@ -274,6 +275,8 @@ where
                 payload,
                 registration,
                 dispatched,
+                #[cfg(feature = "transaction")]
+                tracking,
             ))
             .await?
     }
@@ -1013,7 +1016,6 @@ where
 {
     type FlowState = SenderFlowState;
     type UnsettledEntry = UnsettledMessage;
-    type UnsettledEntry = UnsettledMessage;
     type Unsettled = ArcSenderUnsettledMap;
     type Target = T;
 
@@ -1100,63 +1102,57 @@ where
         reader: &mut mpsc::Receiver<LinkFrame>,
         session: &mpsc::Sender<SessionControl>,
     ) -> SenderAttachError {
-        let unsettled = self.unsettled.clone();
-        unsettled
-            .until_terminated(async {
-                match attach_error {
-                    SenderAttachError::UnsettledCapacityExceeded(_)
-                    | SenderAttachError::NativeBufferTooLarge
-                    | SenderAttachError::SessionStopped(_)
-                    | SenderAttachError::SessionNotMapped
-                    | SenderAttachError::IllegalState
-                    | SenderAttachError::NonAttachFrameReceived
-                    | SenderAttachError::ExpectImmediateDetach
-                    | SenderAttachError::RemoteClosedWithError(_) => attach_error,
+        match attach_error {
+            SenderAttachError::UnsettledCapacityExceeded(_)
+            | SenderAttachError::NativeBufferTooLarge
+            | SenderAttachError::SessionStopped(_)
+            | SenderAttachError::SessionNotMapped
+            | SenderAttachError::IllegalState
+            | SenderAttachError::NonAttachFrameReceived
+            | SenderAttachError::ExpectImmediateDetach
+            | SenderAttachError::RemoteClosedWithError(_) => attach_error,
 
-                    SenderAttachError::DuplicatedLinkName => {
-                        let error = definitions::Error::new(
-                            SessionError::HandleInUse,
-                            "Link name is in use".to_string(),
-                            None,
-                        );
-                        session
-                            .send(SessionControl::End(Some(error)))
-                            .await
-                            .map(|_| attach_error)
-                            .unwrap_or(match self.session_stop_reason.get() {
-                                Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
-                                None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                            })
-                    }
+            SenderAttachError::DuplicatedLinkName => {
+                let error = definitions::Error::new(
+                    SessionError::HandleInUse,
+                    "Link name is in use".to_string(),
+                    None,
+                );
+                session
+                    .send(SessionControl::End(Some(error)))
+                    .await
+                    .map(|_| attach_error)
+                    .unwrap_or(match self.session_stop_reason.get() {
+                        Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
+                        None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                    })
+            }
 
-                    SenderAttachError::SndSettleModeNotSupported
-                    | SenderAttachError::IncomingTargetIsNone => {
-                        // Just send detach immediately
-                        let err = self
-                            .send_detach(writer, true, None)
-                            .await
-                            .map(|_| attach_error)
-                            .unwrap_or(match self.session_stop_reason.get() {
-                                Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
-                                None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
-                            });
-                        recv_detach(self, reader, err).await
-                    }
+            SenderAttachError::SndSettleModeNotSupported
+            | SenderAttachError::IncomingTargetIsNone => {
+                // Just send detach immediately
+                let err = self
+                    .send_detach(writer, true, None)
+                    .await
+                    .map(|_| attach_error)
+                    .unwrap_or(match self.session_stop_reason.get() {
+                        Some(reason) => SenderAttachError::SessionStopped(reason.clone()),
+                        None => SenderAttachError::IllegalState, // defensive: no stop reason recorded; failure is link-local
+                    });
+                recv_detach(self, reader, err).await
+            }
 
-                    SenderAttachError::CoordinatorIsNotImplemented
-                    | SenderAttachError::SourceAddressIsSomeWhenDynamicIsTrue
-                    | SenderAttachError::TargetAddressIsNoneWhenDynamicIsTrue
-                    | SenderAttachError::DynamicNodePropertiesIsSomeWhenDynamicIsFalse => {
-                        try_detach_with_error(self, attach_error, writer, reader).await
-                    }
-                    #[cfg(feature = "transaction")]
-                    SenderAttachError::DesireTxnCapabilitiesNotSupported => {
-                        try_detach_with_error(self, attach_error, writer, reader).await
-                    }
-                }
-            })
-            .await
-            .unwrap_or_else(SenderAttachError::from)
+            SenderAttachError::CoordinatorIsNotImplemented
+            | SenderAttachError::SourceAddressIsSomeWhenDynamicIsTrue
+            | SenderAttachError::TargetAddressIsNoneWhenDynamicIsTrue
+            | SenderAttachError::DynamicNodePropertiesIsSomeWhenDynamicIsFalse => {
+                try_detach_with_error(self, attach_error, writer, reader).await
+            }
+            #[cfg(feature = "transaction")]
+            SenderAttachError::DesireTxnCapabilitiesNotSupported => {
+                try_detach_with_error(self, attach_error, writer, reader).await
+            }
+        }
     }
 }
 

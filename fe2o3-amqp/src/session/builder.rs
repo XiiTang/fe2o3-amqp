@@ -57,6 +57,8 @@ pub struct Builder {
     /// that are used by links attached to the session
     pub buffer_size: usize,
 
+    pub(crate) unsettled_capacity_reporter: Option<super::CapacityReporter>,
+
     /// Acceptor for incoming transaction control links
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(all(feature = "transaction", feature = "acceptor"))]
@@ -74,6 +76,7 @@ impl Default for Builder {
             desired_capabilities: None,
             properties: None,
             buffer_size: DEFAULT_SESSION_MUX_BUFFER_SIZE,
+            unsettled_capacity_reporter: None,
 
             #[cfg(not(target_arch = "wasm32"))]
             #[cfg(all(feature = "transaction", feature = "acceptor"))]
@@ -105,6 +108,7 @@ cfg_transaction! {
                     // control,
                     outgoing_channel,
                     session_stop_reason: Arc::new(OnceLock::new()),
+                    unsettled_capacity_reporter: self.unsettled_capacity_reporter,
                     connection_stop_reason,
                     local_state,
                     initial_outgoing_id: Constant::new(self.next_outgoing_id),
@@ -156,6 +160,7 @@ impl Builder {
         Session {
             outgoing_channel,
             session_stop_reason: Arc::new(OnceLock::new()),
+            unsettled_capacity_reporter: self.unsettled_capacity_reporter,
             connection_stop_reason,
             local_state,
             initial_outgoing_id: Constant::new(self.next_outgoing_id),
@@ -180,6 +185,16 @@ impl Builder {
             close_pending: HashSet::new(),
             delivery_tag_by_id: HashMap::new(),
         }
+    }
+
+    /// Report a typed retained-state refusal synchronously before this engine
+    /// writes its error End. The callback must not block or call native code.
+    pub fn unsettled_capacity_reporter(
+        mut self,
+        report: Arc<dyn Fn(&crate::link::UnsettledCapacityExceeded) + Send + Sync>,
+    ) -> Self {
+        self.unsettled_capacity_reporter = Some(super::CapacityReporter(report));
+        self
     }
 
     /// The transfer-id of the first transfer id the sender will send

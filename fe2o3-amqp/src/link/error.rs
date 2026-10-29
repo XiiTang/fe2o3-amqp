@@ -34,6 +34,8 @@ pub enum LinkExchangeError<A, E> {
 pub enum SessionStopReason {
     /// The owner stopped local processing without an End exchange.
     Stopped,
+    /// Retained state could not represent an admitted delivery/update.
+    UnsettledCapacityExceeded(super::UnsettledCapacityExceeded),
     /// The session ended cleanly (locally)
     Ended,
     /// We ended the session with this error

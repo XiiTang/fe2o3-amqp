@@ -37,6 +37,8 @@ pub(crate) trait Session {
     /// call is a no-op (the first recorded reason wins).
     fn set_session_stop_reason(&mut self, reason: SessionStopReason);
 
+    fn report_unsettled_capacity(&self, cause: &crate::link::UnsettledCapacityExceeded);
+
     /// The shared cell holding why the session (or its connection) stopped
     fn session_stop_reason(&self) -> &Arc<OnceLock<SessionStopReason>>;
 

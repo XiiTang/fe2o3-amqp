@@ -1926,7 +1926,7 @@ where
                         delivery_tag,
                         incomplete.section_number.unwrap_or(0),
                         incomplete.section_offset,
-                    )?;
+                    ).map_err(RecvError::from)?;
                 }
             }
             None => {
@@ -1945,7 +1945,7 @@ where
                         delivery_tag,
                         incomplete.section_number.unwrap_or(0),
                         incomplete.section_offset,
-                    )?;
+                    ).map_err(RecvError::from)?;
                 }
                 self.incomplete_transfer = Some(Box::new(incomplete));
             }
@@ -2212,7 +2212,7 @@ where
                             rcv_settle_mode: transfer.rcv_settle_mode.clone(),
                             _sealed: crate::util::Sealed {},
                         });
-                    })?.and_then(|entry| entry.info);
+                    }).map_err(RecvError::from)?.and_then(|entry| entry.info);
                 }
             }
             if transfer.aborted || transfer.settled == Some(true) {
@@ -2609,6 +2609,11 @@ impl From<ResumingReceiver> for Receiver {
 }
 
 impl DetachedReceiver {
+    /// Check the same retained Store without allocating or changing attachment.
+    pub fn check_unsettled(&self) -> Result<(), super::UnsettledCapacityExceeded> {
+        self.inner.link.unsettled().check()
+    }
+
     /// Resume with an explicit interruption future while retaining ownership.
     /// An interrupted admitted Attach completes upstream's nonclosing Detach
     /// cleanup before custody returns; an already Detached link sends nothing.
@@ -2932,10 +2937,10 @@ mod tests {
         seed_unsettled(inner.link.unsettled(), &[vec![9]]);
         let tag: DeliveryTag = vec![9].into();
         {
-            let mut guard = inner.link.unsettled().write();
-            let entry = guard.as_mut().unwrap().get_mut(&tag).unwrap();
-            entry.received = true;
-            entry.info = Some(make_delivery_info(1, tag.to_vec()));
+            inner.link.unsettled().update(&tag, |entry| {
+                entry.received = true;
+                entry.info = Some(make_delivery_info(1, tag.to_vec()));
+            }).unwrap();
         }
         let mut session = Builder::new().into_session(
             OutgoingChannel(0),
@@ -3023,15 +3028,7 @@ mod tests {
             seed_unsettled(inner.link.unsettled(), &[tag.to_vec()]);
             let info = make_delivery_info(42, tag.to_vec());
             {
-                inner
-                    .link
-                    .unsettled()
-                    .write()
-                    .as_mut()
-                    .unwrap()
-                    .get_mut(&tag)
-                    .unwrap()
-                    .info = Some(info.clone());
+                inner.link.unsettled().update(&tag, |entry| entry.info = Some(info.clone())).unwrap();
             }
             let state = if transactional {
                 #[cfg(feature = "transaction")]
@@ -3066,15 +3063,7 @@ mod tests {
             seed_unsettled(inner.link.unsettled(), &[tag.to_vec()]);
             let fresh = make_delivery_info(42, tag.to_vec());
             {
-                inner
-                    .link
-                    .unsettled()
-                    .write()
-                    .as_mut()
-                    .unwrap()
-                    .get_mut(&tag)
-                    .unwrap()
-                    .info = Some(fresh.clone());
+                inner.link.unsettled().update(&tag, |entry| entry.info = Some(fresh.clone())).unwrap();
             }
             assert!(matches!(
                 inner.dispose(info, None, state.clone()).await,
@@ -3628,14 +3617,10 @@ mod tests {
                 seed_unsettled(inner.link.unsettled(), &[vec![9]]);
                 let old = make_delivery_info(1, vec![9]);
                 {
-                    let mut guard = inner.link.unsettled().write();
-                    let entry = guard
-                        .as_mut()
-                        .unwrap()
-                        .get_mut(&DeliveryTag::from(vec![9]))
-                        .unwrap();
-                    entry.received = true;
-                    entry.info = Some(old.clone());
+                    inner.link.unsettled().update(&DeliveryTag::from(vec![9]), |entry| {
+                        entry.received = true;
+                        entry.info = Some(old.clone());
+                    }).unwrap();
                 }
                 let mut receiver = Receiver { inner };
                 if mode == 1 {
@@ -5777,7 +5762,7 @@ mod tests {
             )
             .unwrap();
         let stop = inner.link.session_stop_reason.clone();
-        let receive = inner.recv_inner::<String>();
+        let receive = inner.recv::<String>();
         let mut receive = Box::pin(receive);
         assert!(futures_util::poll!(&mut receive).is_pending());
         // Force the relay's insertion failure and its subsequent normal session end.
@@ -5798,7 +5783,7 @@ mod tests {
         drop(incoming);
         let result = receive.await;
         assert_recv_capacity(result.unwrap_err(), &cause);
-        assert_recv_capacity(inner.recv_inner::<String>().await.unwrap_err(), &cause);
+        assert_recv_capacity(inner.recv::<String>().await.unwrap_err(), &cause);
     }
 
     #[tokio::test]
@@ -5809,7 +5794,7 @@ mod tests {
         let (mut inner, _session, _outgoing, _incoming) = make_receiver_inner_with_channels(4096);
         let store = Arc::new(Store::new(None, Some(UnsettledLimits::new(0, 32))).unwrap());
         inner.link.unsettled = store.clone();
-        let mut waiting = Box::pin(inner.recv_inner::<String>());
+        let mut waiting = Box::pin(inner.recv::<String>());
         assert!(futures_util::poll!(&mut waiting).is_pending());
         let cause = store
             .insert(vec![1].into(), ReceiverDelivery::new(None))

@@ -677,7 +677,7 @@ mod tests {
                             .recv_timeout(std::time::Duration::from_secs(10))
                             .unwrap();
                     }));
-                    let store = Arc::new(Store::new(None));
+                    let store = Arc::new(Store::new(None, None).unwrap());
                     let tag: fe2o3_amqp_types::definitions::DeliveryTag = vec![7].into();
                     store
                         .register(
@@ -821,7 +821,7 @@ mod tests {
             drain: false,
             properties: None,
         }));
-        let store = Arc::new(Store::new(None));
+        let store = Arc::new(Store::new(None, None).unwrap());
         let coordinator = Coordinator {
             capabilities: Some(
                 vec![fe2o3_amqp_types::transaction::TxnCapability::DistributedTransactions].into(),

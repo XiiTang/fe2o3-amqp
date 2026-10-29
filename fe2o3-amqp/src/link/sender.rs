@@ -1201,6 +1201,11 @@ macro_rules! try_as_sender {
 }
 
 impl DetachedSender {
+    /// Check the same retained Store without allocating or changing attachment.
+    pub fn check_unsettled(&self) -> Result<(), super::UnsettledCapacityExceeded> {
+        self.inner.link.unsettled().check()
+    }
+
     /// Resume with an explicit interruption future, returning the native endpoint.
     /// An interrupted admitted Attach completes upstream's nonclosing Detach
     /// cleanup before custody returns; an already Detached link sends nothing.
@@ -2829,6 +2834,8 @@ mod tests {
                     0,
                     transfer,
                     Payload::from(vec![0; 1024]),
+                    None,
+                    #[cfg(feature = "transaction")]
                     None,
                 );
                 assert_cap_interrupts_handoff(store, send).await;

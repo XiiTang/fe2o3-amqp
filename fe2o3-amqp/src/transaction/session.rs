@@ -238,6 +238,10 @@ where
         self.session.local_state()
     }
 
+    fn report_unsettled_capacity(&self, cause: &crate::link::UnsettledCapacityExceeded) {
+        self.session.report_unsettled_capacity(cause)
+    }
+
     fn set_session_stop_reason(&mut self, reason: SessionStopReason) {
         self.session.set_session_stop_reason(reason)
     }

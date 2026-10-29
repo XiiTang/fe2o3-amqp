@@ -1088,3 +1088,50 @@ SIGABRT from stack overflow) and passes all six tests after (exit 0), using the
 same test stack configuration. No test assertion or stack setting was changed.
 macOS arm64 / Rust 1.98.1. This is a regression of the new terminal guard;
 W4e's commits and detach routing remain unchanged.
+
+
+## W17c2 port status — incomplete, blocked on crossed cleanup passage
+
+This work branch starts at ea211cd459f12c61f942e1c01ca01e26f64b39cf.
+Historical validation above belongs to its named historical revisions, not this
+port. Current committed tip is 1a488e498b70c2961398bf04e69893eb753f4396;
+the reporter/preflight and D1 reconciliation edits remain uncommitted. This is
+not a review-ready pin and must not be fast-forwarded to boundless.
+
+Upstream 8fd06bc3 sender timed resume calls detach_with_error(None) after its
+actual timeout. Upstream shared_inner::detach_with_error handles a crossed
+closing Detach by reattach_then_close, which uses ordinary Attach reconciliation.
+Pin ea211cd4 preserves that behavior and extends cleanup to the ownership-returning
+interruption entries, including admitted half-open Attach. That native custody,
+late-answer routing, actual cleanup error and explicit-retry behavior must remain.
+The old cap line cancels recv_remote_detach and ordinary reattachment on Store
+termination. It cannot be replayed as a compliant cleanup policy. The consuming
+READY design requires admitted cleanup to complete, but does not select the
+ordinary-versus-CloseOnly reconciliation passage for this crossed case. No new
+passage has been selected here. Both old cap_control_detach_wait tests still
+assert the superseded early-refusal behavior; their passing result is not
+compliance evidence. The consumer implementation report records the blocking
+question and the remaining native/adapter regressions.
+
+The work in progress ports W4e answer dispositions before Store limits, retains
+D1's ControlTracker receipt-before-notification, introduces the private Store
+mutation transaction and irreversible typed cause, and adds the reviewed
+construction-bound Session reporter and read-only detached recovery checks.
+Required pending error-path validation includes incoming Flow/Transfer/Disposition
+capacity, report-before-End attribution, interrupted/timed late-answer cleanup,
+and actual Boundless source joins. No new sibling-preservation policy is included.
+
+Focused interim commands on macOS Darwin 27.2.0 arm64 / Rust 1.97.0, all through
+build-slot, with untracked local Cargo.lock selecting tokio-util 0.7.19:
+
+| Command | Exit | Limited result |
+| --- | ---: | --- |
+| cargo test -p fe2o3-amqp --features transaction,acceptor --lib completion | 101 then 0 | First compile had porting fixture errors and latest tokio-util codec ambiguity; after fixture fixes/local lock selection, 5 tests passed before the cap port. |
+| cargo update -p tokio-util --precise 0.7.19 | 0 | Local lock only; no manifest or transport workaround. |
+| cargo test -p fe2o3-amqp --features transaction,acceptor --lib unsettled_store | 101 then 0 | First cap compile had old/new API and fixture mismatches; corrected working tree passed 5 Store tests. |
+| cargo test -p fe2o3-amqp --features transaction,acceptor --lib link::receiver::tests:: | 0 | 59 passed, including an old Detach-cap assertion that must be rewritten. |
+| cargo test -p fe2o3-amqp --features transaction,acceptor --lib link::sender::tests:: | 0 | 30 passed, including the corresponding old Detach-cap assertion. |
+
+Strict Clippy, fmt, native integration regressions and Boundless checks have not
+run. Exact commands/exit codes and logs are held by the consuming implementation
+report. No push or boundless-branch movement was performed.

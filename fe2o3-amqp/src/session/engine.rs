@@ -495,7 +495,8 @@ where
         use fe2o3_amqp_types::transaction::TransactionError;
 
         match kind {
-            SessionInnerError::UnsettledCapacityExceeded(_) => {
+            SessionInnerError::UnsettledCapacityExceeded(cause) => {
+                self.session.report_unsettled_capacity(cause);
                 self.end_session(Some(Error::new(
                     AmqpError::ResourceLimitExceeded,
                     None,
@@ -746,12 +747,15 @@ where
                     }
                     match self.on_error(&error).await {
                         Ok(running) => {
-                            outcome = Err(error);
+                            if !matches!(outcome, Err(SessionInnerError::UnsettledCapacityExceeded(_))) {
+                                outcome = Err(error);
+                            }
                             running
                         }
                         Err(cleanup_error) => {
                             // Exhaustion remains the terminal cause even if the peer
                             // disappears during the End exchange.
+                            if !matches!(outcome, Err(SessionInnerError::UnsettledCapacityExceeded(_))) {
                             outcome = Err(
                                 if matches!(error, SessionInnerError::UnsettledCapacityExceeded(_))
                                 {
@@ -760,6 +764,7 @@ where
                                     cleanup_error
                                 },
                             );
+                            }
                             Running::Stop
                         }
                     }
@@ -786,12 +791,8 @@ where
                 SessionStopReason::RemoteEndedWithError(error.clone())
             }
             Err(SessionInnerError::RemoteEnded) => SessionStopReason::RemoteEnded,
-            Err(SessionInnerError::UnsettledCapacityExceeded(_)) => {
-                SessionStopReason::EndedWithError(fe2o3_amqp_types::definitions::Error::new(
-                    AmqpError::ResourceLimitExceeded,
-                    None,
-                    None,
-                ))
+            Err(SessionInnerError::UnsettledCapacityExceeded(cause)) => {
+                SessionStopReason::UnsettledCapacityExceeded(cause.clone())
             }
             _ => SessionStopReason::Ended,
         };
@@ -1384,7 +1385,7 @@ mod refused_transfer_tests {
         );
         native.remote_outgoing_window = 1;
         let (link_tx, mut link_rx) = mpsc::channel(2);
-        let store = Arc::new(Store::new(None));
+        let store = Arc::new(Store::new(None, None).unwrap());
         let flow = Arc::new(LinkFlowState::receiver(LinkFlowStateInner {
             initial_delivery_count: 0,
             delivery_count: 0,

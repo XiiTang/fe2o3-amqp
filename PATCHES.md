@@ -1235,3 +1235,23 @@ other delivery's cap: its direct peer evidence is preserved. Only map-derived
 retention decisions use the post-query latch check. The cap selection rerun
 (24 tests), strict Clippy including test-util, and fmt all exit 0 after this
 clarification; the sender/receiver module selections above remain unchanged.
+
+Reproducible functional source tip:
+`c3885f787db9d633b7aa996f67e65b2b54b289d8`, with
+`fe2o3-amqp/` tree `4bdbde6b5c3942452e36c4eb196c56f80e5aac11`.
+The final evidence commit changes only this record. Omitting only the StateOnly
+post-query check at that tip independently reproduces StateOnly(retained=false)
+after purge (the same parser regression exits 101); restoring the tip passes
+(exit 0). The three-arm parser test includes both cap-purged absence queries
+and the directly parsed settled Transfer.
+
+Consumer regressions at this functional tip also pass (exit 0, macOS arm64):
+`resumed_parser_cap_purge_keeps_the_original_receipt_failure` drives both real
+resumed-parser queries with Session reporting held, and checks original receipt,
+canonical typed failure and child-record attribution.
+`completed_sender_handoff_keeps_its_confirmed_outcome_across_cap` confirms A,
+exhausts B through real Received growth, publishes the Session failure while A
+is held, and retains one Accepted under A's original operation/delivery identity.
+The fixture holds B's separate source cleanup until the native error End has
+consumed its real reply, so it exercises the handoff/result boundary without
+also stopping the Session during that independent exchange.

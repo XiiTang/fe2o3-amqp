@@ -2238,16 +2238,22 @@ where
             }
             #[cfg(any(test, feature = "test-util"))]
             self.link.unsettled().test_hook(1);
-            let retained = transfer.delivery_tag.as_ref().is_some_and(|tag| {
-                self.link
-                    .unsettled()
-                    .read()
-                    .as_ref()
-                    .is_some_and(|map| map.contains_key(tag))
-            });
-            // Retention is map-derived. Check the irreversible cause before
-            // the observer can retire a public receipt from an absent binding.
-            self.link.unsettled().check().map_err(RecvError::from)?;
+            let retained = if transfer.settled == Some(true) {
+                // The actual parsed settlement above removed this tag. A later
+                // cap of another delivery cannot erase that peer knowledge.
+                false
+            } else {
+                let retained = transfer.delivery_tag.as_ref().is_some_and(|tag| {
+                    self.link
+                        .unsettled()
+                        .read()
+                        .as_ref()
+                        .is_some_and(|map| map.contains_key(tag))
+                });
+                // Only this branch derives completion from map absence.
+                self.link.unsettled().check().map_err(RecvError::from)?;
+                retained
+            };
             commit.commit(
                 ReceiverTransferEffect::StateOnly {
                     info,
@@ -2943,7 +2949,7 @@ mod tests {
         use crate::link::{
             receiver_delivery::ReceiverDelivery, unsettled_store::Store, UnsettledLimits,
         };
-        for retained_query in [false, true] {
+        for (retained_query, peer_settled) in [(false, false), (true, false), (true, true)] {
             let (mut inner, _control, _outgoing, incoming) =
                 make_receiver_inner_with_channels(4096);
             let store = Arc::new(Store::new(None, Some(UnsettledLimits::new(2, 64))).unwrap());
@@ -2985,6 +2991,7 @@ mod tests {
             });
             let mut resumed = make_incoming_transfer(9, Some(tag.to_vec()), false, false);
             resumed.resume = true;
+            resumed.settled = Some(peer_settled);
             incoming
                 .send(queued_transfer(resumed, Payload::new()))
                 .await
@@ -2997,11 +3004,21 @@ mod tests {
                 .unwrap_err();
             assert_recv_capacity(error, &store.check().unwrap_err());
             assert_eq!(progress.steps.len(), 1);
-            assert!(
-                matches!(progress.steps[0].effect(), ReceiverTransferEffect::Failed),
-                "{retained_query}: {:?}",
-                progress.steps
-            );
+            if peer_settled {
+                assert!(matches!(
+                    progress.steps[0].effect(),
+                    ReceiverTransferEffect::StateOnly {
+                        retained: false,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(
+                    matches!(progress.steps[0].effect(), ReceiverTransferEffect::Failed),
+                    "{retained_query}: {:?}",
+                    progress.steps
+                );
+            }
         }
     }
 

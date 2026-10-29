@@ -1216,8 +1216,9 @@ Ignored instead of Failed (exit 101). `completed_handoff_keeps_accepted_before_a
 holds the final handoff, confirms A, then grows B's actual Received state; the
 old guard drops A's ready outcome with UnsettledCapacityExceeded (exit 101).
 The existing pending-credit, queue and fragment cap tests continue to pass.
-The optional `test-util` feature exposes only one-shot, lock-free callback
-checkpoints at these exact boundaries for consumer effect regressions; normal
+The optional `test-util` feature exposes only one-shot callback
+checkpoints outside Store locks at these exact boundaries for consumer effect
+regressions; normal
 builds contain neither the callbacks nor their storage.
 
 Validation on macOS arm64, Rust 1.97.0, from c129a992 plus this change, all via
@@ -1228,3 +1229,9 @@ build-slot (exit 0):
 - `cargo test -p fe2o3-amqp --lib --features transaction,acceptor,test-util -- link::sender::tests::`: 30 passed.
 - `cargo clippy -p fe2o3-amqp --lib --tests --features transaction,acceptor,test-util -- -D warnings`.
 - `cargo fmt --all --check`.
+
+The StateOnly regression also confirms a parsed settled Transfer before the
+other delivery's cap: its direct peer evidence is preserved. Only map-derived
+retention decisions use the post-query latch check. The cap selection rerun
+(24 tests), strict Clippy including test-util, and fmt all exit 0 after this
+clarification; the sender/receiver module selections above remain unchanged.

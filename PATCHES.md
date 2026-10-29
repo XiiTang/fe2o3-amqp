@@ -1146,8 +1146,9 @@ resume, pre-dispatch and actual peer cleanup-error arms remain. Both old endpoin
 Detach-cap early-return tests and obsolete relay early-drop assertions are gone;
 no ordering-only replacements were added.
 
-Validated source tip: 2dd8f15a. On macOS Darwin 27.2.0 arm64 / Rust 1.97.0,
-all following commands ran through build-slot and exited 0:
+Validated source tip: 2dd8f15a. On macOS Darwin 27.2.0 arm64, the following
+commands ran through build-slot. Tests and strict Clippy use Rust 1.97.0;
+the formatting row states its separate toolchain.
 
 | cargo arguments | Result |
 | --- | --- |
@@ -1159,7 +1160,7 @@ all following commands ran through build-slot and exited 0:
 | test -p fe2o3-amqp --features transaction,acceptor --test detached_link_frames | 7 passed |
 | test -p fe2o3-amqp --features transaction,acceptor --test unsettled_limits | 1 passed |
 | clippy -p fe2o3-amqp --features transaction,acceptor --lib --tests -- -D warnings | passed |
-| fmt --all --check | passed |
+| fmt --all --check | exit 0 on default Rust 1.98.1; pinned 1.97.0 formatting recheck pending |
 
 The A6 regression fails (exit 101, "Store exhaustion cancelled admitted cleanup")
 when the old `recv_remote_detach` Store race is restored temporarily; restoring
@@ -1178,3 +1179,7 @@ port fixture mismatches and latest tokio-util codec ambiguity; the pinned focuse
 results above supersede those failures. The consuming implementation ledger
 retains the exact command/exit logs. This documentation-only evidence commit
 follows the tested source tip; no push or boundless-branch movement occurred.
+
+Consumer implementation stopped on its required disk preflight at 29 GiB free
+on 2026-10-29. The pinned formatter recheck is not claimed complete. No additional
+compile/check or cleanup deletion was attempted after that stop.

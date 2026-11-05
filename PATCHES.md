@@ -495,6 +495,19 @@ flags, genuinely fragmented controls and answer-before-oneshot gates. The
 controller regression invokes its public retained exact close. Native gates
 and queues force the interleavings; no sleeping supplies an assertion.
 
+Test feature-selection correction (2026-11-05): the receiver tests added by
+`3455283d` used the production transaction-only `AmqpError` import and relied
+on the transactional branch to infer a delivery state's type. Qualify the
+test's error through `definitions`, as upstream `33d0a295`'s receiver tests do,
+and annotate `DeliveryState`; keep the ordinary disposition case enabled
+without transactions. No production code or test assertions change. At
+`b8f7b3cf`, `cargo test -p fe2o3-amqp --no-default-features --lib` fails to
+compile (exit 101); with this correction and the W17c test correction below,
+it passes 192 tests on macOS arm64 / Rust 1.97.0 (exit 0). With
+`--features transaction,acceptor --lib`, the `link::receiver::tests::`,
+`end_drain_tests::` and `cleanup_capacity_tests::` selections pass 59, 3 and 1
+tests respectively (exit 0 each); `cargo fmt --all --check` also passes.
+
 ### Receiver Close preserves the admitted prefix (necessity correction)
 
 `Receiver::close_in_place_exact<T,O,F,G,E>(&mut self,peer_suspended:bool,
@@ -1220,6 +1233,15 @@ The optional `test-util` feature exposes only one-shot callback
 checkpoints outside Store locks at these exact boundaries for consumer effect
 regressions; normal
 builds contain neither the callbacks nor their storage.
+
+Test feature-selection correction (2026-11-05):
+`cap_purge_cannot_commit_absence_as_peer_recovery`, added by fork commit
+`f8594178`, also borrowed the production transaction-only `AmqpError` import.
+Use `definitions::AmqpError` inside the test, following upstream `33d0a295`'s
+receiver tests. The regression remains enabled without optional features;
+production code and assertions are unchanged. It passes in both the 192-test
+no-default-features library suite and the 59-test transaction/acceptor receiver
+selection recorded under the exact-link-end patch above (exit 0 each).
 
 Validation on macOS arm64, Rust 1.97.0, from c129a992 plus this change, all via
 build-slot (exit 0):

@@ -2975,7 +2975,7 @@ mod tests {
                 // the parser is between its outer check and the queried effect.
                 let state = fe2o3_amqp_types::messaging::Rejected {
                     error: Some(definitions::Error::new(
-                        AmqpError::InternalError,
+                        definitions::AmqpError::InternalError,
                         Some("x".repeat(128)),
                         None,
                     )),
@@ -3134,7 +3134,7 @@ mod tests {
                     .update(&tag, |entry| entry.info = Some(info.clone()))
                     .unwrap();
             }
-            let state = if transactional {
+            let state: DeliveryState = if transactional {
                 #[cfg(feature = "transaction")]
                 {
                     DeliveryState::TransactionalState(
@@ -3897,8 +3897,8 @@ mod tests {
                     .session_stop_reason
                     .set(SessionStopReason::Stopped)
                     .unwrap();
-                let error =
-                    with_error.then(|| definitions::Error::new(AmqpError::NotFound, None, None));
+                let error = with_error
+                    .then(|| definitions::Error::new(definitions::AmqpError::NotFound, None, None));
                 incoming
                     .send(LinkFrame::Detach(
                         Detach {

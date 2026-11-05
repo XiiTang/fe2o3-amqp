@@ -1255,3 +1255,111 @@ is held, and retains one Accepted under A's original operation/delivery identity
 The fixture holds B's separate source cleanup until the native error End has
 consumed its real reply, so it exercises the handoff/result boundary without
 also stopping the Session during that independent exchange.
+
+## Discard crossing input through the actual Session End (Boundless #490)
+
+A receiver Store cap selected a local resource-limit End, but the initial
+Mapped-to-Discarding path still dispatched queued input while waiting for the
+peer. A second Transfer into the failed Store ended the native receiver before
+the peer End. The Connection still routed that End to the original relay;
+its dead receiver then failed the Connection and healthy sibling Sessions.
+Boundless `NativeSource::capacity_failed` and `SessionNative::join_with` rely on
+this native exchange completing. Their physical fallback for a genuinely
+unfinished boundary remains necessary and unchanged.
+
+Use the existing private `SessionEngine::wait_for_remote_end` as the one owned
+error-End drain. Mapped error, error after an earlier normal EndSent, explicit
+error-End control and closed-control Discarding teardown all enter it. No
+non-End input reaches a link handler while it waits; consume and apply the
+actual peer End before completion. EndSent error changes the outstanding wait
+without sending a second End. The input receiver is private to the engine
+module; listener construction moves there unchanged, preserving its original
+acceptor/non-wasm gates. No receiver accessor, parallel dispatch guard, public
+API, new queue or outcome owner is added.
+
+The class includes Transfer into a failed receiver Store, link Flow into a
+failed sender Store, and Disposition with a retained delivery route into either
+failed Store. Session-only Flow and unmatched Disposition do not establish those
+Store-failure paths. Plain Session, ListenerSession, TxnSession<Session> and
+TxnSession<ListenerSession> share this engine and delegate End to the same
+Session implementation. Connection engine Discarding is not an instance: its
+existing non-Close guard already discards before dispatch and is unchanged.
+
+### Upstream comparison
+
+Read upstream `33d0a2958abbe89aca2c60f09de6ea3ab2afbd69` and current upstream main
+`df8c73b43e5b65ea61a7d9189f9bae3590653100`. The Session engine, Session and
+listener files below are identical between those revisions. Paths are relative
+to `fe2o3-amqp/src/`; quoted excerpts and lines describe both upstream objects.
+This is an upstream drain defect reached here by the fork's unsettled cap;
+upstream has not supplied the required behavior.
+
+| Path | Upstream code / behavior | This patch |
+| --- | --- | --- |
+| Mapped error End | `session/mod.rs:1056-1058`: `SessionState::Mapped => match error.is_some() { true => self.local_state = SessionState::Discarding, false => self.local_state = SessionState::EndSent, },`. Engine `:543-552` calls `.send_end(&self.outgoing, error)` then `let (channel, end) = self.wait_for_remote_end(false).await?;` and `self.session.on_incoming_end(channel, end)?;`. | Select discard for error End, retaining send/error handling. Keep the fork's stronger state commit only after queue admission. |
+| Error after EndSent | `session/engine.rs:554-556`: `SessionState::EndSent => { self.wait_for_remote_end(false).await?; }`. | Discard for error-driven entry, keep normal dispatch otherwise; apply the returned End and preserve a real peer error. Never retransmit End. |
+| Explicit error-End control | `session/engine.rs:309-322`: `SessionControl::End(error) => {` publishes stop reason, calls `self.outgoing_link_frames.close();`, drains buffered output, then `self.session.send_end(&self.outgoing, error).await?;`. Ordinary event-loop dispatch resumes. | Keep stop publication and output close/drain. Route `Some(error)` through `end_session` and its owned wait. `None` retains ordinary normal-End processing. Public `end_with_error` and duplicate-name controls use this entry. |
+| Existing Discarding wait | `session/engine.rs:567-572` calls `self.wait_for_remote_end(true).await?;` but ignores its End. The drain at `:591-594` returns `SessionFrameBody::End(end) => return Ok((IncomingChannel(frame.channel), end)),` and dispatches other input only under `if !discard_other_frame`. | Keep that receive/match as the sole error-End drain; apply its End once before stopping. |
+| Dropped-control teardown | `session/engine.rs:660-663`: `SessionState::Discarding | SessionState::EndSent => { match self.incoming.recv().await { Some(incoming) => { let _ = self.on_incoming(incoming).await; },`. | Delegate Discarding to the same owned drain. Keep ordinary EndSent teardown and its existing error disposition. |
+| Receiver / listener construction | `session/engine.rs:65,69`: `pub(crate) struct SessionEngine<S: Session>` has `pub incoming: mpsc::Receiver<SessionIncomingItem>,`. `acceptor/session.rs:372-379` constructs `Self { conn_control, session, control, incoming, outgoing, outgoing_link_frames, }`. | Private receiver and engine-owned listener construction; preserve Begin and all wrapper behavior. |
+| Cancellation, timeout and retry | A SessionHandle sends End control and waits on `on_end`; leaving its waiter does not retract the control. The engine owns the exchange. There is no built-in End retry or new drain deadline. | Kept. No cancellation, timeout, retry or adapter fallback change. Real input closure/transport failure and error-bearing peer End still retain their native meanings; the existing event-loop first-cap selection stays first. |
+
+Lifetime comparison: qpid-proton
+`3f263156a9a4ea3fd3c2eb78dbd796314958fd0b`,
+`c/src/core/transport.c::pni_process_ssn_teardown:2537-2553` sends End and unmaps
+only the local channel; `pn_do_end:1810-1825` keeps the remote channel until
+actual peer End. This supports keeping the original relay boundary; it is not
+a claim that Proton uses the same discard implementation.
+
+### Regression evidence
+
+`session::engine::end_drain_tests::error_end_discards_crossing_frames_until_peer_end`
+uses real Session/relays and Store admission exceeding maximum 1 with observed
+2. Its 32 cases combine the four entries, Transfer/Flow/both-role Disposition,
+and normal/error peer End. Receipt of local End gates FIFO crossing input and
+withholds peer End. Manual polling proves the native exchange remains pending;
+a healthy link's queued Accepted result must not dispatch or produce output.
+Actual peer End completes the exchange, no second End is sent, and the original
+typed cap remains the native result of cap-driven entries. Each exchange has
+its own task/cooperative budget, so a scheduler yield cannot stand in for the
+peer-End barrier. No sleep or product test hook is added.
+
+`normal_end_keeps_a_crossing_accepted_result` confirms an actual Accepted result
+crossing normal End still reaches its completion, with normal/error peer End.
+`end_drain_applies_the_actual_peer_end` covers normal EndSent and Discarding,
+including real peer errors and the completed Session transition.
+
+On macOS Darwin 27.2.0 arm64, Rust 1.97.0, this patch on base
+`c05d64575a38542b8d7976b644366d1e1f3535c9` passed the following targeted commands
+(exit 0 each). The existing untracked fork lock selects tokio-util 0.7.19,
+matching the consumer; no lock, manifest override or transport workaround is
+committed. These are fork-local checks; consumer/pool verification follows the
+owner's publication of the work branch.
+
+```sh
+cargo +1.97.0 test -p fe2o3-amqp --features transaction,acceptor --lib end_drain_tests::
+cargo +1.97.0 test -p fe2o3-amqp --features transaction,acceptor --lib session::
+cargo +1.97.0 test -p fe2o3-amqp --features transaction,acceptor --lib cleanup_capacity_tests::
+cargo +1.97.0 test -p fe2o3-amqp --features transaction,acceptor --test clean_teardown --test link_stop_reason --test detached_link_frames --test engine_first_failure --test unsettled_limits
+cargo +1.97.0 fmt --all --check
+```
+
+The new fixture's three tests pass; the Session selection includes them in its
+24 passing tests. The crossed-cleanup capacity selection passes 1, and the five
+integration binaries pass 27 (4/7/5/10/1). This is targeted evidence, not a
+whole-crate or cross-platform acceptance result. Five temporary negative
+controls each fail with exit 101: restoring Mapped or EndSent dispatch ends the
+engine before peer End; restoring explicit-control dispatch substitutes a Store
+cap; restoring Discarding teardown dispatch delivers the forbidden Accepted;
+omitting peer-End application fails to unmap the Session. Every control was
+removed before the final passing selections. Initial fixture development found
+a private receiver-type import, closed-channel expectations after engine Drop,
+and cooperative-budget interference; those fixture issues were corrected.
+
+An additional `cargo +1.97.0 test -p fe2o3-amqp --no-default-features --lib end_drain_tests::`
+compile fails with exit 101 in unchanged receiver tests: missing `AmqpError` at
+`link/receiver.rs:2978,3901` and ambiguous `state` at `:3137`. Restoring both
+changed source files to unmodified c05d6457 reproduces the same three errors
+(exit 101). This pre-existing feature-selection test defect is not repaired or
+counted as a pass. Strict Clippy and Boundless consumer checks are not claimed
+by this fork-test step.

@@ -63,7 +63,7 @@ pub(crate) struct SessionEngine<S: Session> {
     pub conn_control: mpsc::Sender<ConnectionControl>,
     pub session: S,
     pub control: mpsc::Receiver<SessionControl>,
-    pub incoming: mpsc::Receiver<SessionIncomingItem>,
+    incoming: mpsc::Receiver<SessionIncomingItem>,
     pub outgoing: mpsc::Sender<SessionFrame>,
 
     pub(crate) retired_allocations: crate::completion::Retired<crate::endpoint::OutputAttachment>,
@@ -116,6 +116,41 @@ where
             _ => return Err(BeginError::IllegalState),
         };
         engine.session.on_incoming_begin(channel, remote_begin)?;
+        Ok(engine)
+    }
+}
+
+#[cfg(all(feature = "acceptor", not(target_arch = "wasm32")))]
+impl<S> SessionEngine<S>
+where
+    S: crate::acceptor::session::ListenerSessionEndpoint + endpoint::SessionEndpoint,
+    BeginError: From<S::BeginError>,
+{
+    #[allow(clippy::too_many_arguments)]
+    pub async fn begin_listener_session(
+        conn_control: mpsc::Sender<ConnectionControl>,
+        session: S,
+        control: mpsc::Receiver<SessionControl>,
+        incoming: mpsc::Receiver<SessionIncomingItem>,
+        outgoing: mpsc::Sender<SessionFrame>,
+        outgoing_link_frames: mpsc::Receiver<LinkFrame>,
+    ) -> Result<Self, BeginError> {
+        #[cfg(feature = "tracing")]
+        tracing::trace!("Instantiating session engine");
+        #[cfg(feature = "log")]
+        log::trace!("Instantiating session engine");
+        let mut engine = Self {
+            conn_control,
+            session,
+            control,
+            incoming,
+            outgoing,
+            retired_allocations: Default::default(),
+            outgoing_link_frames,
+        };
+
+        // send a begin
+        engine.session.send_begin(&engine.outgoing).await?;
         Ok(engine)
     }
 }
@@ -325,6 +360,9 @@ where
                     self.on_outgoing_link_frames(frame).await?;
                 }
 
+                if error.is_some() {
+                    return self.end_session(error).await;
+                }
                 self.session.send_end(&self.outgoing, error).await?;
             }
             SessionControl::AllocateLink {
@@ -568,6 +606,7 @@ where
         &mut self,
         error: Option<definitions::Error>,
     ) -> Result<Running, SessionInnerError> {
+        let discard_other_frames = error.is_some();
         match self.session.local_state() {
             SessionState::Unmapped => {}
             SessionState::BeginSent | SessionState::BeginReceived | SessionState::Mapped => {
@@ -579,11 +618,14 @@ where
                             self.session.connection_stop_reason(),
                         ))
                     })?;
-                let (channel, end) = self.wait_for_remote_end(false).await?;
+                let (channel, end) = self.wait_for_remote_end(discard_other_frames).await?;
                 self.session.on_incoming_end(channel, end)?;
             }
             SessionState::EndSent => {
-                self.wait_for_remote_end(false).await?;
+                // An error after a normal End changes the outstanding drain,
+                // not the already-sent End.
+                let (channel, end) = self.wait_for_remote_end(discard_other_frames).await?;
+                self.session.on_incoming_end(channel, end)?;
             }
             SessionState::EndReceived => {
                 self.session
@@ -596,16 +638,17 @@ where
                     })?;
             }
             SessionState::Discarding => {
-                // The DISCARDING state is a variant of the CLOSE SENT state where the close is triggered
-                // by an error. In this case any incoming frames on the connection MUST be silently discarded
-                // until the peer’s close frame is received.
-                self.wait_for_remote_end(true).await?;
+                let (channel, end) = self.wait_for_remote_end(true).await?;
+                self.session.on_incoming_end(channel, end)?;
             }
         }
 
         Ok(Running::Stop)
     }
 
+    // Sole error-End drain: while this owns the private receiver, neither
+    // ordinary dispatch nor handle-drop teardown can deliver non-End input
+    // to a link whose unsettled Store may already have failed (AMQP DISCARDING).
     async fn wait_for_remote_end(
         &mut self,
         discard_other_frame: bool,
@@ -699,8 +742,12 @@ where
                                             log::error!("err {:?}", _err);
                                         }
                                     },
-                                    // Wait for remote end
-                                    SessionState::Discarding | SessionState::EndSent => {
+                                    SessionState::Discarding => {
+                                        let _ = self.end_session(None).await;
+                                        break 'inner;
+                                    },
+                                    // A normal End still processes crossing input.
+                                    SessionState::EndSent => {
                                         match self.incoming.recv().await {
                                             Some(incoming) => {
                                                 let _ = self.on_incoming(incoming).await;
@@ -1542,6 +1589,460 @@ mod refused_transfer_tests {
                 },
             )
             .await;
+        }
+    }
+}
+
+/// Crossing input must not kill a failed Session before its actual peer End:
+/// the Connection still owns that Session's original incoming relay.
+#[cfg(test)]
+mod end_drain_tests {
+    use super::*;
+    use crate::{
+        endpoint::{InputHandle, OutgoingChannel},
+        link::{
+            delivery::UnsettledMessage,
+            state::{LinkFlowState, LinkFlowStateInner},
+            unsettled_store::Store,
+            ArcReceiverUnsettledMap, LinkRelay, LinkStateError, UnsettledCapacityExceeded,
+            UnsettledLimits,
+        },
+        session::Builder,
+        util::Producer,
+    };
+    use fe2o3_amqp_types::{
+        definitions::{ReceiverSettleMode, Role},
+        messaging::{Accepted, DeliveryState},
+        performatives::{Disposition, Flow, Transfer},
+    };
+    use tokio::sync::oneshot::error::TryRecvError;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Entry {
+        MappedError,
+        EndSentError,
+        ExplicitError,
+        DiscardingTeardown,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum Crossing {
+        Transfer,
+        Flow,
+        SenderDisposition,
+        ReceiverDisposition,
+    }
+
+    struct Harness {
+        engine: SessionEngine<super::super::Session>,
+        input: mpsc::Sender<SessionIncomingItem>,
+        control: mpsc::Sender<SessionControl>,
+        written: mpsc::Receiver<SessionFrame>,
+        _link_output: mpsc::Sender<LinkFrame>,
+        _link_inboxes: Vec<mpsc::Receiver<LinkFrame>>,
+        deallocated: mpsc::Receiver<ConnectionControl>,
+        sender_store: Arc<Store<UnsettledMessage>>,
+        receiver_store: ArcReceiverUnsettledMap,
+        cause: UnsettledCapacityExceeded,
+        accepted: crate::completion::Receiver<Result<Option<DeliveryState>, LinkStateError>>,
+    }
+
+    fn flow_state() -> LinkFlowStateInner {
+        LinkFlowStateInner {
+            initial_delivery_count: 0,
+            delivery_count: 0,
+            link_credit: 8,
+            available: 0,
+            drain: false,
+            properties: None,
+        }
+    }
+
+    fn message() -> UnsettledMessage {
+        let (tx, _) = crate::completion::channel();
+        UnsettledMessage::new(Default::default(), None, 0, tx)
+    }
+
+    fn harness() -> Harness {
+        let (conn_control, deallocated) = mpsc::channel(1);
+        let (control, controls) = mpsc::channel(1);
+        let (input, incoming) = mpsc::channel(4);
+        let (outgoing, written) = mpsc::channel(8);
+        let (link_output, outgoing_link_frames) = mpsc::channel(1);
+        let mut session = Builder::new().into_session(
+            OutgoingChannel(0),
+            SessionState::Mapped,
+            Arc::new(OnceLock::new()),
+        );
+        let limits = Some(UnsettledLimits::new(1, 1024));
+        let receiver_store: ArcReceiverUnsettledMap = Arc::new(Store::new(None, limits).unwrap());
+        receiver_store
+            .insert(vec![0].into(), Default::default())
+            .unwrap();
+        let cause = receiver_store
+            .insert(vec![1].into(), Default::default())
+            .unwrap_err();
+        let sender_store = Arc::new(Store::new(None, limits).unwrap());
+        sender_store.register(vec![0].into(), message()).unwrap();
+        let (error, _) = sender_store
+            .register(vec![1].into(), message())
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LinkStateError::UnsettledCapacityExceeded(_)
+        ));
+        let healthy_store = Arc::new(Store::new(None, None).unwrap());
+        let (tx, accepted) = crate::completion::channel();
+        healthy_store
+            .register(
+                vec![2].into(),
+                UnsettledMessage::new(Default::default(), None, 0, tx),
+            )
+            .unwrap();
+
+        let mut inboxes = Vec::new();
+        let (tx, rx) = mpsc::channel(4);
+        inboxes.push(rx);
+        let receiver = LinkRelay::new_receiver(
+            tx,
+            Arc::new(LinkFlowState::receiver(flow_state())),
+            receiver_store.clone(),
+            ReceiverSettleMode::First,
+        );
+        let mut relays = vec![receiver];
+        for store in [sender_store.clone(), healthy_store] {
+            let (tx, rx) = mpsc::channel(4);
+            inboxes.push(rx);
+            relays.push(LinkRelay::new_sender(
+                tx,
+                Producer::new(
+                    Arc::new(tokio::sync::Notify::new()),
+                    Arc::new(LinkFlowState::sender(flow_state())),
+                ),
+                store,
+            ));
+        }
+        for (handle, relay) in relays.into_iter().enumerate() {
+            let name = format!("link-{handle}");
+            session.allocate_link(name.clone(), Some(relay)).unwrap();
+            let relay = session.link_by_name.get_mut(&name).unwrap().take().unwrap();
+            session
+                .link_by_input_handle
+                .insert(InputHandle(handle as u32), relay);
+            let role = if handle == 0 {
+                Role::Sender
+            } else {
+                Role::Receiver
+            };
+            session.delivery_tag_by_id.insert(
+                (role, handle as u32),
+                (InputHandle(handle as u32), vec![handle as u8].into()),
+            );
+        }
+        Harness {
+            engine: SessionEngine {
+                conn_control,
+                session,
+                control: controls,
+                incoming,
+                outgoing,
+                retired_allocations: Default::default(),
+                outgoing_link_frames,
+            },
+            input,
+            control,
+            written,
+            _link_output: link_output,
+            _link_inboxes: inboxes,
+            deallocated,
+            sender_store,
+            receiver_store,
+            cause,
+            accepted,
+        }
+    }
+
+    fn disposition(role: Role, id: u32) -> SessionFrameBody {
+        SessionFrameBody::Disposition(Disposition {
+            role,
+            first: id,
+            last: None,
+            settled: true,
+            state: Some(Accepted {}.into()),
+            batchable: false,
+        })
+    }
+
+    fn crossing(kind: Crossing) -> SessionFrameBody {
+        match kind {
+            Crossing::Transfer => SessionFrameBody::Transfer {
+                performative: Transfer {
+                    handle: 0u32.into(),
+                    delivery_id: Some(3),
+                    delivery_tag: Some(vec![3].into()),
+                    message_format: Some(0),
+                    settled: Some(false),
+                    more: false,
+                    rcv_settle_mode: None,
+                    state: None,
+                    resume: false,
+                    aborted: false,
+                    batchable: false,
+                },
+                payload: Default::default(),
+            },
+            Crossing::Flow => SessionFrameBody::Flow(Flow {
+                next_incoming_id: Some(0),
+                incoming_window: 8,
+                next_outgoing_id: 0,
+                outgoing_window: 8,
+                handle: Some(1u32.into()),
+                delivery_count: Some(0),
+                link_credit: Some(8),
+                available: None,
+                drain: false,
+                echo: true,
+                properties: None,
+            }),
+            Crossing::SenderDisposition => disposition(Role::Receiver, 1),
+            Crossing::ReceiverDisposition => disposition(Role::Sender, 0),
+        }
+    }
+
+    fn error() -> definitions::Error {
+        definitions::Error::new(AmqpError::ResourceLimitExceeded, None, None)
+    }
+
+    #[tokio::test]
+    async fn error_end_discards_crossing_frames_until_peer_end() {
+        for entry in [
+            Entry::MappedError,
+            Entry::EndSentError,
+            Entry::ExplicitError,
+            Entry::DiscardingTeardown,
+        ] {
+            for kind in [
+                Crossing::Transfer,
+                Crossing::Flow,
+                Crossing::SenderDisposition,
+                Crossing::ReceiverDisposition,
+            ] {
+                for peer_error in [false, true] {
+                    // Give each manually-polled exchange its own cooperative
+                    // budget; a budget yield is not the peer-End barrier.
+                    tokio::spawn(error_end_case(entry, kind, peer_error))
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    async fn error_end_case(entry: Entry, kind: Crossing, peer_error: bool) {
+        let mut h = harness();
+        match entry {
+            Entry::MappedError => {}
+            Entry::EndSentError => {
+                h.engine
+                    .on_control(SessionControl::End(None))
+                    .await
+                    .unwrap();
+            }
+            Entry::ExplicitError => {
+                h.control
+                    .send(SessionControl::End(Some(error())))
+                    .await
+                    .unwrap();
+            }
+            Entry::DiscardingTeardown => {
+                h.engine
+                    .session
+                    .send_end(&h.engine.outgoing, Some(error()))
+                    .await
+                    .unwrap();
+            }
+        }
+        if matches!(entry, Entry::MappedError | Entry::EndSentError) {
+            // A real failed Store selects on_error, including after a normal End.
+            h.input
+                .send(SessionFrame::new(0u16, crossing(Crossing::Transfer)))
+                .await
+                .unwrap();
+        }
+        let (tx, mut outcome) = EngineOutcome::channel();
+        let mut engine = tokio_test::task::spawn(h.engine.event_loop(tx));
+        // With no input and a closed control, this selects teardown before
+        // admitting crossing input, without a scheduler or clock assumption.
+        if matches!(entry, Entry::DiscardingTeardown) {
+            drop(h.control);
+        }
+        tokio_test::assert_pending!(engine.poll());
+        let local_end = h.written.try_recv().expect("the peer received local End");
+        let SessionFrameBody::End(local_end) = local_end.body else {
+            panic!("expected End")
+        };
+        assert_eq!(
+            local_end.error.is_some(),
+            !matches!(entry, Entry::EndSentError)
+        );
+
+        // Peer gate: FIFO admission puts each offending frame and an
+        // observable business result ahead of the withheld peer End.
+        h.input
+            .send(SessionFrame::new(0u16, crossing(kind)))
+            .await
+            .unwrap();
+        h.input
+            .send(SessionFrame::new(0u16, disposition(Role::Receiver, 2)))
+            .await
+            .unwrap();
+        tokio_test::assert_pending!(engine.poll());
+        assert!(
+            matches!(h.accepted.try_recv(), Err(TryRecvError::Empty)),
+            "{entry:?}/{kind:?}: dispatched a business result after error End"
+        );
+        assert!(matches!(outcome.try_recv(), Err(TryRecvError::Empty)));
+        assert!(
+            matches!(h.written.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
+            "no second End or business output"
+        );
+
+        let remote_error = peer_error.then(error);
+        h.input
+            .send(SessionFrame::new(
+                0u16,
+                SessionFrameBody::End(End {
+                    error: remote_error.clone(),
+                }),
+            ))
+            .await
+            .unwrap();
+        tokio_test::assert_ready!(engine.poll());
+        let result = outcome.try_recv().unwrap();
+        match entry {
+            Entry::MappedError | Entry::EndSentError => {
+                assert!(
+                    matches!(result, Err(Error::UnsettledCapacityExceeded(ref cause)) if cause == &h.cause),
+                    "{result:?}"
+                );
+            }
+            Entry::ExplicitError if peer_error => {
+                assert!(
+                    matches!(result, Err(Error::RemoteEndedWithError(ref actual)) if Some(actual) == remote_error.as_ref()),
+                    "{result:?}"
+                );
+            }
+            _ => result.unwrap(),
+        }
+        assert!(matches!(
+            h.deallocated.try_recv(),
+            Ok(ConnectionControl::DeallocateSession(OutgoingChannel(0)))
+        ));
+        assert!(
+            h.written.try_recv().is_err(),
+            "no second End or business output"
+        );
+        // Engine teardown may close the unanswered completion; it
+        // must never have delivered the discarded Accepted result.
+        assert!(matches!(
+            h.accepted.try_recv(),
+            Err(TryRecvError::Empty | TryRecvError::Closed)
+        ));
+        assert_eq!(h.receiver_store.check().unwrap_err(), h.cause);
+        let sender_cause = h.sender_store.check().unwrap_err();
+        assert_eq!(sender_cause.limits, h.cause.limits);
+        assert_eq!((sender_cause.entries, h.cause.entries), (2, 2));
+    }
+
+    #[tokio::test]
+    async fn end_drain_applies_the_actual_peer_end() {
+        for local_error in [false, true] {
+            for peer_error in [false, true] {
+                let mut h = harness();
+                h.engine
+                    .session
+                    .send_end(&h.engine.outgoing, local_error.then(error))
+                    .await
+                    .unwrap();
+                h.written.try_recv().unwrap();
+                let remote_error = peer_error.then(error);
+                h.input
+                    .send(SessionFrame::new(
+                        0u16,
+                        SessionFrameBody::End(End {
+                            error: remote_error.clone(),
+                        }),
+                    ))
+                    .await
+                    .unwrap();
+                let result = h.engine.end_session(None).await;
+                if peer_error {
+                    assert!(
+                        matches!(result, Err(SessionInnerError::RemoteEndedWithError(ref actual)) if Some(actual) == remote_error.as_ref()),
+                        "{result:?}"
+                    );
+                } else {
+                    assert!(matches!(result.unwrap(), Running::Stop));
+                }
+                assert!(matches!(
+                    h.engine.session.local_state(),
+                    SessionState::Unmapped
+                ));
+                assert!(matches!(
+                    h.written.try_recv(),
+                    Err(mpsc::error::TryRecvError::Empty)
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_end_keeps_a_crossing_accepted_result() {
+        for peer_error in [false, true] {
+            let mut h = harness();
+            h.engine
+                .on_control(SessionControl::End(None))
+                .await
+                .unwrap();
+            assert!(matches!(
+                h.written.try_recv().unwrap().body,
+                SessionFrameBody::End(End { error: None })
+            ));
+            let (tx, mut outcome) = EngineOutcome::channel();
+            let mut engine = tokio_test::task::spawn(h.engine.event_loop(tx));
+            h.input
+                .send(SessionFrame::new(0u16, disposition(Role::Receiver, 2)))
+                .await
+                .unwrap();
+            tokio_test::assert_pending!(engine.poll());
+            assert!(matches!(
+                h.accepted.try_recv(),
+                Ok(Ok(Some(DeliveryState::Accepted(_))))
+            ));
+            let remote_error = peer_error.then(error);
+            h.input
+                .send(SessionFrame::new(
+                    0u16,
+                    SessionFrameBody::End(End {
+                        error: remote_error.clone(),
+                    }),
+                ))
+                .await
+                .unwrap();
+            tokio_test::assert_ready!(engine.poll());
+            let result = outcome.try_recv().unwrap();
+            if peer_error {
+                assert!(
+                    matches!(result, Err(Error::RemoteEndedWithError(ref actual)) if Some(actual) == remote_error.as_ref()),
+                    "{result:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+            assert!(
+                h.written.try_recv().is_err(),
+                "no second End or business output"
+            );
         }
     }
 }

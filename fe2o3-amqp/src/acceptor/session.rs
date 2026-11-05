@@ -25,7 +25,7 @@ use crate::{
         error::{
             connection_stop_reason_or_closed, AllocLinkError, BeginError, Error, SessionInnerError,
         },
-        frame::{SessionFrame, SessionIncomingItem, SessionOutgoingItem},
+        frame::{SessionFrame, SessionOutgoingItem},
         SessionHandle, DEFAULT_SESSION_CONTROL_BUFFER_SIZE,
     },
     util::Initialized,
@@ -355,40 +355,6 @@ impl SessionAcceptor {
                 ))?;
         self.accept_incoming_session(incoming_session, connection)
             .await
-    }
-}
-
-impl<S> SessionEngine<S>
-where
-    S: ListenerSessionEndpoint + endpoint::SessionEndpoint,
-    BeginError: From<S::BeginError>,
-{
-    #[allow(clippy::too_many_arguments)]
-    pub async fn begin_listener_session(
-        conn_control: mpsc::Sender<ConnectionControl>,
-        session: S,
-        control: mpsc::Receiver<SessionControl>,
-        incoming: mpsc::Receiver<SessionIncomingItem>,
-        outgoing: mpsc::Sender<SessionFrame>,
-        outgoing_link_frames: mpsc::Receiver<LinkFrame>,
-    ) -> Result<Self, BeginError> {
-        #[cfg(feature = "tracing")]
-        tracing::trace!("Instantiating session engine");
-        #[cfg(feature = "log")]
-        log::trace!("Instantiating session engine");
-        let mut engine = Self {
-            conn_control,
-            session,
-            control,
-            incoming,
-            outgoing,
-            retired_allocations: Default::default(),
-            outgoing_link_frames,
-        };
-
-        // send a begin
-        engine.session.send_begin(&engine.outgoing).await?;
-        Ok(engine)
     }
 }
 

@@ -1385,3 +1385,41 @@ changed source files to unmodified c05d6457 reproduces the same three errors
 (exit 101). This pre-existing feature-selection test defect is not repaired or
 counted as a pass. Strict Clippy and Boundless consumer checks are not claimed
 by this fork-test step.
+
+
+## Observe the original live settlement handoff (#610)
+
+Boundless's `src/protocols/amqp1/client.rs::State::submit` must accept an actual
+terminal peer outcome into its original shared outcome cell before normal Close,
+closing Detach or logical release concludes unanswered publications. The existing
+untaken sink does not run when a live receiver has an unread value; the receiver
+can also remain private inside awaited send creation before DeliveryFut exists.
+The public send/Future/conversion APIs cannot expose that source handoff.
+
+Upstream 0.18.1 (`8fd06bc36f2e3819ba4f01256b6688a2ce0d627a`) sends settlement
+and failure through a Tokio oneshot in `UnsettledMessage`. The inspected upstream
+0.18.4 main (`33d0a2958abbe89aca2c60f09de6ea3ab2afbd69`) keeps that behavior and
+a private DeliveryFut settlement receiver. This patch keeps the original value,
+receiver, native correlation, conversion, failure and untaken disposition. It adds
+only an optional borrowed `CompletionSink::with_on_answer` observer captured at
+channel creation and invoked before the original send, outside completion locks.
+It does not select a Boundless result or alter close/cancellation policy. Existing
+constructors default it off; allocation `map_input` remains untaken-only.
+
+`native_settlement_hands_every_untaken_outcome_to_its_sink` now checks live-unread
+observation before receiver polling/drop, exactly once, for settlement and actual
+link failure, while the native Store is unlocked.
+`native_settlement_observes_private_creation_before_receiver_return` drives the
+real sender/relay at its final handoff: a correlated Disposition is observed before
+creation returns the receiver, and ordinary receipt still takes the same answer.
+Boundless supplies independent real-peer ordinary/transactional and negative
+result coverage. Recording and retirement stay with the admitted consumer owner,
+never the synchronous observer.
+
+Validation of source revision `2d8a530963da67dda2129aa443b5a5c5abe6ff2b` on macOS
+arm64 through the consumer test pool: the two `native_settlement_` unit regressions
+with `transaction,acceptor` passed three of three nextest runs (six executions,
+exit 0). The consumer's original-cell/normal-ending AMQP1 regression also passed
+on that revision. A preceding native run passed both Rust tests but failed JUnit
+artifact collection; it is not a passing pool run. This is targeted macOS evidence;
+Linux and full-crate verification are not claimed here.

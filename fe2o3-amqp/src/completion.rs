@@ -1,7 +1,8 @@
 //! Dispositions for native answers whose operation stopped waiting.
 //!
 //! Install a typed sink with [`CompletionSink::scope`] before polling an operation.
-//! Channels created by that operation capture the sink. A sender finding its
+//! Channels created by that operation capture the sink and optional answer observer.
+//! The observer sees delivery before the receiver can take the answer. A sender finding its
 //! receiver closed, or a receiver dropped with an unread answer, invokes it once.
 //! Sinks run synchronously, outside channel locks; queue asynchronous recovery to
 //! its owner. Scopes are inherited by nested scopes, but not by spawned tasks.
@@ -29,10 +30,13 @@ tokio::task_local! {
 }
 
 /// A per-operation disposition for an untaken native answer of type `T`.
-pub struct CompletionSink<T>(Arc<dyn Fn(T) + Send + Sync>);
+pub struct CompletionSink<T>(
+    Arc<dyn Fn(T) + Send + Sync>,
+    Option<Arc<dyn Fn(&T) + Send + Sync>>,
+);
 impl<T> Clone for CompletionSink<T> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.clone(), self.1.clone())
     }
 }
 impl<T> fmt::Debug for CompletionSink<T> {
@@ -43,7 +47,16 @@ impl<T> fmt::Debug for CompletionSink<T> {
 impl<T: 'static> CompletionSink<T> {
     /// Build a disposition. It must not block the engine that hands it an answer.
     pub fn new(sink: impl Fn(T) + Send + Sync + 'static) -> Self {
-        Self(Arc::new(sink))
+        Self(Arc::new(sink), None)
+    }
+    /// Observe an answer at its original channel's send, even with a live unread
+    /// receiver. Captured at channel creation, before dispatch; it neither takes
+    /// the answer nor changes untaken disposition. Must not block or re-enter
+    /// native owners. It runs before the raw value becomes available, outside
+    /// completion locks; defer recording and retirement to the admitted owner.
+    pub fn with_on_answer(mut self, observer: impl Fn(&T) + Send + Sync + 'static) -> Self {
+        self.1 = Some(Arc::new(observer));
+        self
     }
     /// Poll `operation` with this sink installed, before its native handoff.
     /// The innermost sink of a matching type wins; other answer types are unchanged.
@@ -76,6 +89,7 @@ type Disposition<T> = Arc<Mutex<Option<Box<dyn FnOnce(T) + Send>>>>;
 pub(crate) struct Sender<T> {
     inner: oneshot::Sender<T>,
     disposition: Disposition<T>,
+    on_answer: Option<Arc<dyn Fn(&T) + Send + Sync>>,
 }
 impl<T> fmt::Debug for Sender<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -96,6 +110,7 @@ impl<T> From<oneshot::Sender<T>> for Sender<T> {
         Self {
             inner,
             disposition: Arc::default(),
+            on_answer: None,
         }
     }
 }
@@ -119,6 +134,9 @@ impl<T: 'static> Sender<T> {
         }));
     }
     pub(crate) fn send(self, value: T) -> Result<(), T> {
+        if let Some(observer) = self.on_answer {
+            observer(&value);
+        }
         match self.inner.send(value) {
             Ok(()) => Ok(()),
             Err(value) => dispose(&self.disposition, value),
@@ -206,6 +224,7 @@ pub(crate) fn channel_with<T: 'static>(
     sink: Option<CompletionSink<T>>,
 ) -> (Sender<T>, Receiver<T>) {
     let (tx, rx) = oneshot::channel();
+    let on_answer = sink.as_ref().and_then(|sink| sink.1.clone());
     let disposition: Disposition<T> = Arc::new(Mutex::new(
         sink.map(|sink| Box::new(move |value| (sink.0)(value)) as _),
     ));
@@ -213,6 +232,7 @@ pub(crate) fn channel_with<T: 'static>(
         Sender {
             inner: tx,
             disposition: disposition.clone(),
+            on_answer,
         },
         Receiver {
             inner: rx,

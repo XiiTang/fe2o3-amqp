@@ -2224,11 +2224,21 @@ mod tests {
                 let writer = crate::session::transfer_queue::Sender::from(writer);
                 let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
                 let output = seen.clone();
+                let answered = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let observed = answered.clone();
+                let unsettled = inner.link.unsettled.clone();
                 let sink = crate::completion::CompletionSink::new(
                     move |value: Result<Option<DeliveryState>, LinkStateError>| {
                         output.lock().push(value)
                     },
-                );
+                )
+                .with_on_answer(move |value| {
+                    // Settlement withdrew its message before this source handoff.
+                    assert_eq!(unsettled.usage(), (0, 0));
+                    observed
+                        .lock()
+                        .push(matches!(value, Ok(Some(DeliveryState::Accepted(_)))));
+                });
                 let settlement = sink
                     .scope(inner.link.send_payload(
                         &writer,
@@ -2264,7 +2274,10 @@ mod tests {
                     1 => message.settle_with_state(Some(Accepted {}.into())).unwrap(),
                     _ => message.fail(LinkStateError::RemoteClosed).unwrap(),
                 }
+                // Required observation precedes polling or dropping a live receiver.
+                assert_eq!(&*answered.lock(), &[completion != 2]);
                 drop(outcome);
+                assert_eq!(answered.lock().len(), 1);
                 let seen = seen.lock();
                 assert_eq!(seen.len(), 1);
                 match completion {
@@ -2273,6 +2286,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn native_settlement_observes_private_creation_before_receiver_return() {
+        let mut inner = credited_sender(4096);
+        let store = inner.link.unsettled.clone();
+        let (incoming, _inbox) = mpsc::channel(1);
+        let mut relay =
+            LinkRelay::new_sender(incoming, inner.link.flow_state.producer(), store.clone())
+                .with_output_handle(crate::endpoint::OutputAttachment::for_tests(0));
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let at_handoff = answered.clone();
+        store.set_test_hook(2, move || {
+            relay
+                .on_incoming_disposition(
+                    definitions::Role::Receiver,
+                    true,
+                    Some(fe2o3_amqp_types::messaging::Accepted {}.into()),
+                    DeliveryTag::from([0; 4]),
+                )
+                .unwrap();
+            assert_eq!(at_handoff.load(std::sync::atomic::Ordering::Acquire), 1);
+        });
+        let observed = answered.clone();
+        let sink = crate::completion::CompletionSink::new(
+            |_: Result<Option<DeliveryState>, LinkStateError>| panic!("receiver takes this answer"),
+        )
+        .with_on_answer(move |value| {
+            assert!(matches!(value, Ok(Some(DeliveryState::Accepted(_)))));
+            assert_eq!(store.usage(), (0, 0));
+            observed.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        });
+        let (writer, mut frames) = mpsc::channel(1);
+        let writer = crate::session::transfer_queue::Sender::from(writer);
+        let settlement = sink
+            .scope(inner.link.send_payload(
+                &writer,
+                std::future::pending(),
+                Payload::from_static(b"m"),
+                0,
+                Some(false),
+                None,
+                false,
+            ))
+            .await
+            .unwrap();
+        let Settlement::Unsettled { outcome, .. } = settlement else {
+            panic!("unsettled")
+        };
+        assert_eq!(answered.load(std::sync::atomic::Ordering::Acquire), 1);
+        assert!(frames.try_recv().is_ok());
+        assert!(matches!(
+            outcome.await.unwrap(),
+            Ok(Some(DeliveryState::Accepted(_)))
+        ));
+        assert_eq!(answered.load(std::sync::atomic::Ordering::Acquire), 1);
     }
 
     /// Aborting a delivery sends a resuming, aborted transfer; the delivery is

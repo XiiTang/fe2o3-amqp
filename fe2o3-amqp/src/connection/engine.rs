@@ -268,6 +268,7 @@ where
             Err(error) => {
                 // The opening's failure is how it ended: what closing the
                 // connection after it meets does not replace it.
+                engine.transport.report_open_failed(&error);
                 let _ = engine.close_connection(None).await;
                 Err(error)
             }
@@ -376,7 +377,13 @@ where
                 self.connection.on_incoming_end(channel, end).await?;
             }
             FrameBody::Close(close) => {
-                let result = self.connection.on_incoming_close(channel, close);
+                let result = self
+                    .connection
+                    .on_incoming_close(channel, close)
+                    .map_err(ConnectionInnerError::from);
+                // The accepted Close, before any queue drain or Close reply.
+                self.transport
+                    .report_connection_ended(result.as_ref().map(|_| ()));
                 if matches!(
                     self.connection.local_state(),
                     ConnectionState::CloseReceived
@@ -680,7 +687,15 @@ where
                     // The first failure is how the engine ended: what its
                     // cleanup meets after it, a Close that cannot be sent or a
                     // stream that ends before the peer's Close, does not
-                    // replace it.
+                    // replace it. It is reported before that cleanup; a
+                    // remote Close was reported where it was accepted.
+                    if !matches!(
+                        error,
+                        ConnectionInnerError::RemoteClosed
+                            | ConnectionInnerError::RemoteClosedWithError(_)
+                    ) {
+                        self.transport.report_connection_ended(Err(&error));
+                    }
                     let running = match self.on_error(&error).await {
                         Ok(running) => running,
                         Err(_cleanup) => {

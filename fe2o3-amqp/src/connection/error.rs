@@ -150,7 +150,7 @@ impl From<ConnectionStateError> for OpenError {
 
 /// Error with connection
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum ConnectionInnerError {
+pub enum ConnectionInnerError {
     /// Transport error
     #[error(transparent)]
     TransportError(#[from] transport::Error),

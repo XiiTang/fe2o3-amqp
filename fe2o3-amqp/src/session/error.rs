@@ -80,10 +80,11 @@ impl From<SessionStateError> for BeginError {
 
 /// Error with session operations
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum SessionInnerError {
+pub enum SessionInnerError {
     /// An attached link exceeded its configured unsettled retention bound.
     #[error(transparent)]
     UnsettledCapacityExceeded(#[from] crate::link::UnsettledCapacityExceeded),
+    /// A Transfer carried an invalid or duplicate transfer identity.
     #[error("Invalid or duplicate transfer identity")]
     InvalidTransfer,
     /// The peer sent more transfers than the advertised session window.
@@ -93,6 +94,7 @@ pub(crate) enum SessionInnerError {
     #[error("A frame (other than attach) was received referencing a handle which is not currently in use of an attached link.")]
     UnattachedHandle,
 
+    /// The peer attached a link whose name is not found locally.
     #[error("Remote sent an attach with a name that cannot be found locally")]
     RemoteAttachingLinkNameNotFound,
 
@@ -121,6 +123,7 @@ pub(crate) enum SessionInnerError {
     RemoteEndedWithError(definitions::Error),
 
     /// Unknown transaction ID
+    /// The transaction ID is unknown.
     #[cfg(not(target_arch = "wasm32"))]
     #[cfg(all(feature = "transaction", feature = "acceptor"))]
     #[error("Unknown transaction ID")]

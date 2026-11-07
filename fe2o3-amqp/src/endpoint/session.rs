@@ -39,6 +39,10 @@ pub(crate) trait Session {
 
     fn report_unsettled_capacity(&self, cause: &crate::link::UnsettledCapacityExceeded);
 
+    /// The engine's accepted End result or first native failure, before its
+    /// reply or error-End cleanup.
+    fn report_result(&self, result: &Result<(), crate::session::error::SessionInnerError>);
+
     /// The shared cell holding why the session (or its connection) stopped
     fn session_stop_reason(&self) -> &Arc<OnceLock<SessionStopReason>>;
 

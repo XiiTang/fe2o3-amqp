@@ -1423,3 +1423,125 @@ exit 0). The consumer's original-cell/normal-ending AMQP1 regression also passed
 on that revision. A preceding native run passed both Rust tests but failed JUnit
 artifact collection; it is not a passing pool run. This is targeted macOS evidence;
 Linux and full-crate verification are not claimed here.
+
+## Report a Connection's and Session's native end before its reply or cleanup (Boundless B)
+
+Boundless books each native end on its original Connection or Session Terminal
+before a peer frame can be read as a normal end. The engines already compute
+that end, but report it only through the final engine outcome, after the Close
+or End reply, the error Close/End cleanup and the peer's acknowledgment. A
+consumer that judged the peer's clean acknowledgment first recorded a normal end
+for an engine that had failed; an opening failure was visible only after its
+cleanup Close.
+
+### Upstream comparison
+
+Read upstream `33d0a2958abbe89aca2c60f09de6ea3ab2afbd69` and current upstream
+main `df8c73b43e5b65ea61a7d9189f9bae3590653100`; the excerpts below are the
+same in both. Paths are relative to `fe2o3-amqp/src/`, lines at 33d0a29.
+
+| Path | Upstream code / behavior | This patch |
+| --- | --- | --- |
+| Peer Close | `connection/engine.rs:376-392`: `let result = self.connection.on_incoming_close(channel, close);`, then for `CloseReceived` closes and drains session output and sends the Close reply, then `result?`. | Report `result` once, synchronously, before the drain and reply. The drain, reply and returned result are unchanged. |
+| Connection failure | `connection/engine.rs:635-646`: the event loop's `Err(error)` arm calls `self.on_error(&error)`, which sends the error Close (`:509-529`) and waits for the peer's. | Report the original error before `on_error`. A remote Close was already reported where it was accepted and is not reported again. |
+| Opening failure | `connection/engine.rs:260-262`: `match engine.open_inner().await { ... Err(error) => { match engine.close_connection(None).await` | Report the original `OpenError` before `close_connection`. The fork's existing "first failure is how it ended" return is unchanged. |
+| Peer End | `session/engine.rs:259-282`: `let result = self.session.on_incoming_end(channel, end);`, then for `EndReceived` records the stop reason, closes and drains link output, sends the End reply, then `result?`. | Report `result` before the drain and reply. |
+| Session failure | `session/engine.rs:705`: the event loop's error arm calls `self.on_error(&error)`, which sends the error End and drains for the peer's (`:476`, `:591`). | Report the original error before `on_error`, except a remote End already reported where it was accepted. |
+| Cleanup drains | `connection/engine.rs::close_connection` and the Session `end_session` / `wait_for_remote_end` drains apply the peer's answering Close/End. | Unchanged and never reported: an answer to cleanup acknowledges the end already reported. |
+| Cancellation, timeout and retry | Dropping a handle or its waiter does not retract an engine's exchange; there is no built-in Close/End deadline or retry. | Kept. No state transition, frame value, flush order, deadline, retry or final outcome changes. |
+
+The hooks reuse existing types. `IncomingFrameObserver` gains default no-op
+`connection_open_failed(&OpenError)` and
+`connection_ended(Result<(), &ConnectionInnerError>)`, forwarded by the
+Transport's existing observer field. The Session builder gains an optional
+`result_reporter` carried by the Session, delegated by `ListenerSession` and
+both `TxnSession` wrappers. The private capacity reporter becomes the shared
+`Reporter<E>` newtype. `ConnectionInnerError` and `SessionInnerError` become
+public so the borrowed values can be named. Unconfigured users see no change.
+
+An explicit `SessionControl::End(Some(error))` is not reported here. Its
+native sender, the `DuplicatedLinkName` arm of `handle_attach_error`, is not
+reached: `session::allocate_link` returns that error through `?` in
+`link/builder.rs` before any Attach is sent, and `exchange_attach` never
+produces it. The other sender is the public `end_with_error`, an end its caller
+already owns.
+
+Lifetime comparison: Azure AMQP `4fafcae20b3318a0cc1b1fd22d24303a4bb60097`,
+`AmqpObject.cs:441-445,612-620`, records the terminal exception before its close
+exchange and keeps it through the acknowledgment.
+
+### Regression evidence
+
+`tests/native_end_reports.rs` scripts the peer over an in-memory duplex stream
+and checks each report when the peer has read the client's frame:
+
+- a second Open reports `Err(IllegalState)` before the error Close, and the
+  peer's clean Close acknowledgment adds no report;
+- a peer Close reports `Err(RemoteClosed)` before the Close reply;
+- a Begin answering the Open reports `open IllegalState` before the cleanup
+  Close;
+- a Flow for an unattached handle reports `Err(UnattachedHandle)` before the
+  error End, and the peer's clean End adds no report;
+- a peer End reports `Err(RemoteEnded)` before the End reply.
+
+A temporary negative control removed both the Session End arm's report and
+the receiver's Attach refusal report; it failed
+`a_peer_end_is_reported_before_its_reply` and both receiver Attach regressions
+(exit 101) and was removed before the passing runs below.
+
+## Report the original Attach refusal before its closing Detach (Boundless B)
+
+Boundless books each native end on the link's original Terminal before a peer
+answer can be read as a normal end. When the library refuses a peer's Attach
+answer, `handle_attach_error` sends its own closing Detach and returns the
+refusal only after a clean reply. Before this patch, the peer's error-free
+acknowledgment was the first end Boundless saw, so the link's record said normal
+while the Attach failed (receiver `InitialDeliveryCountIsNone`, sender
+`TargetAddressIsNoneWhenDynamicIsTrue`; Boundless runs
+`rt-shared-B-v4-attach-claude-73509-1794060954`,
+`rt-shared-B-v4-attach-claude2-79895-1794061314`). If the peer instead closed
+the connection, the library returned `SessionStopped` and the refusal survived
+nowhere.
+
+Upstream `33d0a2958abbe89aca2c60f09de6ea3ab2afbd69` and the documented base
+`8fd06bc36f2e3819ba4f01256b6688a2ce0d627a` have the same `handle_attach_error`
+(receiver `receiver_link.rs:865-929`, sender `sender_link.rs:862-919` at
+33d0a29). They return the original error only after a clean Detach reply. A
+failed send or closed reader becomes `SessionStopped`/`IllegalState`, another
+frame becomes `NonAttachFrameReceived`, and a failing reply becomes its detach
+error. The sender ignores `on_detach_reply` errors (`FIXME`, `sender_link.rs:940`).
+Nothing is notified before the exchange. There is no timeout or retry. Dropping
+the awaiting attach future cancels the exchange.
+
+This patch adds only an optional synchronous `attach_refusal_reporter` on the
+link Builder, carried into `Link`. It is called once with the borrowed original
+error as the first statement of each role's `handle_attach_error`, before any
+Detach or Session End. The shared `Reporter<E>` newtype holds it. Detach values,
+waits, return values, cancellation, the `FIXME` behavior and the listener links
+are unchanged; unconfigured users see no difference. Resume does not call
+`handle_attach_error`.
+
+Regression, in `tests/native_end_reports.rs`: real Session and link pairs for
+both roles. The reporter has the exact variant when the peer reads the closing
+Detach (`InvalidField`, closed). After a clean reply the attach returns the
+original error. After a peer Close it returns `SessionStopped`, while the report
+already carried the original. An unconfigured builder sends the same Detach and
+returns the same error. The negative control above covers the receiver's
+report.
+
+### Validation
+
+On macOS Darwin 27.2.0 arm64, Rust 1.98.1, these passed with exit 0:
+
+```sh
+cargo test -p fe2o3-amqp --features transaction,acceptor --lib --test native_end_reports --test clean_teardown --test detached_link_frames --test engine_first_failure --test large_message_split --test link_stop_reason --test relay_remote_detach --test sasl_acceptor --test unsettled_limits --test acceptor
+cargo check -p fe2o3-amqp --no-default-features --features transaction
+cargo check --workspace --tests
+cargo fmt --all --check
+```
+
+The library selection passes 205 tests and the integration binaries pass 49,
+including the nine new ones. `broker_connection_compat`, `link` and
+`transaction` start broker containers and fail at container start on a host
+without Docker; they are not counted. Boundless consumer evidence is recorded
+with the consumer commit.

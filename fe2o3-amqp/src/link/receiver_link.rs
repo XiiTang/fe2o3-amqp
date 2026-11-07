@@ -724,6 +724,10 @@ where
         reader: &mut mpsc::Receiver<LinkFrame>,
         session: &mpsc::Sender<SessionControl>,
     ) -> ReceiverAttachError {
+        // The refusal itself, before this link's own closing Detach or End.
+        if let Some(report) = &self.attach_refused {
+            (report.0)(&attach_error);
+        }
         match attach_error {
             // Errors that indicate failed attachment
             ReceiverAttachError::SessionStopped(_)

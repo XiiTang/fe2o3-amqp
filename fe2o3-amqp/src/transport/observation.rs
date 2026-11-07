@@ -99,6 +99,13 @@ pub trait IncomingFrameObserver: Send + Sync + std::fmt::Debug {
     fn protocol_header(&self, _header: [u8; 8]) {}
     /// Observe an admitted incoming AMQP frame before the engine processes it.
     fn incoming(&self, frame: Arc<IncomingFrame>) -> IncomingFrameAction;
+    /// The connection's opening failed, before the engine's opening cleanup
+    /// Close. What that cleanup meets is not reported.
+    fn connection_open_failed(&self, _error: &crate::connection::OpenError) {}
+    /// The engine's accepted Close result, or its first native failure, before
+    /// it sends a Close reply or starts error cleanup. A Close that answers
+    /// that cleanup is not reported: it acknowledges the failure reported.
+    fn connection_ended(&self, _result: Result<(), &crate::connection::ConnectionInnerError>) {}
 }
 
 #[cfg(test)]

@@ -332,15 +332,24 @@ pub(crate) async fn allocate_link(
         .map_err(|_| AllocLinkError::SessionStopped(reason()))?
 }
 
-#[derive(Clone)]
-pub(crate) struct CapacityReporter(
-    Arc<dyn Fn(&crate::link::UnsettledCapacityExceeded) + Send + Sync>,
-);
-impl std::fmt::Debug for CapacityReporter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("CapacityReporter")
+/// A synchronous observer of a native fact, called before the engine's
+/// reply or cleanup work. It must not block, wait or call native code.
+pub(crate) struct Reporter<E: ?Sized>(pub(crate) Arc<dyn Fn(&E) + Send + Sync>);
+impl<E: ?Sized> Clone for Reporter<E> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
 }
+impl<E: ?Sized> std::fmt::Debug for Reporter<E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Reporter")
+    }
+}
+pub(crate) type CapacityReporter = Reporter<crate::link::UnsettledCapacityExceeded>;
+/// The Session engine's accepted End result or its first native failure.
+pub(crate) type ResultReporter = Reporter<Result<(), SessionInnerError>>;
+/// The callback [`Builder::result_reporter`](builder::Builder::result_reporter) takes.
+pub type ResultReport = Arc<dyn Fn(&Result<(), SessionInnerError>) + Send + Sync>;
 
 /// AMQP1.0 Session
 ///
@@ -380,6 +389,7 @@ impl std::fmt::Debug for CapacityReporter {
 pub struct Session {
     pub(crate) outgoing_channel: OutgoingChannel,
     pub(crate) unsettled_capacity_reporter: Option<CapacityReporter>,
+    pub(crate) result_reporter: Option<ResultReporter>,
 
     /// Why this session (or its connection) stopped, shared with the links
     /// and the session handle
@@ -703,6 +713,12 @@ impl endpoint::Session for Session {
     fn report_unsettled_capacity(&self, cause: &crate::link::UnsettledCapacityExceeded) {
         if let Some(report) = &self.unsettled_capacity_reporter {
             (report.0)(cause);
+        }
+    }
+
+    fn report_result(&self, result: &Result<(), SessionInnerError>) {
+        if let Some(report) = &self.result_reporter {
+            (report.0)(result);
         }
     }
 

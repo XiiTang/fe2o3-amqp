@@ -235,6 +235,7 @@ where
             max_frame_size,
             verify_incoming_source: self.verify_incoming_source,
             verify_incoming_target: self.verify_incoming_target,
+            attach_refused: None,
         };
 
         // `on_incoming_attach` should always be evaluated

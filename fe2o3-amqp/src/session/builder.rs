@@ -58,6 +58,7 @@ pub struct Builder {
     pub buffer_size: usize,
 
     pub(crate) unsettled_capacity_reporter: Option<super::CapacityReporter>,
+    pub(crate) result_reporter: Option<super::ResultReporter>,
 
     /// Acceptor for incoming transaction control links
     #[cfg(not(target_arch = "wasm32"))]
@@ -77,6 +78,7 @@ impl Default for Builder {
             properties: None,
             buffer_size: DEFAULT_SESSION_MUX_BUFFER_SIZE,
             unsettled_capacity_reporter: None,
+            result_reporter: None,
 
             #[cfg(not(target_arch = "wasm32"))]
             #[cfg(all(feature = "transaction", feature = "acceptor"))]
@@ -109,6 +111,7 @@ cfg_transaction! {
                     outgoing_channel,
                     session_stop_reason: Arc::new(OnceLock::new()),
                     unsettled_capacity_reporter: self.unsettled_capacity_reporter,
+                    result_reporter: self.result_reporter,
                     connection_stop_reason,
                     local_state,
                     initial_outgoing_id: Constant::new(self.next_outgoing_id),
@@ -161,6 +164,7 @@ impl Builder {
             outgoing_channel,
             session_stop_reason: Arc::new(OnceLock::new()),
             unsettled_capacity_reporter: self.unsettled_capacity_reporter,
+            result_reporter: self.result_reporter,
             connection_stop_reason,
             local_state,
             initial_outgoing_id: Constant::new(self.next_outgoing_id),
@@ -193,7 +197,17 @@ impl Builder {
         mut self,
         report: Arc<dyn Fn(&crate::link::UnsettledCapacityExceeded) + Send + Sync>,
     ) -> Self {
-        self.unsettled_capacity_reporter = Some(super::CapacityReporter(report));
+        self.unsettled_capacity_reporter = Some(super::Reporter(report));
+        self
+    }
+
+    /// Report this Session's accepted End result, or its first native
+    /// failure, synchronously before the engine sends its End reply or starts
+    /// error-End cleanup. An End that answers that cleanup is not reported:
+    /// it acknowledges the failure already reported. The callback must not
+    /// block or call native code.
+    pub fn result_reporter(mut self, report: super::ResultReport) -> Self {
+        self.result_reporter = Some(super::Reporter(report));
         self
     }
 

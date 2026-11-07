@@ -175,6 +175,7 @@ where
             max_frame_size: session.max_frame_size(),
             verify_incoming_source: self.verify_incoming_source,
             verify_incoming_target: self.verify_incoming_target,
+            attach_refused: None,
         };
 
         let outgoing = session.outgoing.clone();

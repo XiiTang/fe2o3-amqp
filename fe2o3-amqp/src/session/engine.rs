@@ -296,7 +296,12 @@ where
             }
             SessionFrameBody::End(end) => {
                 let end_error = end.error.clone();
-                let result = self.session.on_incoming_end(channel, end);
+                let result = self
+                    .session
+                    .on_incoming_end(channel, end)
+                    .map_err(SessionInnerError::from);
+                // The accepted End, before any queue drain or End reply.
+                self.session.report_result(&result);
                 if matches!(self.session.local_state(), SessionState::EndReceived) {
                     // Record the stop reason before the link channel is closed,
                     // so links that fail on the closure observe the reason. The
@@ -792,6 +797,21 @@ where
                         #[cfg(feature = "log")]
                         log::error!("{:?}", error);
                     }
+                    // The first native failure, before its error-End cleanup.
+                    // A remote End was reported where it was accepted.
+                    let error = if matches!(
+                        error,
+                        SessionInnerError::RemoteEnded | SessionInnerError::RemoteEndedWithError(_)
+                    ) {
+                        error
+                    } else {
+                        let failed = Err(error);
+                        self.session.report_result(&failed);
+                        match failed {
+                            Err(error) => error,
+                            Ok(()) => unreachable!("reported the failure it holds"),
+                        }
+                    };
                     match self.on_error(&error).await {
                         Ok(running) => {
                             if !matches!(

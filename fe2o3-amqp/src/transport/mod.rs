@@ -65,6 +65,19 @@ where
     ) {
         self.observer = observer;
     }
+    pub(crate) fn report_open_failed(&self, error: &crate::connection::OpenError) {
+        if let Some(observer) = &self.observer {
+            observer.connection_open_failed(error);
+        }
+    }
+    pub(crate) fn report_connection_ended(
+        &self,
+        result: Result<(), &crate::connection::ConnectionInnerError>,
+    ) {
+        if let Some(observer) = &self.observer {
+            observer.connection_ended(result);
+        }
+    }
     /// Consume the transport and return the underlying codec
     pub fn into_framed_codec(
         self,

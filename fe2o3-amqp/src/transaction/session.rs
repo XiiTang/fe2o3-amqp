@@ -242,6 +242,10 @@ where
         self.session.report_unsettled_capacity(cause)
     }
 
+    fn report_result(&self, result: &Result<(), crate::session::error::SessionInnerError>) {
+        self.session.report_result(result)
+    }
+
     fn set_session_stop_reason(&mut self, reason: SessionStopReason) {
         self.session.set_session_stop_reason(reason)
     }

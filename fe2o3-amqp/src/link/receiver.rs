@@ -4778,6 +4778,7 @@ mod tests {
             max_frame_size,
             verify_incoming_source: true,
             verify_incoming_target: true,
+            attach_refused: None,
         };
         let inner = ReceiverInner {
             link,

@@ -237,7 +237,16 @@ pub(crate) struct Link<R, T, F, M> {
 
     pub(crate) verify_incoming_source: bool,
     pub(crate) verify_incoming_target: bool,
+
+    /// Reports the library's refusal of an Attach answer before cleanup
+    pub(crate) attach_refused: Option<AttachRefusalReporter>,
 }
+
+/// The library's refusal of the peer's Attach answer, borrowed as the role's
+/// own attach error.
+pub(crate) type AttachRefusalReporter = crate::session::Reporter<dyn std::error::Error + 'static>;
+/// The callback [`Builder::attach_refusal_reporter`](builder::Builder::attach_refusal_reporter) takes.
+pub type AttachRefusalReport = Arc<dyn Fn(&(dyn std::error::Error + 'static)) + Send + Sync>;
 
 impl<R, T, F, M> Link<R, T, F, M>
 where

@@ -23,8 +23,8 @@ use super::{
     sender::SenderInner,
     state::{LinkFlowState, LinkFlowStateInner, LinkState},
     target_archetype::VerifyTargetArchetype,
-    ArcUnsettledMap, Receiver, ReceiverAttachError, ReceiverFlowState, ReceiverLink,
-    ReceiverRelayFlowState, Sender, SenderAttachError, SenderFlowState, SenderLink,
+    ArcUnsettledMap, AttachRefusalReporter, Receiver, ReceiverAttachError, ReceiverFlowState,
+    ReceiverLink, ReceiverRelayFlowState, Sender, SenderAttachError, SenderFlowState, SenderLink,
     SenderRelayFlowState, SessionStopReason,
 };
 
@@ -120,6 +120,10 @@ pub struct Builder<Role, T, NameState, SS, TS> {
     /// Default to true
     pub verify_incoming_target: bool,
 
+    /// Reports the library's refusal of the peer's Attach answer before the
+    /// link's own closing Detach or Session End
+    pub(crate) attach_refused: Option<AttachRefusalReporter>,
+
     // Type state markers
     role: PhantomData<Role>,
     name_state: PhantomData<NameState>,
@@ -152,6 +156,7 @@ impl<Role, T> Default for Builder<Role, T, WithoutName, WithoutSource, WithoutTa
             auto_accept: false,
             verify_incoming_source: true,
             verify_incoming_target: true,
+            attach_refused: None,
         }
     }
 }
@@ -180,6 +185,16 @@ impl<T, NameState, SS, TS> Builder<role::ReceiverMarker, T, NameState, SS, TS> {
 }
 
 impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
+    /// Report the library's refusal of the peer's Attach answer synchronously,
+    /// before this link sends its own closing Detach or Session End. The error
+    /// is the role's `SenderAttachError` or `ReceiverAttachError`; the attach
+    /// still returns its own result after that cleanup. The callback must not
+    /// block or call native code.
+    pub fn attach_refusal_reporter(mut self, report: super::AttachRefusalReport) -> Self {
+        self.attach_refused = Some(crate::session::Reporter(report));
+        self
+    }
+
     /// Bound this link's unsettled entry count and aggregate retained content.
     /// No deployment defaults are selected by the library; omitted limits keep
     /// upstream behavior. Exhaustion permanently ends the unsettled owner.
@@ -213,6 +228,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             auto_accept: self.auto_accept,
             verify_incoming_source: self.verify_incoming_source,
             verify_incoming_target: self.verify_incoming_target,
+            attach_refused: self.attach_refused,
         }
     }
 
@@ -241,6 +257,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             auto_accept: self.auto_accept,
             verify_incoming_source: self.verify_incoming_source,
             verify_incoming_target: self.verify_incoming_target,
+            attach_refused: self.attach_refused,
         }
     }
 
@@ -269,6 +286,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             auto_accept: self.auto_accept,
             verify_incoming_source: self.verify_incoming_source,
             verify_incoming_target: self.verify_incoming_target,
+            attach_refused: self.attach_refused,
         }
     }
 
@@ -309,6 +327,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             auto_accept: self.auto_accept,
             verify_incoming_source: self.verify_incoming_source,
             verify_incoming_target: self.verify_incoming_target,
+            attach_refused: self.attach_refused,
         }
     }
 
@@ -340,6 +359,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             auto_accept: self.auto_accept,
             verify_incoming_source: self.verify_incoming_source,
             verify_incoming_target: self.verify_incoming_target,
+            attach_refused: self.attach_refused,
         }
     }
 
@@ -372,6 +392,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
                 auto_accept: self.auto_accept,
                 verify_incoming_source: self.verify_incoming_source,
                 verify_incoming_target: self.verify_incoming_target,
+            attach_refused: self.attach_refused,
             }
         }
     }
@@ -469,6 +490,7 @@ impl<Role, T, NameState, SS, TS> Builder<Role, T, NameState, SS, TS> {
             max_frame_size,
             verify_incoming_source: self.verify_incoming_source,
             verify_incoming_target: self.verify_incoming_target,
+            attach_refused: self.attach_refused,
         }
     }
 }

@@ -1545,3 +1545,19 @@ including the nine new ones. `broker_connection_compat`, `link` and
 `transaction` start broker containers and fail at container start on a host
 without Docker; they are not counted. Boundless consumer evidence is recorded
 with the consumer commit.
+
+## Split graceful Connection Close dispatch from receipt
+
+Upstream `ConnectionHandle::close` awaits enqueueing `Close(None)` and then
+reads the engine outcome with `on_close`, even if the control channel closed
+before enqueue. Keep that implementation by sharing the existing send in
+`enqueue_close`. Unlike `try_close`, observing `on_close` does not enqueue
+another frame.
+
+Boundless `State::close_native` uses the split for host-owned Close. Its
+deadline prevents an enqueue after the cutoff, then allows a receive-only
+check of the original result. When the engine has already committed a result,
+a delayed observer must keep it even if the deadline has passed. The Boundless
+host Close regression holds the observer after dispatch and advances the
+deadline after the engine commits. It checks the original Close evidence and
+the separate engine and pump joins. Timeout policy stays in Boundless.

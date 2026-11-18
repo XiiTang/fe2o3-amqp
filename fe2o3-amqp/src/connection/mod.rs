@@ -205,10 +205,17 @@ impl<R> ConnectionHandle<R> {
         ///
         /// This method is not supported in wasm32 targets, please use `drop()` instead.
         pub async fn close(&mut self) -> Result<(), Error> {
-            // If sending is unsuccessful, the `ConnectionEngine` event loop is
-            // already dropped, this should be reflected by `JoinError` then.
-            let _ = self.control.send(ConnectionControl::Close(None)).await;
+            self.enqueue_close().await;
             self.on_close().await
+        }
+
+        /// Queue a graceful Close without receiving its result.
+        ///
+        /// After this returns, use [`Self::on_close`] to receive the original
+        /// engine outcome. A closed control channel also leaves the engine
+        /// outcome as the authority on how the connection closed.
+        pub async fn enqueue_close(&mut self) {
+            let _ = self.control.send(ConnectionControl::Close(None)).await;
         }
 
         /// Close the connection with an error
